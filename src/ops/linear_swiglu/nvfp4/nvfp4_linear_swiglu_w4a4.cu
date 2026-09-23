@@ -21,12 +21,16 @@ using Geometry = Nvfp4N34816K5120;
 using M64N128  = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 4, 2, 1>;
 using M128N128 = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 4, 2, 1>;
 using M96N128  = Nvfp4W4a4MmaSchedule<96, 128, 256, 3, 4, 2, 1>;
+// Speculative verify widths fit one 16-token MMA tile; the smaller shared image lets two CTAs share
+// an SM, so the 272 row tiles stream in one resident wave instead of a partial second wave.
+using M16N128 = Nvfp4W4a4MmaSchedule<16, 128, 256, 1, 8, 2, 2>;
 
 constexpr int kIntermediate = Geometry::kOutputRows / 2;
 
+template <int RowsPerBranch>
 struct Nvfp4SwiGluRows {
     static constexpr bool kContiguous   = false;
-    static constexpr int kRowsPerBranch = M64N128::kBlockN / 2;
+    static constexpr int kRowsPerBranch = RowsPerBranch;
 
     __device__ __forceinline__ int weight_row(int row_begin, int local_row) const {
         return row_begin + (local_row & (kRowsPerBranch - 1)) +
@@ -65,15 +69,15 @@ template <class Schedule>
 void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace,
                  std::int32_t tokens, cudaStream_t stream) {
     constexpr int kPairRows = Schedule::kBlockN / 2;
-    static_assert(kPairRows == Nvfp4SwiGluRows::kRowsPerBranch);
+    using Rows              = Nvfp4SwiGluRows<kPairRows>;
     const dim3 grid(kIntermediate / kPairRows,
                     (tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
     const Nvfp4W4a4MaterializedActivation activation{workspace.codes, workspace.scales};
-    const Nvfp4SwiGluRows row_policy{};
+    const Rows row_policy{};
     const Nvfp4SwiGluOutput output{static_cast<__nv_bfloat16*>(out.data)};
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4SwiGluOutput,
-                          Nvfp4SwiGluRows, true><<<grid, Schedule::kThreads, 0, stream>>>(
+    nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4SwiGluOutput, Rows, true>
+        <<<grid, Schedule::kThreads, 0, stream>>>(
         activation, static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
         output, row_policy);
@@ -94,7 +98,9 @@ void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& 
 
 void nvfp4_linear_swiglu_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                      WorkspaceArena& workspace, cudaStream_t stream) {
-    if (x.ne[1] <= M64N128::kBlockM) {
+    if (x.ne[1] <= M16N128::kBlockM) {
+        launch<M16N128>(x, weight, out, workspace, stream);
+    } else if (x.ne[1] <= M64N128::kBlockM) {
         launch<M64N128>(x, weight, out, workspace, stream);
     } else if (x.ne[1] <= M96N128::kBlockM) {
         launch<M96N128>(x, weight, out, workspace, stream);

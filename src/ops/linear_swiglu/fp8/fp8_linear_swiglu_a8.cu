@@ -17,15 +17,14 @@ namespace ninfer::ops::detail {
 namespace {
 
 using Geometry = Fp8N34816K5120;
-using Schedule = Fp8A8DefaultSchedule;
 
 constexpr int kIntermediate = Geometry::kOutputRows / 2;
-using Rows                  = Fp8SwiGluRows<Schedule::kBlockRows / 2, kIntermediate>;
-static_assert((Schedule::kBlockRows % 2) == 0);
 
-template <bool FullTokens>
+template <class Schedule, bool FullTokens>
 void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std::int32_t tokens,
                 cudaStream_t stream) {
+    using Rows = Fp8SwiGluRows<Schedule::kBlockRows / 2, kIntermediate>;
+    static_assert((Schedule::kBlockRows % 2) == 0);
     constexpr int kRowTiles = Geometry::kOutputRows / Schedule::kBlockRows;
     const int token_tiles   = (tokens + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens;
     const int blocks        = kRowTiles * token_tiles;
@@ -47,6 +46,16 @@ void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <class Schedule>
+void run(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std::int32_t tokens,
+         cudaStream_t stream) {
+    if ((tokens % Schedule::kBlockTokens) == 0) {
+        launch_mma<Schedule, true>(weight, out, workspace, tokens, stream);
+    } else {
+        launch_mma<Schedule, false>(weight, out, workspace, tokens, stream);
+    }
+}
+
 } // namespace
 
 void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
@@ -55,10 +64,10 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
     const Fp8A8Workspace scratch =
         allocate_fp8_a8_workspace(workspace, x.ne[1], Geometry::kInputRows);
     launch_fp8_a8_quantize(x, weight, scratch, stream);
-    if ((x.ne[1] % Schedule::kBlockTokens) == 0) {
-        launch_mma<true>(weight, out, scratch, x.ne[1], stream);
+    if (x.ne[1] <= kFp8A8SmallTokenLimit) {
+        run<Fp8A8SmallTokenSchedule>(weight, out, scratch, x.ne[1], stream);
     } else {
-        launch_mma<false>(weight, out, scratch, x.ne[1], stream);
+        run<Fp8A8DefaultSchedule>(weight, out, scratch, x.ne[1], stream);
     }
 }
 

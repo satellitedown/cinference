@@ -26,6 +26,9 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t wi
                                            std::int32_t batch_size, KvCacheStorage storage,
                                            CausalAttentionExecutionEnvelope envelope) {
     if (q_heads == 16) return 6;
+    // The K8V4 kernel owns all 96 GQA rows of a sixteen-column verify block, so the whole block
+    // is one pass and each persistent K/V byte is streamed once rather than once per chunk.
+    if (storage == KvCacheStorage::Fp8KeyNvfp4Value) return kMaximumVerifyTokens;
     // Balance the two narrow BF16 chunks; INT8 benefits from 5+4/5 at long contexts.
     if (batch_size == 1 && ((storage == KvCacheStorage::BFloat16 && width >= 9 && width <= 12) ||
                             (storage == KvCacheStorage::Int8Group64 && width >= 9 && width <= 10 &&
@@ -286,10 +289,9 @@ void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceA
                             KvCacheStorage cache_storage, CausalAttentionExecutionEnvelope envelope,
                             Tensor& out, Launch&& launch) {
     for (std::int32_t begin = 0; begin < q.ne[2];
-         begin +=
-         causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope)) {
-        const std::int32_t count = std::min(
-            causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope),
+         begin += causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope)) {
+        const std::int32_t count =
+            std::min(causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope),
             q.ne[2] - begin);
         auto chunk_scope = workspace.scope();
         const std::int32_t splits =
@@ -308,10 +310,10 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                             Tensor& out, cudaStream_t stream) {
     for (std::int32_t begin = 0; begin < q.ne[2];
-         begin += causal_attention_chunk_tokens(q.ne[1], q.ne[2], q.ne[3], cache.storage,
-                                                        envelope)) {
-        const std::int32_t count  = std::min(causal_attention_chunk_tokens(
-                                                q.ne[1], q.ne[2], q.ne[3], cache.storage, envelope),
+         begin +=
+         causal_attention_chunk_tokens(q.ne[1], q.ne[2], q.ne[3], cache.storage, envelope)) {
+        const std::int32_t count = std::min(
+            causal_attention_chunk_tokens(q.ne[1], q.ne[2], q.ne[3], cache.storage, envelope),
                                              q.ne[2] - begin);
         auto chunk_scope          = workspace.scope();
         const std::int32_t splits = detail::causal_attention_split_capacity(
@@ -425,12 +427,12 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         if (route == detail::CausalAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
         for (std::int32_t begin = 0; begin < width;
-             begin += causal_attention_chunk_tokens(q_heads, width, batch_size,
-                                                            cache_storage, envelope)) {
+             begin +=
+             causal_attention_chunk_tokens(q_heads, width, batch_size, cache_storage, envelope)) {
             maximum = std::max(
                 maximum,
-                chunk_capacity(std::min(causal_attention_chunk_tokens(
-                                            q_heads, width, batch_size, cache_storage, envelope),
+                chunk_capacity(std::min(causal_attention_chunk_tokens(q_heads, width, batch_size,
+                                                                      cache_storage, envelope),
                                         width - begin)));
         }
         return maximum;

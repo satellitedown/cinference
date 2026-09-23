@@ -70,7 +70,12 @@ std::int32_t causal_small_t_split_count(std::int32_t window, std::int32_t tokens
         const std::int32_t clamped  = (splits > kMin) ? splits : kMin;
         return (clamped < kMax) ? clamped : kMax;
     }
-    return causal_small_t_split_upper_bound<Geometry>(window);
+    const std::int32_t splits = causal_small_t_split_upper_bound<Geometry>(window);
+    if (tokens > kCausalWideTokenTile) {
+        constexpr std::int32_t kWideLimit = causal_small_t_wide_split_limit<Geometry>();
+        return splits < kWideLimit ? splits : kWideLimit;
+    }
+    return splits;
 }
 
 template <typename Geometry>
@@ -217,7 +222,11 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
                                              KvCacheStorage cache_storage,
                                              CausalAttentionExecutionEnvelope envelope,
                                              std::int32_t batch_size) {
-    if (tokens < 1 || tokens > (q_heads == 24 ? 8 : 6) || envelope.min_visible_keys == 0 ||
+    // The 24-head K8V4 kernel covers a complete sixteen-column verify block in one pass; every
+    // other codec chunks 24-head blocks to eight columns and 16-head blocks to six.
+    const std::int32_t maximum_tokens =
+        q_heads == 24 ? (cache_storage == KvCacheStorage::Fp8KeyNvfp4Value ? 16 : 8) : 6;
+    if (tokens < 1 || tokens > maximum_tokens || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("causal_softmax_attention split capacity: invalid profile");
     }

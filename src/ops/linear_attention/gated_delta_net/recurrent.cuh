@@ -683,6 +683,141 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     zero_output_suffix(access, coord, valid, access.width);
 }
 
+// Speculative verify widths are short, so the per-token loop above is dominated by dependent global
+// loads and redundant Q/K normalizations. This form stages the complete raw block once, normalizes
+// each Q/K column once per CTA with the same lane partition and reduction as normalize_qk_lane,
+// writes the records in parallel, and then runs the unchanged per-token transition from shared
+// memory. Outputs, records and every arithmetic step are identical to recurrent_record_kernel.
+inline constexpr int kStagedRecordMaxWidth = 16;
+
+template <bool Masked>
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+    recurrent_record_staged_kernel(RecordAccess<Masked> access) {
+    const RecurrentCoordinates coord = access.coordinates();
+    const std::int32_t valid         = access.active_columns(coord);
+    const int thread                 = coord.warp * kWarpSize + coord.lane;
+    constexpr int kThreads           = kWarpSize * kNumWarps;
+    constexpr int kPacksPerColumn    = kStateDim / 8;
+
+    __shared__ __align__(16) __nv_bfloat16 key_raw[kStagedRecordMaxWidth][kStateDim];
+    __shared__ __align__(16) __nv_bfloat16 query_raw[kStagedRecordMaxWidth][kStateDim];
+    __shared__ __align__(16) __nv_bfloat16 value_raw[kStagedRecordMaxWidth][kBlockDv];
+    __shared__ float key_scale[kStagedRecordMaxWidth];
+    __shared__ float query_scale[kStagedRecordMaxWidth];
+    __shared__ uint2 gate_raw[kStagedRecordMaxWidth];
+
+    // The state tile is independent of the staged block, so its DRAM latency overlaps staging.
+    __align__(16) float state[kDvPerWarp][kQkPerLane];
+    load_state_tile(state, access.state_read_base(coord), coord);
+
+    const std::uint32_t tile_dv = static_cast<std::uint32_t>(coord.state_tile * kBlockDv);
+    for (int task = thread; task < valid * kPacksPerColumn; task += kThreads) {
+        const int token = task / kPacksPerColumn;
+        const int pack  = task - token * kPacksPerColumn;
+        store_vec(&key_raw[token][pack * 8],
+                  load_vec<uint4>(access.key_ptr(coord, token) + pack * 8));
+        store_vec(&query_raw[token][pack * 8],
+                  load_vec<uint4>(access.query_ptr(coord, token) + pack * 8));
+    }
+    for (int task = thread; task < valid * (kBlockDv / 8); task += kThreads) {
+        const int token = task / (kBlockDv / 8);
+        const int pack  = task - token * (kBlockDv / 8);
+        store_vec(&value_raw[token][pack * 8],
+                  load_vec<uint4>(access.value_ptr(coord, token) + tile_dv + pack * 8));
+    }
+    for (int token = thread; token < valid; token += kThreads) {
+        gate_raw[token] = access.load_gate(coord, token).bits;
+    }
+    __syncthreads();
+
+    for (int token = coord.warp; token < valid; token += kNumWarps) {
+        float key[kQkPerLane];
+        float query[kQkPerLane];
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) {
+            key[c]   = __bfloat162float(key_raw[token][coord.dqk_base + c]);
+            query[c] = __bfloat162float(query_raw[token][coord.dqk_base + c]);
+        }
+        float key_sum   = 0.0f;
+        float query_sum = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) {
+            key_sum += key[c] * key[c];
+            query_sum += query[c] * query[c];
+        }
+        key_sum   = warp_reduce_sum(key_sum);
+        query_sum = warp_reduce_sum(query_sum);
+        if (coord.lane == 0) {
+            key_scale[token]   = rsqrtf(key_sum + kQkL2NormEps);
+            query_scale[token] = rsqrtf(query_sum + kQkL2NormEps);
+        }
+    }
+
+    if (coord.state_tile == 0 &&
+        static_cast<int>(coord.value_head) % access.heads.group_size() == 0) {
+        for (int task = thread; task < valid * kPacksPerColumn; task += kThreads) {
+            const int token = task / kPacksPerColumn;
+            const int pack  = task - token * kPacksPerColumn;
+            __nv_bfloat16* destination =
+                access.key_record +
+                (access.column(coord, token) * access.heads.H_qk + coord.qk_head) * kStateDim;
+            store_vec(destination + pack * 8, load_vec<uint4>(&key_raw[token][pack * 8]));
+        }
+    }
+    for (int task = thread; task < valid * (kBlockDv / 8); task += kThreads) {
+        const int token = task / (kBlockDv / 8);
+        const int pack  = task - token * (kBlockDv / 8);
+        __nv_bfloat16* destination =
+            access.value_record +
+            (access.column(coord, token) * access.heads.H_v + coord.value_head) * kStateDim;
+        store_vec(destination + tile_dv + pack * 8, load_vec<uint4>(&value_raw[token][pack * 8]));
+    }
+    if (coord.state_tile == 0) {
+        for (int token = thread; token < valid; token += kThreads) {
+            access.gate_record[access.column(coord, token) * access.heads.H_v + coord.value_head] =
+                gate_raw[token];
+        }
+    }
+    __syncthreads();
+
+    const int local_dv = coord.warp * kDvPerWarp;
+    for (std::int32_t token = 0; token < valid; ++token) {
+        float key[kQkPerLane];
+        const float key_multiplier = key_scale[token];
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) {
+            key[c] = __bfloat162float(key_raw[token][coord.dqk_base + c]) * key_multiplier;
+        }
+        const float value_local = coord.lane < kDvPerWarp
+                                      ? __bfloat162float(value_raw[token][local_dv + coord.lane])
+                                      : 0.0f;
+        const uint2 gate        = gate_raw[token];
+        apply_gdn_transition(state, key, value_local, __uint_as_float(gate.x),
+                             __uint_as_float(gate.y));
+
+        float query[kQkPerLane];
+        const float query_multiplier = query_scale[token];
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) {
+            query[c] = __bfloat162float(query_raw[token][coord.dqk_base + c]) * query_multiplier;
+        }
+        float attn_val = 0.0f;
+#pragma unroll
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            float partial = 0.0f;
+#pragma unroll
+            for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * query[c]; }
+            partial = warp_sum<kWarpSize>(partial);
+            if (coord.lane == r) { attn_val = partial; }
+        }
+        if (coord.lane < kDvPerWarp) {
+            access.output_ptr(coord, token)[coord.dv_base + coord.lane] =
+                __float2bfloat16(attn_val * access.scale);
+        }
+    }
+    zero_output_suffix(access, coord, valid, access.width);
+}
+
 template <class Geometry>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry> access) {

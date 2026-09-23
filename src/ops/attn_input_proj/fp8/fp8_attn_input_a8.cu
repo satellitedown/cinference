@@ -5,6 +5,7 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output.cuh"
 #include "ops/linear/fp8/fp8_a8_mma.cuh"
 #include "ops/linear/fp8/fp8_config.h"
+#include "ops/linear/fp8/fp8_a8_schedule.cuh"
 #include "ops/linear/fp8/fp8_output.cuh"
 
 #include <cuda_bf16.h>
@@ -67,7 +68,9 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
                                      Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
     using Prefill   = Fp8MmaSchedule<64, 128, 128, 2, 4, 2, 2, Cache::cg, Cache::cg,
                                      Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
-    if (x.ne[1] <= 32)
+    if (x.ne[1] <= kFp8A8SmallTokenLimit)
+        run<Fp8A8SmallTokenSchedule>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+    else if (x.ne[1] <= 32)
         run<Small32>(weight, q, gate, k, v, workspace, x.ne[1], stream);
     else if (x.ne[1] <= 64)
         run<Small64>(weight, q, gate, k, v, workspace, x.ne[1], stream);

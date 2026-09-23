@@ -851,6 +851,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                          device.stream);
         }
 
+        bool staged_host_copy = false;
         if (is_masked_draft_backend(speculative_backend)) {
             std::array<std::uint32_t, kMaximumConcurrency> append_lanes{};
             std::array<std::uint32_t, kMaximumConcurrency> append_starts{};
@@ -869,12 +870,20 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     std::span<const std::uint32_t>(append_lanes.data(), append_size),
                     std::span<const std::uint32_t>(append_starts.data(), append_size),
                     std::span<const std::uint32_t>(append_counts.data(), append_size));
+                staged_host_copy = true;
             }
         }
 
+        // The fold and token-count updates read only device records and kernel parameters, and
+        // every later consumer is ordered behind them on this stream. Only a terminal context
+        // append stages its ingress through the pinned buffer the next round refills, so only that
+        // path must drain before the host continues. Otherwise the next round is prepared and
+        // launched while the fold runs; a device fault still surfaces at the next synchronization.
+        if (staged_host_copy) {
         timing.begin_wait();
         device.synchronize();
         timing.end_wait();
+        }
         work.reset();
     } catch (...) {
         try {

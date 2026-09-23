@@ -18,15 +18,24 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
                          Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
-    constexpr int Warps                = RowTiles == 3 ? 12 : 8;
-    constexpr int KeyBlock             = TokenTile == 1 ? 32 : 64;
+    // More than three row tiles is a complete wide verify block. Two consumer warps per row tile
+    // keep the PV accumulator at sixteen n-tiles, and the double-buffered 32-key tile keeps
+    // Q, P, two packed K/V stages and the widened V tile within one CTA's shared memory.
+    constexpr bool Wide     = RowTiles > 3;
+    constexpr int Warps     = Wide ? 2 * RowTiles : (RowTiles == 3 ? 12 : 8);
+    constexpr int KeyBlock  = TokenTile == 1 || Wide ? 32 : 64;
+    constexpr int Stages    = Wide ? 2 : 1;
     constexpr int MinBlocks            = TokenTile == 1 ? 2 : 1;
-    constexpr std::size_t DynamicBytes = 7u * KeyBlock * kCausalHeadDim / 2u;
+    constexpr std::size_t DynamicBytes =
+        static_cast<std::size_t>(Stages) * 3u * KeyBlock * kCausalHeadDim / 2u +
+        2u * KeyBlock * kCausalHeadDim;
     using KernelInput                  = CacheInput;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     const auto launch = [&]() {
-        auto kernel = causal_attention_small_t_k8v4_tiled_kernel<
-            Geometry, TokenTile, Warps, MinBlocks, KeyBlock, true, MultiBatch, Masked, KernelInput>;
+        auto kernel =
+            causal_attention_small_t_k8v4_tiled_kernel<Geometry, TokenTile, Warps, MinBlocks,
+                                                       KeyBlock, true, MultiBatch, Masked,
+                                                       KernelInput, Stages>;
         static const cudaError_t attr = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(DynamicBytes));
         CUDA_CHECK(attr);
@@ -146,6 +155,44 @@ void causal_attention_small_t_k8v4_launch_for(const Tensor& q, CacheInput input,
     case 8:
         if constexpr (Geometry::QHeads == 24) {
             dispatch_metadata.template operator()<8>();
+            break;
+        }
+        throw std::invalid_argument("unsupported query-row tile");
+    case 9:
+    case 10:
+    case 11:
+    case 12:
+    case 13:
+    case 14:
+    case 15:
+    case 16:
+        if constexpr (Geometry::QHeads == 24) {
+            switch (invocation.width) {
+            case 9:
+                dispatch_metadata.template operator()<9>();
+                break;
+            case 10:
+                dispatch_metadata.template operator()<10>();
+                break;
+            case 11:
+                dispatch_metadata.template operator()<11>();
+                break;
+            case 12:
+                dispatch_metadata.template operator()<12>();
+                break;
+            case 13:
+                dispatch_metadata.template operator()<13>();
+                break;
+            case 14:
+                dispatch_metadata.template operator()<14>();
+                break;
+            case 15:
+                dispatch_metadata.template operator()<15>();
+                break;
+            default:
+                dispatch_metadata.template operator()<16>();
+                break;
+            }
             break;
         }
         throw std::invalid_argument("unsupported query-row tile");

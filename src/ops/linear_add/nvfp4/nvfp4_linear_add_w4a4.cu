@@ -12,7 +12,11 @@
 namespace ninfer::ops::detail {
 namespace {
 
-using M32N64            = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
+// The [5120,K] projection has only 80 64-row tiles. Four cp.async stages keep enough weight bytes
+// in flight for those CTAs to stream near device bandwidth; a 16-token tile also avoids staging and
+// multiplying an idle token half through T=32, where L2 absorbs the second token tile's reread.
+using M16N64            = Nvfp4W4a4MmaSchedule<16, 64, 256, 1, 4, 4, 3>;
+using M32N64            = Nvfp4W4a4MmaSchedule<32, 64, 256, 2, 4, 4, 2>;
 using M32N128           = Nvfp4W4a4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
 using M64N128           = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
 using M128N128Pipelined = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
@@ -41,7 +45,9 @@ void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace work
 template <class Geometry>
 void launch_problem(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace workspace,
                     std::int32_t tokens, cudaStream_t stream) {
-    if (tokens <= 64) {
+    if (tokens <= 32) {
+        launch_gemm<Geometry, M16N64>(weight, residual, workspace, tokens, stream);
+    } else if (tokens <= 64) {
         launch_gemm<Geometry, M32N64>(weight, residual, workspace, tokens, stream);
     } else if (tokens <= 128) {
         launch_gemm<Geometry, M32N128>(weight, residual, workspace, tokens, stream);

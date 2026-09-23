@@ -41,8 +41,10 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& residual, cudaStr
         Tensor residual_chunk(output, DType::BF16, {weight.n, active});
         if (active == 1) {
             fp8_linear_add_decode_launch(input_chunk, weight, residual_chunk, stream);
-        } else {
+        } else if (active < kFp8LinearAddFirstMmaTokens) {
             fp8_linear_add_small_t_launch(input_chunk, weight, residual_chunk, stream);
+        } else {
+            fp8_linear_add_mma_small_t_launch(input_chunk, weight, residual_chunk, stream);
         }
     }
 }

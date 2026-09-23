@@ -15,14 +15,12 @@ namespace ninfer::ops::detail {
 namespace {
 
 using Geometry = Fp8N16384K5120;
-using Schedule = Fp8A8DefaultSchedule;
 
-static_assert((Fp8GdnInputOutput::kQkvRows % Schedule::kBlockRows) == 0);
-static_assert((Fp8GdnInputOutput::kZRows % Schedule::kBlockRows) == 0);
-
-template <bool FullTokens>
+template <class Schedule, bool FullTokens>
 void launch_mma(const Weight& weight, Tensor& qkv, Tensor& z, Fp8A8Workspace workspace,
                 std::int32_t tokens, cudaStream_t stream) {
+    static_assert((Fp8GdnInputOutput::kQkvRows % Schedule::kBlockRows) == 0);
+    static_assert((Fp8GdnInputOutput::kZRows % Schedule::kBlockRows) == 0);
     constexpr int kRowTiles = Geometry::kOutputRows / Schedule::kBlockRows;
     const int token_tiles   = (tokens + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens;
     const int blocks        = kRowTiles * token_tiles;
@@ -43,15 +41,25 @@ void launch_mma(const Weight& weight, Tensor& qkv, Tensor& z, Fp8A8Workspace wor
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <class Schedule>
+void run(const Weight& weight, Tensor& qkv, Tensor& z, Fp8A8Workspace workspace,
+         std::int32_t tokens, cudaStream_t stream) {
+    if ((tokens % Schedule::kBlockTokens) == 0) {
+        launch_mma<Schedule, true>(weight, qkv, z, workspace, tokens, stream);
+    } else {
+        launch_mma<Schedule, false>(weight, qkv, z, workspace, tokens, stream);
+    }
+}
+
 } // namespace
 
 void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                              Fp8A8Workspace workspace, cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
-    if ((x.ne[1] % Schedule::kBlockTokens) == 0) {
-        launch_mma<true>(weight, qkv, z, workspace, x.ne[1], stream);
+    if (x.ne[1] <= kFp8A8SmallTokenLimit) {
+        run<Fp8A8SmallTokenSchedule>(weight, qkv, z, workspace, x.ne[1], stream);
     } else {
-        launch_mma<false>(weight, qkv, z, workspace, x.ne[1], stream);
+        run<Fp8A8DefaultSchedule>(weight, qkv, z, workspace, x.ne[1], stream);
     }
 }
 

@@ -119,12 +119,26 @@ __device__ __forceinline__ int causal_small_t_active_splits(int window, int laun
     return splits < launch_capacity ? splits : launch_capacity;
 }
 
+// A wide K8V4 verify block (more than eight columns) keeps one CTA per SM for the whole pass, so
+// its grid is limited to one resident 170-SM wave; each split then covers more keys, which the
+// double-buffered tile loop streams without the partial second wave or extra split partials.
+inline constexpr int kCausalWideTokenTile = 8;
+
+template <typename Geometry>
+__device__ __host__ __forceinline__ constexpr int causal_small_t_wide_split_limit() {
+    return 168 / Geometry::KVHeads;
+}
+
 template <typename Geometry>
 __device__ __forceinline__ int
 causal_small_t_quantized_active_splits(int window, int launch_capacity, int tokens) {
     int splits = causal_small_t_default_splits<Geometry>(window);
     if constexpr (Geometry::SmallTSplitScale == 1) {
         if (tokens == 1 && window > 8198) { splits = Geometry::SmallTMaximumSplits; }
+    }
+    if (tokens > kCausalWideTokenTile) {
+        constexpr int kWideLimit = causal_small_t_wide_split_limit<Geometry>();
+        splits                   = splits < kWideLimit ? splits : kWideLimit;
     }
     return splits < launch_capacity ? splits : launch_capacity;
 }

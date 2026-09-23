@@ -1,9 +1,13 @@
 #pragma once
 
-// Asymmetric K8V4 split-KV causal attention for up to 48 query rows. A CTA owns one KV head and all
+// Asymmetric K8V4 split-KV causal attention for up to 96 query rows. A CTA owns one KV head and all
 // GQA query heads, so each persistent K/V byte is streamed once. Q/K use the existing rotated,
 // row-scaled E4M3 native Tensor Core path. Rotated V uses group-16 packed NVFP4 and widens exactly
 // to FP16 for FP16/FP32 PV MMA. Split numerators and inverse rotation remain FP32.
+//
+// Stages=2 double-buffers the packed K/V tile: the next tile's copies are in flight while the
+// current tile's scores, V widening and PV product execute. Wide query blocks (more than three row
+// tiles, a complete 27B verify width) use it so that one pass streams the cache once for all rows.
 
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
@@ -19,7 +23,7 @@
 namespace ninfer::ops {
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
-          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput>
+          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput, int Stages = 1>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void causal_attention_small_t_k8v4_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
@@ -43,34 +47,38 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
     constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
     constexpr int PVKs                 = Bc / 16;
-    constexpr int PageIds              = 64;
+    // Wide blocks run one resident wave, so a split may cover up to 128 pages (8192 keys).
+    constexpr int PageIds         = RowTiles > 3 ? 128 : 64;
     constexpr int ProducerThreads      = RowTiles * 32;
     constexpr int VLoaderThreads       = Threads - ProducerThreads;
     constexpr float Log2E              = 1.4426950408889634074F;
     constexpr unsigned FullMask        = 0xffffffffU;
 
-    static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
+    static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 96);
     static_assert(Bc == 32 || Bc == 64);
-    static_assert(RowTiles >= 1 && RowTiles <= 3);
+    static_assert(RowTiles >= 1 && RowTiles <= 6);
     static_assert(Wc > RowTiles && Wc % RowTiles == 0);
     static_assert(PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
     static_assert(QKKs == 8);
+    static_assert(Stages == 1 || Stages == 2);
+    constexpr int KStageBytes = Bc * D;
+    constexpr int StageBytes  = KStageBytes + Bc * D / 2;
+    constexpr int ArenaBytes  = Stages * StageBytes + Bc * D * 2;
+    static_assert(ArenaBytes >= Wc * D * static_cast<int>(sizeof(float)));
     __shared__ __align__(16) std::uint8_t q_s[Br * D];
-    __shared__ __align__(16) std::uint8_t static_arena[DynamicArena ? 16 : 7 * Bc * D / 2];
+    __shared__ __align__(16) std::uint8_t static_arena[DynamicArena ? 16 : ArenaBytes];
     extern __shared__ __align__(16) std::uint8_t dynamic_arena[];
     std::uint8_t* arena   = DynamicArena ? dynamic_arena : static_arena;
     float* q_scale_tmp    = reinterpret_cast<float*>(arena);
-    std::uint8_t* k_fp8   = arena;
-    std::uint8_t* v_nvfp4 = arena + Bc * D;
-    __half* v_f16         = reinterpret_cast<__half*>(arena + 3 * Bc * D / 2);
+    __half* v_f16        = reinterpret_cast<__half*>(arena + Stages * StageBytes);
     __nv_bfloat16* q_b16  = reinterpret_cast<__nv_bfloat16*>(q_s);
-    __nv_bfloat16* k_b16  = reinterpret_cast<__nv_bfloat16*>(k_fp8);
+    const auto k_fp8     = [&](int stage) { return arena + stage * StageBytes; };
+    const auto v_nvfp4   = [&](int stage) { return arena + stage * StageBytes + KStageBytes; };
     __shared__ __align__(16) __half p_s[Br * PStride];
     __shared__ float alpha_s[Br];
-    __shared__ __align__(16) __half k_scale_s[Bc];
-    __shared__ __align__(16) std::uint8_t v_scale_s[Bc * kKVCacheNvfp4Groups];
+    __shared__ __align__(16) __half k_scale_s[Stages][Bc];
+    __shared__ __align__(16) std::uint8_t v_scale_s[Stages][Bc * kKVCacheNvfp4Groups];
     __shared__ std::int32_t physical_pages_s[PageIds];
-
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
     const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
@@ -291,19 +299,38 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     float l0 = 0.0F;
     float l1 = 0.0F;
 
-    auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+    // Scales for eight consecutive keys of one page are one aligned 16-byte span, so complete
+    // in-split groups are copied asynchronously with the codes instead of stalling the issuing
+    // threads on a dependent global load. Split-boundary groups keep the per-key zero fill.
+    auto issue_kv_tile = [&](int stage, int tile_k0, int physical_page) {
+        std::uint8_t* k_codes = k_fp8(stage);
+        std::uint8_t* v_codes = v_nvfp4(stage);
+        for (int group = tid; group < Bc / 8; group += Threads) {
+            const int key0 = tile_k0 + group * 8;
+            if (key0 >= split_start && key0 + 8 <= split_end) {
+                const std::int64_t k_scale_offset = kv_cache_fp8_scale_index<Geometry>(
+                    physical_page, kv_head, key0 & kPagedKVPageMask);
+                cp_async<16>(&k_scale_s[stage][group * 8], cache_k_scale + k_scale_offset);
+            } else {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int key = key0 + i;
+                    k_scale_s[stage][group * 8 + i] =
+                        key >= split_start && key < split_end
+                            ? cache_k_scale[kv_cache_fp8_scale_index<Geometry>(
+                                  physical_page, kv_head, key & kPagedKVPageMask)]
+                            : __float2half_rn(0.0F);
+                }
+            }
+        }
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key             = tile_k0 + key_l;
-            std::uint8_t* v_scale_dst = v_scale_s + key_l * kKVCacheNvfp4Groups;
+            std::uint8_t* v_scale_dst = &v_scale_s[stage][key_l * kKVCacheNvfp4Groups];
             if (key >= split_start && key < split_end) {
-                const std::int64_t k_scale_offset = kv_cache_fp8_scale_index<Geometry>(
-                    physical_page, kv_head, key & kPagedKVPageMask);
                 const std::int64_t v_scale_offset = kv_cache_nvfp4_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
-                k_scale_s[key_l] = cache_k_scale[k_scale_offset];
                 cp_async<16>(v_scale_dst, cache_v_scale + v_scale_offset);
             } else {
-                k_scale_s[key_l] = __float2half_rn(0.0F);
                 store_vec(v_scale_dst, make_int4(0, 0, 0, 0));
             }
         }
@@ -313,7 +340,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int dc        = chunk - key_l * (D / 16);
             const int d         = dc * 16;
             const int key       = tile_k0 + key_l;
-            std::uint8_t* k_dst = &k_fp8[(key_l * DB16 + causal_small_t_tc_swz(key_l, dc * 8)) * 2];
+            std::uint8_t* k_dst =
+                &k_codes[(key_l * DB16 + causal_small_t_tc_swz(key_l, dc * 8)) * 2];
             if (key >= split_start && key < split_end) {
                 const std::int64_t code_offset = kv_cache_fp8_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
@@ -328,7 +356,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int dc        = chunk - key_l * (D / 32);
             const int d         = dc * 32;
             const int key       = tile_k0 + key_l;
-            std::uint8_t* v_dst = &v_nvfp4[key_l * (D / 2) + d / 2];
+            std::uint8_t* v_dst = &v_codes[key_l * (D / 2) + d / 2];
             if (key >= split_start && key < split_end) {
                 const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
@@ -339,14 +367,27 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         }
         ninfer::ops::cp_commit();
     };
+    const auto tile_page = [&](int tile_k0) {
+        return physical_pages_s[(tile_k0 >> kPagedKVPageShift) - first_page];
+    };
 
-    int physical_page = physical_pages_s[0];
-    issue_kv_tile(first_tile, physical_page);
+    issue_kv_tile(0, first_tile, tile_page(first_tile));
+    if constexpr (Stages == 2) {
+        if (key_blocks > 1) {
+            issue_kv_tile(1, first_tile + Bc, tile_page(first_tile + Bc));
+            ninfer::ops::cp_wait<1>();
+        } else {
     ninfer::ops::cp_wait<0>();
+        }
+    } else {
+        ninfer::ops::cp_wait<0>();
+    }
     __syncthreads();
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
+        const int stage   = Stages == 2 ? (kb & 1) : 0;
+        const auto* k_b16 = reinterpret_cast<const __nv_bfloat16*>(k_fp8(stage));
         if (warp < RowTiles) {
             const int row_base = warp * 16;
             __half* p_sw       = &p_s[row_base * PStride];
@@ -377,8 +418,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int keya = nt * 8 + 2 * lid;
                 const int keyb = keya + 1;
-                float ks0      = gid == 0 ? __half2float(k_scale_s[keya]) : 0.0F;
-                float ks1      = gid == 0 ? __half2float(k_scale_s[keyb]) : 0.0F;
+                float ks0      = gid == 0 ? __half2float(k_scale_s[stage][keya]) : 0.0F;
+                float ks1      = gid == 0 ? __half2float(k_scale_s[stage][keyb]) : 0.0F;
                 ks0            = __shfl_sync(FullMask, ks0, lid);
                 ks1            = __shfl_sync(FullMask, ks1, lid);
                 score[nt][0] *= q_scale_r0 * ks0;
@@ -464,6 +505,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             }
         } else {
             const int loader_tid = tid - ProducerThreads;
+            const std::uint8_t* v_codes = v_nvfp4(stage);
 #pragma unroll 1
             for (int chunk = loader_tid; chunk < Bc * (D / 8); chunk += VLoaderThreads) {
                 const int key_l = chunk / (D / 8);
@@ -472,10 +514,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + causal_small_t_tc_swz(key_l, d)];
                 if (key >= split_start && key < split_end) {
-                    store_vec(dst,
-                              kv_cache_nvfp4_dequant_f16x8(
-                                  &v_nvfp4[key_l * (D / 2) + d / 2],
-                                  v_scale_s[key_l * kKVCacheNvfp4Groups + d / kKVCacheNvfp4Group]));
+                    store_vec(dst, kv_cache_nvfp4_dequant_f16x8(
+                                       &v_codes[key_l * (D / 2) + d / 2],
+                                       v_scale_s[stage][key_l * kKVCacheNvfp4Groups +
+                                                        d / kKVCacheNvfp4Group]));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }
@@ -483,13 +525,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         }
         __syncthreads();
 
-        const bool has_next = kb + 1 < key_blocks;
-        if (has_next) {
-            const int next_k0 = k0 + Bc;
-            if ((next_k0 & kPagedKVPageMask) == 0) {
-                physical_page = physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page];
-            }
-            issue_kv_tile(next_k0, physical_page);
+        // The tile consumed above is no longer read; refill its stage. With two stages the
+        // following tile is already resident or in flight, so this copy overlaps two tiles of work.
+        const int refill = Stages == 2 ? kb + 2 : kb + 1;
+        if (refill < key_blocks) {
+            const int refill_k0 = first_tile + refill * Bc;
+            issue_kv_tile(stage, refill_k0, tile_page(refill_k0));
         }
 
         const int consumer_tile     = warp % RowTiles;
@@ -525,7 +566,15 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                         vf[0], vf[1]);
             }
         }
-        if (has_next) { ninfer::ops::cp_wait<0>(); }
+        if constexpr (Stages == 2) {
+            if (kb + 2 < key_blocks) {
+                ninfer::ops::cp_wait<1>();
+            } else if (kb + 1 < key_blocks) {
+                ninfer::ops::cp_wait<0>();
+            }
+        } else if (kb + 1 < key_blocks) {
+            ninfer::ops::cp_wait<0>();
+        }
         __syncthreads();
     }
 

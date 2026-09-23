@@ -81,9 +81,10 @@ int main(int argc, char** argv) {
         options.context_cache.device_state_slots     = argc > 7 ? std::stoul(argv[7]) : 3U;
         options.use_cuda_graph                       = graph;
         options.enable_vision                        = argc > 6 && std::stoi(argv[6]) != 0;
-        options.kv_cache                             = argc > 5 && std::string(argv[5]) == "int8"
-                                                           ? ninfer::KvCacheStorage::Int8Group64
-                                                           : ninfer::KvCacheStorage::BFloat16;
+        const std::string kv_codec                   = argc > 5 ? std::string(argv[5]) : "";
+        options.kv_cache = kv_codec == "int8"   ? ninfer::KvCacheStorage::Int8Group64
+                           : kv_codec == "k8v4" ? ninfer::KvCacheStorage::Fp8KeyNvfp4Value
+                                                : ninfer::KvCacheStorage::BFloat16;
         auto penalty                                 = request(24);
         penalty.execution.sampling.presence_penalty  = 0.5F;
         penalty.execution.sampling.frequency_penalty = 0.25F;

@@ -97,7 +97,11 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         state_slot_stride,
         scale,
     };
+    if (q.ne[2] <= kStagedRecordMaxWidth) {
+        recurrent_record_staged_kernel<Masked><<<grid, block, 0, stream>>>(access);
+    } else {
     recurrent_record_kernel<Masked><<<grid, block, 0, stream>>>(access);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
