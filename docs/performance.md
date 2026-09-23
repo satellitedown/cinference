@@ -1,9 +1,9 @@
 # Single-GPU serving performance
 
 > Modified by satellitedown for Cinference: this index labels retained upstream NInfer results.
-> These are not new Cinference MTP-10 or Huihui measurements. See the
-> [Cinference Swift archive-recall observations](../README.md#swift-archive-recall-on-rtx-5090)
-> for the separate fork-specific record.
+> These are not fafstmobel or Cinference MTP-10 measurements. See the
+> [Cinference performance overview](../README.md#performance) for fafstmobel evidence
+> and the separate historical Huihui archive-recall record.
 
 Published measurements use one NVIDIA GeForce RTX 5090 through NInfer's public HTTP serving route.
 Choose a model below for its detailed results, run conditions, output limitations, and reproduction

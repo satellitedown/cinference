@@ -106,5 +106,5 @@
     "path": "results/rtx5090-archive-recall.json",
     "scope": "Huihui Qwen3.8-27B Abliterated NVFP4; deterministic cold-prefix archive recall; thinking off; RTX 5090; K8V4; MTP-10"
   },
-  "recipe_repository": "https://github.com/satellitedown/fast-long-context-cinference"
+  "recipe_repository": "https://github.com/satellitedown/fafstmobel-cinference"
 }

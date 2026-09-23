@@ -46,3 +46,14 @@ artifact uses fixed mixed FP8/NVFP4 weights from unsloth/Qwen3.8-27B-NVFP4.
 The original model cards and their additional source/license notices remain
 in model-cards/. No model weights are included in this source distribution.
 Downloaded model artifacts carry their own applicable licenses and notices.
+
+The recommended fafstmobel artifact is published separately:
+https://huggingface.co/satellitedown/fafstmobel
+It combines UkisAI Swift-Qwen3.8-27b with the observed Huihui-minus-Qwen
+abliteration delta, NVFP4/FP8 text quantization, and the pretrained z-lab
+Qwen3.8-27B-DFlash2 draft. Text, vision, MTP and DFlash2 are bundled in NInfer v3.
+The Swift contribution retains the Swift Open License v1.0, including its
+commercial-use threshold; Qwen, Huihui and DFlash2 retain Apache-2.0 terms.
+This source repository's Apache-2.0 license does not relicense those weights.
+Consult the artifact's LICENSE.swift, other license files, NOTICE and
+PROVENANCE.md before use or redistribution.

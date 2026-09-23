@@ -2,7 +2,7 @@
 
 > Modified by satellitedown for Cinference: this map retains the upstream NInfer technical guides.
 > Product names and API symbols remain unchanged; applicable MTP ranges reflect this fork.
-> Model artifacts and historical measurements listed here are upstream NInfer publications.
+> Cinference's recommended artifact is fafstmobel; the other model cards and historical measurements retained here are upstream NInfer publications.
 
 Start with the [Cinference README](../README.md) to build the engine, obtain a supported artifact,
 and run the CLI or HTTP server.
@@ -24,6 +24,7 @@ The executable `--help` output is the exact source for command-line option spell
 
 | Model | Weights | Download | Versioned model card source |
 |---|---|---|---|
+| **fafstmobel (recommended)** | `nvfp4` / `fp8` | [Hugging Face](https://huggingface.co/satellitedown/fafstmobel) · [installer](https://github.com/satellitedown/fafstmobel-cinference) | [model card](https://huggingface.co/satellitedown/fafstmobel/blob/54202e174c5f05945fbb873d1c2d8384e2643bd3/README.md) |
 | Qwen3.6-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | [model card](../model-cards/Qwen3.6-27B-NInfer/README.md) |
 | Qwen3.6-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) |
 | Qwen3.8-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |

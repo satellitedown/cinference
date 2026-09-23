@@ -2,7 +2,7 @@
 
 # Cinference
 
-**A custom C++/CUDA inference engine for Qwen on a single RTX 5090 (32 GB), with 256K context.**
+**A custom C++/CUDA inference engine for [fafstmobel](https://huggingface.co/satellitedown/fafstmobel) on a single RTX 5090 (32 GB), with 256K context, DFlash2 decoding, and vision.**
 
 Built from [NInfer](https://github.com/Neroued/ninfer), with source-level changes to speculative decoding, CPU/GPU round buffers, and CUDA Graph management. Cinference modifies the native engine itself, not just its launch flags.
 
@@ -11,21 +11,39 @@ Built from [NInfer](https://github.com/Neroued/ninfer), with source-level change
 - **MTP-10 decoding:** raised the draft window from 5 to 10 tokens. Longer proposals let the engine emit more tokens per verification round when the drafts are accepted.
 - **Capture-based CUDA Graph reuse:** reworked MTP graph matching to use the captured node types and kernel functions. Profiles with matching signatures and batch sizes share an executable, rather than relying only on planned context ranges.
 - **Expanded CPU/GPU round handling:** enlarged draft and token-position buffers and updated native validation for the longer windows. This carries MTP-10 through the decoding path, not just the command-line options.
-- **Ready-to-run Huihui setup:** published the NVFP4 v3 model and a matching installer. Users download one ~21.5 GB model file, without a local conversion step.
+- **Ready-to-run fafstmobel setup:** a Swift-based Qwen3.8-27B derivative with Huihui's abliteration delta and NVFP4/FP8 text weights. One ~23.7 GB NInfer v3 file bundles text, vision, MTP, and the pretrained DFlash2 draft; no local conversion or separate draft download is needed. The recommended installer uses the engine's existing DFlash2 support, not MTP-10.
 
 ## Run
 
-For [Huihui Qwen3.8-27B Abliterated NVFP4](https://huggingface.co/satellitedown/Huihui-Qwen3.8-27B-abliterated-NVFP4-NInfer-v3), use the [one-menu installer](https://github.com/satellitedown/fast-long-context-cinference):
+For [fafstmobel](https://huggingface.co/satellitedown/fafstmobel), use the [one-menu installer](https://github.com/satellitedown/fafstmobel-cinference):
 
 ```bash
-git clone https://github.com/satellitedown/fast-long-context-cinference.git
-cd fast-long-context-cinference
+git clone https://github.com/satellitedown/fafstmobel-cinference.git
+cd fafstmobel-cinference
 bash setup.sh
 ```
 
-Requires Linux and working NVIDIA drivers. Choose **1** to install, then **3** to start.
+Requires Linux x86_64, an RTX 5090 (32 GB), and NVIDIA drivers compatible with CUDA 13.4. Choose **1** to install, then **3** to start. The installer builds the pinned Cinference runtime and verifies the model download and accompanying license/provenance files.
+
+### Connect
+
+- **OpenAI-compatible API:** `http://127.0.0.1:8001/v1`
+- **Model ID:** `fafstmobel-cinference`
+- **Profile:** 262,144-token context, K8V4 KV cache, DFlash2 with 15 draft tokens, proposal head and vision enabled, one request at a time.
+
+Keep the server on loopback: the installer profile has no authentication. The full 256K profile leaves little VRAM headroom. After installation, use `bash scripts/serve.sh --max-context 131072` from the installer checkout if other GPU workloads leave insufficient memory, and set the same context limit in your client.
+
+See the installer's [configuration and client setup](https://github.com/satellitedown/fafstmobel-cinference#connect-an-application) for overrides and OMP integration. The engine still accepts other compatible v3 `.ninfer` artifacts by explicit path.
 
 ## Performance
+
+The fafstmobel installer's [verification record](https://github.com/satellitedown/fafstmobel-cinference/blob/main/results/verification.json) covers text, tool calls, vision, and recall from a 259,843-token prompt with the 256K DFlash2-15 profile. These are integration/capacity checks, not throughput or general quality benchmarks.
+
+The [fafstmobel model card](https://huggingface.co/satellitedown/fafstmobel#measured-results-rtx-5090-32-gb-context-16384-fp8-kv-cuda-graphs-on) reports DFlash2 at **304.1–312.9 tokens/s** on a separate 16K-context, FP8-KV, greedy 256-token workload. Those results do not measure the installer's 256K K8V4 profile.
+
+### Historical Huihui measurements
+
+The following results used the previous **Huihui Qwen3.8-27B Abliterated NVFP4** model, not fafstmobel:
 
 | Prompt tokens | Tokens/s |
 |---:|---:|
@@ -35,5 +53,9 @@ Requires Linux and working NVIDIA drivers. Choose **1** to install, then **3** t
 | 260,000 | 299.64 |
 
 Huihui Qwen3.8-27B Abliterated NVFP4, MTP-10, K8V4. Generation speed on synthetic recall, thinking off. [Measurements](results/rtx5090-archive-recall.json).
+
+## Model licensing
+
+Cinference's source remains [Apache-2.0](LICENSE). The downloaded model has separate terms: fafstmobel's Swift contribution uses the **Swift Open License v1.0**, including its US$1 million commercial-use threshold. Commercial use by a legal entity exceeding that threshold requires a separate Swift Enterprise License. Read the model's [license and notices](https://huggingface.co/satellitedown/fafstmobel#licensing-and-notices), including `LICENSE.swift`, before use or redistribution. Qwen, Huihui, and DFlash2 contributions retain their Apache-2.0 terms.
 
 [Build from source](docs/maintainer/build-system.md) · [Technical docs](docs/README.md) · [Attribution](NOTICE)
