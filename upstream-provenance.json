@@ -129,6 +129,7 @@
       "include/ninfer/ops/rmsnorm_swiglu_ffn.h",
       "results/rtx5090-archive-recall.json",
       "results/rtx5090-fafstmobel-dflash2-kernels-2.json",
+      "results/rtx5090-fafstmobel-dflash2-kernels-3.json",
       "results/rtx5090-fafstmobel-dflash2-kernels.json",
       "src/ops/linear_add/fp8/fp8_linear_add_mma.cu",
       "src/ops/rmsnorm_swiglu_ffn/nvfp4_rmsnorm_quantize.cu",
