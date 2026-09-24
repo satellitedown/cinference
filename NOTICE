@@ -30,7 +30,8 @@ and weight rows across heads and token tiles, GDN replay records that warm
 the next layer's state in L2, a fused RMSNorm E4M3 producer for the FP8
 attention input and FFN projections, wide K8V4 verify blocks whose
 otherwise idle compute warps accumulate part of the other rows' PV products,
-and a K8V4 prompt kernel that pipelines score and PV warps across key tiles.
+and a K8V4 prompt kernel that pipelines alternating score warp groups and PV
+warps across key tiles.
 Publication changes add fork branding, provenance and measurement scope,
 correct stale range text, make local-path instructions portable, and omit
 machine-local agent automation and unrelated sponsorship configuration.

@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: pipelined score and PV warps with staged copies.
+// Modified by satellitedown for Cinference: pipelined ping-pong score groups and PV warps.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -7,10 +7,11 @@
 // rotation and native FP8 Tensor Core path. Rotated V uses group-16 NVFP4, widens exactly to
 // FP16 for FP16/FP32 PV MMA, and the normalized result receives the FP32 inverse rotation.
 //
-// The CTA is two pipelined warp groups. Score warps run QK and the online softmax of key tile j
-// into a double-buffered P tile; PV warps meanwhile run the PV product of tile j - 1 and widen
-// tile j's V. Every row, key and value dimension sees the same operations in the same order as a
-// tile-at-a-time schedule.
+// The CTA is three pipelined warp groups. Two score groups alternate key tiles, each running QK
+// and the online softmax of its tile into its own P buffer, so one group's QK product overlaps the
+// other's softmax; only the running row statistics pass between them, in tile order. PV warps
+// meanwhile run the PV product of tile j - 1 and widen tile j's V. Every row, key and value
+// dimension sees the same operations in the same order as a tile-at-a-time schedule.
 
 #include "ops/common/mbarrier.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
@@ -32,12 +33,15 @@ inline constexpr int kCausalPromptK8V4Br       = 64;
 inline constexpr int kCausalPromptK8V4Bc       = 64;
 inline constexpr int kCausalPromptK8V4DB16     = kCausalPromptHeadDim / 2;
 inline constexpr int kCausalPromptK8V4RowTiles = kCausalPromptK8V4Br / 16;
-// Score warp w owns row tile w / 2 and the 32-key column half w % 2; PV warp 8 + p owns row tile
-// p % 4 and the 128-dimension half p / 4.
-inline constexpr int kCausalPromptK8V4ScoreWarps = 2 * kCausalPromptK8V4RowTiles;
+// Two score groups alternate key tiles: score warp w of group w / 4 owns row tile w % 4 over all
+// keys of its group's tiles. PV warp 8 + p owns row tile p % 4 and the 128-dimension half p / 4.
+inline constexpr int kCausalPromptK8V4ScoreGroups = 2;
+inline constexpr int kCausalPromptK8V4ScoreWarps =
+    kCausalPromptK8V4ScoreGroups * kCausalPromptK8V4RowTiles;
 inline constexpr int kCausalPromptK8V4PvWarps =
     kCausalPromptK8V4Warps - kCausalPromptK8V4ScoreWarps;
-inline constexpr int kCausalPromptK8V4GroupThreads = kCausalPromptK8V4ScoreWarps * 32;
+inline constexpr int kCausalPromptK8V4ScoreGroupThreads = kCausalPromptK8V4RowTiles * 32;
+inline constexpr int kCausalPromptK8V4PvThreads         = kCausalPromptK8V4PvWarps * 32;
 
 inline constexpr int kCausalPromptK8V4KBytes = kCausalPromptK8V4Bc * kCausalPromptHeadDim;
 inline constexpr int kCausalPromptK8V4KScaleBytes =
@@ -51,8 +55,9 @@ inline constexpr int kCausalPromptK8V4PBytes =
 inline constexpr int kCausalPromptK8V4RowBytes =
     kCausalPromptK8V4Br * static_cast<int>(sizeof(float));
 
-// Double-buffered K tiles and P tiles, single packed-V and widened-V stages; row statistics last,
-// behind the FP32 output staging the epilogue lays over the dead tiles.
+// Score group g stages its K tiles in K stage g and publishes their P tiles in P buffer g; single
+// packed-V and widened-V stages; row statistics last, behind the FP32 output staging the epilogue
+// lays over the dead tiles.
 inline constexpr int kCausalPromptK8V4KOffset      = 0;
 inline constexpr int kCausalPromptK8V4KScaleOffset = 2 * kCausalPromptK8V4KBytes;
 inline constexpr int kCausalPromptK8V4VOffset =
@@ -65,12 +70,15 @@ inline constexpr int kCausalPromptK8V4POffset =
     kCausalPromptK8V4VStageOffset + kCausalPromptK8V4VStageBytes;
 inline constexpr int kCausalPromptK8V4StatsOffset =
     kCausalPromptK8V4POffset + 2 * kCausalPromptK8V4PBytes;
-// q scale, two alpha buffers, two partial maxima and sums, running maximum and sum.
-inline constexpr int kCausalPromptK8V4StatsRows = 1 + 2 + 2 + 2 + 2;
+// q scale, two alpha buffers, running maximum and sum.
+inline constexpr int kCausalPromptK8V4StatsRows = 1 + 2 + 1 + 1;
 inline constexpr int kCausalPromptK8V4BarrierOffset =
     kCausalPromptK8V4StatsOffset + kCausalPromptK8V4StatsRows * kCausalPromptK8V4RowBytes;
+// p_ready and p_free per P buffer; m_ready and l_ready per row tile.
+inline constexpr int kCausalPromptK8V4Barriers = 2 * 2 + 2 * kCausalPromptK8V4RowTiles;
 inline constexpr int kCausalPromptK8V4SmemBytes =
-    kCausalPromptK8V4BarrierOffset + 4 * static_cast<int>(sizeof(std::uint64_t));
+    kCausalPromptK8V4BarrierOffset +
+    kCausalPromptK8V4Barriers * static_cast<int>(sizeof(std::uint64_t));
 
 static_assert(kCausalPromptK8V4ScoreWarps == 8 && kCausalPromptK8V4PvWarps == 8);
 static_assert(kCausalPromptK8V4Bc == kPagedKVPageSize);
@@ -79,7 +87,7 @@ static_assert(kCausalPromptK8V4Br * kCausalPromptHeadDim <= kCausalPromptK8V4VSt
 // The epilogue's FP32 output staging must end before the row statistics.
 static_assert(kCausalPromptK8V4Br * kCausalPromptHeadDim * static_cast<int>(sizeof(float)) <=
               kCausalPromptK8V4StatsOffset);
-static_assert(kCausalPromptK8V4SmemBytes == 93728);
+static_assert(kCausalPromptK8V4SmemBytes == 92768);
 
 template <typename Geometry, typename Metadata>
 __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
@@ -93,13 +101,14 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
     constexpr int Bc            = kCausalPromptK8V4Bc;
     constexpr int DB16          = kCausalPromptK8V4DB16;
     constexpr int QKKs          = D / 32;
-    constexpr int QKNt          = (Bc / 2) / 8;
+    constexpr int QKNt          = Bc / 8;
     constexpr int PVNt          = D / (2 * 8);
     constexpr int PVKs          = Bc / 16;
-    constexpr int GroupThreads  = kCausalPromptK8V4GroupThreads;
+    constexpr int ScoreThreads  = kCausalPromptK8V4ScoreGroupThreads;
+    constexpr int PvThreads     = kCausalPromptK8V4PvThreads;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffU;
-    static_assert(QKKs == 8 && QKNt == 4 && PVNt == 16);
+    static_assert(QKKs == 8 && QKNt == 8 && PVNt == 16);
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     const auto k_fp8 = [&](int stage) {
@@ -118,16 +127,17 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
     float* const stats       = reinterpret_cast<float*>(smem_raw + kCausalPromptK8V4StatsOffset);
     float* const q_scale     = stats;
     float* const alpha_s     = stats + Br;
-    float* const partial_m_s = alpha_s + 2 * Br;
-    float* const partial_l_s = partial_m_s + 2 * Br;
-    float* const running_m_s = partial_l_s + 2 * Br;
+    float* const running_m_s = alpha_s + 2 * Br;
     float* const running_l_s = running_m_s + Br;
-    // p_ready[b]: the score warps published a P tile and its rescale factors in buffer b;
-    // p_free[b]: the PV warps finished reading them.
+    // p_ready[b]: score group b published a P tile and its rescale factors in buffer b; p_free[b]:
+    // the PV warps finished reading them. m_ready[r] / l_ready[r]: the running maximum / sum of
+    // row tile r after one more key tile, handed between the two score groups.
     auto* const barriers =
         reinterpret_cast<std::uint64_t*>(smem_raw + kCausalPromptK8V4BarrierOffset);
     std::uint64_t* const p_ready = barriers;
     std::uint64_t* const p_free  = barriers + 2;
+    std::uint64_t* const m_ready = barriers + 4;
+    std::uint64_t* const l_ready = m_ready + kCausalPromptK8V4RowTiles;
 
     const int q_block = static_cast<int>(blockIdx.x);
     const int q_head  = static_cast<int>(blockIdx.y);
@@ -149,11 +159,13 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
     const int max_query_abs         = base_pos + q0 + tile_rows - 1;
     const int key_blocks            = max_query_abs / Bc + 1;
     const bool scores               = warp < kCausalPromptK8V4ScoreWarps;
-    const int group_tid             = scores ? tid : tid - GroupThreads;
+    // Score group of a score warp; its tiles are the key tiles kb with kb % 2 == score_group.
+    const int score_group = warp / kCausalPromptK8V4RowTiles;
+    const int group_tid   = scores ? tid % ScoreThreads : tid - kCausalPromptK8V4ScoreWarps * 32;
 
-    // Score warps stage K tiles (codes and scales), PV warps V tiles. Tiles are page-aligned, so
-    // one physical page id addresses a tile; a tile whose keys are all visible copies whole
-    // page-head blocks, and only the causal tail tests keys and zero-fills.
+    // Each score group stages its own K tiles (codes and scales), PV warps V tiles. Tiles are
+    // page-aligned, so one physical page id addresses a tile; a tile whose keys are all visible
+    // copies whole page-head blocks, and only the causal tail tests keys and zero-fills.
     const auto issue_k_tile = [&](int kb) {
         const int tile_k0       = kb * Bc;
         const int physical_page = block_table[kb];
@@ -163,8 +175,8 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
             const std::uint8_t* block =
                 cache_k + kv_cache_fp8_code_index<Geometry>(physical_page, kv_head, 0, 0);
 #pragma unroll
-            for (int i = 0; i < Bc * (D / 16) / GroupThreads; ++i) {
-                const int chunk = group_tid + i * GroupThreads;
+            for (int i = 0; i < Bc * (D / 16) / ScoreThreads; ++i) {
+                const int chunk = group_tid + i * ScoreThreads;
                 const int key_l = chunk / (D / 16);
                 const int dc    = chunk % (D / 16);
                 cp_async<16, Cache::cg>(&k[(key_l * DB16 + causal_prompt_swz(key_l, dc * 8)) * 2],
@@ -172,7 +184,7 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
             }
         } else {
 #pragma unroll 1
-            for (int chunk = group_tid; chunk < Bc * (D / 16); chunk += GroupThreads) {
+            for (int chunk = group_tid; chunk < Bc * (D / 16); chunk += ScoreThreads) {
                 const int key_l  = chunk / (D / 16);
                 const int dc     = chunk - key_l * (D / 16);
                 std::uint8_t* kd = &k[(key_l * DB16 + causal_prompt_swz(key_l, dc * 8)) * 2];
@@ -201,13 +213,13 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
             const std::uint8_t* block =
                 cache_v + kv_cache_nvfp4_code_index<Geometry>(physical_page, kv_head, 0, 0);
 #pragma unroll
-            for (int i = 0; i < Bc * (D / 32) / GroupThreads; ++i) {
-                const int chunk = group_tid + i * GroupThreads;
+            for (int i = 0; i < Bc * (D / 32) / PvThreads; ++i) {
+                const int chunk = group_tid + i * PvThreads;
                 cp_async<16, Cache::cg>(&v_nvfp4[chunk * 16], block + chunk * 16);
             }
         } else {
 #pragma unroll 1
-            for (int chunk = group_tid; chunk < Bc * (D / 32); chunk += GroupThreads) {
+            for (int chunk = group_tid; chunk < Bc * (D / 32); chunk += PvThreads) {
                 const int key_l  = chunk / (D / 32);
                 const int dc     = chunk - key_l * (D / 32);
                 std::uint8_t* vd = &v_nvfp4[chunk * 16];
@@ -262,16 +274,18 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
     }
     if (tid == 0) {
         for (int buffer = 0; buffer < 2; ++buffer) {
-            cta_mbarrier_init(&p_ready[buffer], GroupThreads);
-            cta_mbarrier_init(&p_free[buffer], GroupThreads);
+            cta_mbarrier_init(&p_ready[buffer], ScoreThreads);
+            cta_mbarrier_init(&p_free[buffer], PvThreads);
+        }
+        for (int row_tile = 0; row_tile < kCausalPromptK8V4RowTiles; ++row_tile) {
+            cta_mbarrier_init(&m_ready[row_tile], 32);
+            cta_mbarrier_init(&l_ready[row_tile], 32);
         }
         cta_mbarrier_fence_init();
     }
-    // Score warps keep K tiles j and j + 1 in flight, one commit group each; PV warps stage V.
+    // Each score group keeps its next K tile in flight; PV warps stage V.
     if (scores) {
-        issue_k_tile(0);
-        ninfer::ops::cp_commit();
-        if (key_blocks > 1) issue_k_tile(1);
+        if (score_group < key_blocks) issue_k_tile(score_group);
         ninfer::ops::cp_commit();
     } else {
         issue_v_tile(0);
@@ -291,9 +305,8 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
     float* const rotated_out = reinterpret_cast<float*>(smem_raw);
 
     if (scores) {
-        const int row_base     = (warp >> 1) * 16;
-        const int col_half     = warp & 1;
-        const int col_base     = col_half * (Bc / 2);
+        const int row_tile     = warp % kCausalPromptK8V4RowTiles;
+        const int row_base     = row_tile * 16;
         const int row0         = row_base + gid;
         const int row1         = row0 + 8;
         const int qabs0        = row0 < tile_rows ? base_pos + q0 + row0 : -1;
@@ -314,14 +327,19 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
         // The query tile is in registers; the PV warps may widen V over it.
         __syncthreads();
         const float scale_l2 = scale * Log2E;
+        const int barrier_id  = 1 + score_group;
+        const auto group_sync = [&] {
+            asm volatile("bar.sync %0, %1;" ::"r"(barrier_id), "n"(ScoreThreads) : "memory");
+        };
 
-        for (int kb = 0; kb < key_blocks; ++kb) {
-            const int k0     = kb * Bc;
-            const int buffer = kb & 1;
-            ninfer::ops::cp_wait<1>();
-            asm volatile("bar.sync 1, %0;" ::"n"(GroupThreads) : "memory");
+        // While one group scores tile kb, the other group's QK product of tile kb + 1 runs. Only
+        // the running statistics pass between them, through m_ready and l_ready of each row tile.
+        for (int kb = score_group; kb < key_blocks; kb += kCausalPromptK8V4ScoreGroups) {
+            const int k0 = kb * Bc;
+            ninfer::ops::cp_wait<0>();
+            group_sync();
 
-            const auto* k_b16 = reinterpret_cast<const __nv_bfloat16*>(k_fp8(buffer));
+            const auto* k_b16 = reinterpret_cast<const __nv_bfloat16*>(k_fp8(score_group));
             float score[QKNt][4];
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt)
@@ -330,7 +348,7 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
             for (int kk = 0; kk < QKKs; ++kk) {
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
-                    const int brow = col_base + nt * 8 + b_rin;
+                    const int brow = nt * 8 + b_rin;
                     const int bcol = kk * 16 + b_koff;
                     unsigned bf[2];
                     ldmatrix_x2(bf[0], bf[1],
@@ -339,10 +357,10 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
                                  qf[kk][1], qf[kk][2], qf[kk][3], bf[0], bf[1]);
                 }
             }
-            const __half* k_scale = k_scale_s(buffer);
+            const __half* k_scale = k_scale_s(score_group);
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                const int keya = col_base + nt * 8 + 2 * lid;
+                const int keya = nt * 8 + 2 * lid;
                 const int keyb = keya + 1;
                 float ks0      = gid == 0 ? __half2float(k_scale[keya]) : 0.0F;
                 float ks1      = gid == 0 ? __half2float(k_scale[keyb]) : 0.0F;
@@ -353,13 +371,20 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
                 score[nt][2] *= q_scale_r1 * ks0;
                 score[nt][3] *= q_scale_r1 * ks1;
             }
+            // Every warp of the group has consumed this K stage: refill it with the group's next
+            // tile.
+            group_sync();
+            if (kb + kCausalPromptK8V4ScoreGroups < key_blocks) {
+                issue_k_tile(kb + kCausalPromptK8V4ScoreGroups);
+            }
+            ninfer::ops::cp_commit();
 
             const bool full_score_tile = q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0;
             float bm0                  = -CUDART_INF_F;
             float bm1                  = -CUDART_INF_F;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                const int key0 = k0 + col_base + nt * 8 + 2 * lid;
+                const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
                 if (!full_score_tile) {
                     score[nt][0] = key0 <= qabs0 ? score[nt][0] : -CUDART_INF_F;
@@ -372,37 +397,37 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
             }
             bm0 = warp_max<4>(bm0, FullMask);
             bm1 = warp_max<4>(bm1, FullMask);
-            if (lid == 0) {
-                partial_m_s[col_half * Br + row0] = bm0;
-                partial_m_s[col_half * Br + row1] = bm1;
-            }
-            asm volatile("bar.sync 1, %0;" ::"n"(GroupThreads) : "memory");
-            // Every score warp has consumed this K stage: refill it with tile kb + 2.
-            if (kb + 2 < key_blocks) issue_k_tile(kb + 2);
-            ninfer::ops::cp_commit();
 
-            bm0                     = fmaxf(partial_m_s[row0], partial_m_s[Br + row0]);
-            bm1                     = fmaxf(partial_m_s[row1], partial_m_s[Br + row1]);
+            // The running maximum after tile kb - 1, published by the other group.
+            if (kb > 0) cta_mbarrier_wait(&m_ready[row_tile], (kb - 1) & 1);
             const float previous_m0 = running_m_s[row0];
             const float previous_m1 = running_m_s[row1];
             const float nm0         = fmaxf(previous_m0, bm0);
             const float nm1         = fmaxf(previous_m1, bm1);
-            const float nm0_scaled  = nm0 * scale_l2;
-            const float nm1_scaled  = nm1 * scale_l2;
-            const float alpha0      = previous_m0 == -CUDART_INF_F
-                                          ? 0.0F
-                                          : exp2_approx(__fmaf_rn(previous_m0, scale_l2, -nm0_scaled));
-            const float alpha1      = previous_m1 == -CUDART_INF_F
-                                          ? 0.0F
-                                          : exp2_approx(__fmaf_rn(previous_m1, scale_l2, -nm1_scaled));
-            // P buffer kb & 1 last held tile kb - 2.
-            if (kb >= 2) cta_mbarrier_wait(&p_free[buffer], ((kb - 2) >> 1) & 1);
-            __half* const p = p_s(buffer);
-            float bl0       = 0.0F;
-            float bl1       = 0.0F;
+            __syncwarp();
+            if (lid == 0) {
+                running_m_s[row0] = nm0;
+                running_m_s[row1] = nm1;
+            }
+            cta_mbarrier_arrive(&m_ready[row_tile]);
+            const float nm0_scaled = nm0 * scale_l2;
+            const float nm1_scaled = nm1 * scale_l2;
+            const float alpha0 = previous_m0 == -CUDART_INF_F
+                                     ? 0.0F
+                                     : exp2_approx(__fmaf_rn(previous_m0, scale_l2, -nm0_scaled));
+            const float alpha1 = previous_m1 == -CUDART_INF_F
+                                     ? 0.0F
+                                     : exp2_approx(__fmaf_rn(previous_m1, scale_l2, -nm1_scaled));
+            // P buffer score_group last held the group's previous tile, kb - 2.
+            if (kb >= 2) cta_mbarrier_wait(&p_free[score_group], ((kb - 2) >> 1) & 1);
+            __half* const p = p_s(score_group);
+            // Row sums per 32-key half, added in the order of two 32-key score warps.
+            float bl0[2] = {0.0F, 0.0F};
+            float bl1[2] = {0.0F, 0.0F};
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
-                const int col0  = col_base + nt * 8 + 2 * lid;
+                const int half  = nt / (QKNt / 2);
+                const int col0  = nt * 8 + 2 * lid;
                 const int col1  = col0 + 1;
                 const float p00 = score[nt][0] > -CUDART_INF_F
                                       ? exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled))
@@ -416,31 +441,30 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
                 const float p11 = score[nt][3] > -CUDART_INF_F
                                       ? exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled))
                                       : 0.0F;
-                bl0 += p00 + p01;
-                bl1 += p10 + p11;
+                bl0[half] += p00 + p01;
+                bl1[half] += p10 + p11;
                 p[row0 * Bc + causal_prompt_p_swz<Bc>(row0, col0)] = __float2half_rn(p00);
                 p[row0 * Bc + causal_prompt_p_swz<Bc>(row0, col1)] = __float2half_rn(p01);
                 p[row1 * Bc + causal_prompt_p_swz<Bc>(row1, col0)] = __float2half_rn(p10);
                 p[row1 * Bc + causal_prompt_p_swz<Bc>(row1, col1)] = __float2half_rn(p11);
             }
-            bl0 = warp_sum<4>(bl0, FullMask);
-            bl1 = warp_sum<4>(bl1, FullMask);
             if (lid == 0) {
-                partial_l_s[col_half * Br + row0] = bl0;
-                partial_l_s[col_half * Br + row1] = bl1;
+                alpha_s[score_group * Br + row0] = alpha0;
+                alpha_s[score_group * Br + row1] = alpha1;
             }
-            asm volatile("bar.sync 1, %0;" ::"n"(GroupThreads) : "memory");
-            if (col_half == 0 && lid == 0) {
-                const float tile_l0         = partial_l_s[row0] + partial_l_s[Br + row0];
-                const float tile_l1         = partial_l_s[row1] + partial_l_s[Br + row1];
-                running_l_s[row0]           = __fmaf_rn(running_l_s[row0], alpha0, tile_l0);
-                running_l_s[row1]           = __fmaf_rn(running_l_s[row1], alpha1, tile_l1);
-                running_m_s[row0]           = nm0;
-                running_m_s[row1]           = nm1;
-                alpha_s[buffer * Br + row0] = alpha0;
-                alpha_s[buffer * Br + row1] = alpha1;
+            cta_mbarrier_arrive(&p_ready[score_group]);
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                bl0[half] = warp_sum<4>(bl0[half], FullMask);
+                bl1[half] = warp_sum<4>(bl1[half], FullMask);
             }
-            cta_mbarrier_arrive(&p_ready[buffer]);
+            // The running sum after tile kb - 1, published by the other group.
+            if (kb > 0) cta_mbarrier_wait(&l_ready[row_tile], (kb - 1) & 1);
+            if (lid == 0) {
+                running_l_s[row0] = __fmaf_rn(running_l_s[row0], alpha0, bl0[0] + bl0[1]);
+                running_l_s[row1] = __fmaf_rn(running_l_s[row1], alpha1, bl1[0] + bl1[1]);
+            }
+            cta_mbarrier_arrive(&l_ready[row_tile]);
         }
         // Pairs with the PV warps' barrier before they read the final row sums.
         __syncthreads();
@@ -458,15 +482,15 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
         const auto widen = [&](int kb) {
             const int k0 = kb * Bc;
             ninfer::ops::cp_wait<0>();
-            asm volatile("bar.sync 2, %0;" ::"n"(GroupThreads) : "memory");
+            asm volatile("bar.sync 3, %0;" ::"n"(PvThreads) : "memory");
             // Every code word and scale is requested before the first conversion so the
             // shared-memory latencies overlap.
-            constexpr int kChunks = Bc * (D / 8) / GroupThreads;
+            constexpr int kChunks = Bc * (D / 8) / PvThreads;
             std::uint32_t packed[kChunks];
             std::uint8_t scale_codes[kChunks];
 #pragma unroll
             for (int i = 0; i < kChunks; ++i) {
-                const int chunk = group_tid + i * GroupThreads;
+                const int chunk = group_tid + i * PvThreads;
                 const int key_l = chunk / (D / 8);
                 const int d     = (chunk % (D / 8)) * 8;
                 packed[i]       = load_vec<std::uint32_t>(&v_nvfp4[key_l * (D / 2) + d / 2]);
@@ -474,7 +498,7 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
             }
 #pragma unroll
             for (int i = 0; i < kChunks; ++i) {
-                const int chunk = group_tid + i * GroupThreads;
+                const int chunk = group_tid + i * PvThreads;
                 const int key_l = chunk / (D / 8);
                 const int d     = (chunk % (D / 8)) * 8;
                 __half* dst     = &v_f16[key_l * D + causal_prompt_swz(key_l, d)];
@@ -487,7 +511,7 @@ __global__ __maxnreg__(128) void causal_attention_prompt_k8v4_kernel(
                 }
             }
             // The packed tile is consumed: stage the next one behind the widened stage.
-            asm volatile("bar.sync 2, %0;" ::"n"(GroupThreads) : "memory");
+            asm volatile("bar.sync 3, %0;" ::"n"(PvThreads) : "memory");
             if (kb + 1 < key_blocks) issue_v_tile(kb + 1);
             ninfer::ops::cp_commit();
         };
