@@ -65,7 +65,7 @@ The fifth pass also pipelines K8V4 prompt attention (`42e4b36`, `2d77e27`), whos
 | 32,768 | 7,096 → 7,629 (+7.5%) |
 | 131,072 | 3,827 → **4,575** (+19.5%) |
 
-A serving sweep of the first kernel pass on a synthetic Python coding prompt (512 output tokens, 1K–190K context) measured 10–21% shorter rounds. Its single-sample tokens/s varied more because greedy trajectories, and therefore acceptance, differ between builds. [Measurements](results/rtx5090-fafstmobel-dflash2-kernels.json).
+A serving sweep through `ninfer-serve` on a synthetic Python coding prompt (OpenAI Chat, greedy, 512 output tokens, 1K–190K context, one sample per point) measured 19–28% shorter rounds than `b4e8ed4` and 14–21% shorter time to first token from 32K up; for example, the 190K request's first token arrived in 51.3 s instead of 64.8 s. Single-sample tokens/s varies more because greedy trajectories, and therefore acceptance, differ between the builds. [Measurements](results/rtx5090-fafstmobel-dflash2-kernels-5.json); the first kernel pass measured 10–21% shorter rounds ([measurements](results/rtx5090-fafstmobel-dflash2-kernels.json)).
 
 ### Historical Huihui measurements
 
