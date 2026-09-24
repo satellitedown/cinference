@@ -23,8 +23,8 @@ head, retuned small-token A8 tiles, a wider argmax, a GDN record convolution
 fused into its input projection, a fused RMSNorm-SwiGLU FFN that hands both
 NVFP4 projections pre-quantized inputs, a fused query/key RMSNorm-RoPE, a K8V4
 verify query prepared once per block instead of in every attention split, a
-warp-level proposal top-k merge over L2-resident partials, and a staged
-selector walk.
+warp-level proposal top-k merge over L2-resident partials, a staged selector
+walk, and L2 discards of consumed attention split numerators.
 Publication changes add fork branding, provenance and measurement scope,
 correct stale range text, make local-path instructions portable, and omit
 machine-local agent automation and unrelated sponsorship configuration.

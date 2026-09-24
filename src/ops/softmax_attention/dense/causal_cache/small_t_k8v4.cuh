@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: warp-specialized wide kernel, prepared query tile.
+// Modified by satellitedown for Cinference: wide kernel, prepared query, L2-discarded partials.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -18,6 +18,7 @@
 // split, instead of being derived again in each split.
 
 #include "ops/common/mbarrier.cuh"
+#include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
@@ -1392,6 +1393,12 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_k8v4_reduce_outp
     normalized[tid] = head_l > 0.0F ? numerator / head_l : 0.0F;
     __syncthreads();
 
+    // This (head, token)'s split numerators were consumed above and stay dead until the next split
+    // pass rewrites them, so their lines leave L2 without a write-back.
+    for (int line = tid; line < active_splits * (kCausalHeadDim / 32); line += 256) {
+        discard_l2_line(&partial_acc[causal_partial_acc_index<Geometry>(q_head, (line & 7) * 32,
+                                                                        token, line >> 3, tokens)]);
+    }
     if (tid >= 32) return;
     float values[8];
 #pragma unroll
