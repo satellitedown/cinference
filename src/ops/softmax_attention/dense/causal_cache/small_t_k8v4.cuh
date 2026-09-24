@@ -475,6 +475,10 @@ __device__ __forceinline__ void k8v4_pv_pair(float (&acc)[4], const unsigned (&p
 
 // Scores one 16-row x Bc-key tile: scales, causal/split masking and the online-softmax update of
 // the row statistics. Leaves P (unnormalized, <= 1) in `score` and the row rescale factors.
+//
+// Most tiles lie inside their split and wholly before every query row's position. There no key is
+// masked and every score and row maximum is finite, so the same scaling and exponentials run
+// without the per-element mask and infinity selects.
 template <typename Geometry, int QKNt>
 __device__ __forceinline__ void
 k8v4_softmax_tile(float (&score)[QKNt][4], const __half* k_scale, float q_scale_r0,
@@ -494,24 +498,38 @@ k8v4_softmax_tile(float (&score)[QKNt][4], const __half* k_scale, float q_scale_
         score[nt][3] *= q_scale_r1 * ks1;
     }
 
+    const int last_key  = k0 + QKNt * 8 - 1;
+    const bool unmasked = __all_sync(
+        FullMask, row0_valid && row1_valid && k0 >= range.split_start &&
+                      last_key < range.split_end && last_key <= qabs0 && last_key <= qabs1);
     float bm0 = -CUDART_INF_F;
     float bm1 = -CUDART_INF_F;
+    if (unmasked) {
 #pragma unroll
-    for (int nt = 0; nt < QKNt; ++nt) {
-        const int key0 = k0 + nt * 8 + 2 * lid;
-        const int key1 = key0 + 1;
-        const bool in0 = key0 >= range.split_start && key0 < range.split_end;
-        const bool in1 = key1 >= range.split_start && key1 < range.split_end;
-        score[nt][0] =
-            row0_valid && in0 && key0 <= qabs0 ? score[nt][0] * attention_scale : -CUDART_INF_F;
-        score[nt][1] =
-            row0_valid && in1 && key1 <= qabs0 ? score[nt][1] * attention_scale : -CUDART_INF_F;
-        score[nt][2] =
-            row1_valid && in0 && key0 <= qabs1 ? score[nt][2] * attention_scale : -CUDART_INF_F;
-        score[nt][3] =
-            row1_valid && in1 && key1 <= qabs1 ? score[nt][3] * attention_scale : -CUDART_INF_F;
-        bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
-        bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+        for (int nt = 0; nt < QKNt; ++nt) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) score[nt][i] *= attention_scale;
+            bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+            bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+        }
+    } else {
+#pragma unroll
+        for (int nt = 0; nt < QKNt; ++nt) {
+            const int key0 = k0 + nt * 8 + 2 * lid;
+            const int key1 = key0 + 1;
+            const bool in0 = key0 >= range.split_start && key0 < range.split_end;
+            const bool in1 = key1 >= range.split_start && key1 < range.split_end;
+            score[nt][0] =
+                row0_valid && in0 && key0 <= qabs0 ? score[nt][0] * attention_scale : -CUDART_INF_F;
+            score[nt][1] =
+                row0_valid && in1 && key1 <= qabs0 ? score[nt][1] * attention_scale : -CUDART_INF_F;
+            score[nt][2] =
+                row1_valid && in0 && key0 <= qabs1 ? score[nt][2] * attention_scale : -CUDART_INF_F;
+            score[nt][3] =
+                row1_valid && in1 && key1 <= qabs1 ? score[nt][3] * attention_scale : -CUDART_INF_F;
+            bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+            bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+        }
     }
     bm0             = warp_max<4>(bm0, FullMask);
     bm1             = warp_max<4>(bm1, FullMask);
@@ -521,22 +539,34 @@ k8v4_softmax_tile(float (&score)[QKNt][4], const __half* k_scale, float q_scale_
     alpha1          = m1 == -CUDART_INF_F ? 0.0F : exp2_approx((m1 - nm1) * Log2E);
     float bl0       = 0.0F;
     float bl1       = 0.0F;
+    if (unmasked) {
 #pragma unroll
-    for (int nt = 0; nt < QKNt; ++nt) {
-        score[nt][0] = nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F
-                           ? exp2_approx((score[nt][0] - nm0) * Log2E)
-                           : 0.0F;
-        score[nt][1] = nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F
-                           ? exp2_approx((score[nt][1] - nm0) * Log2E)
-                           : 0.0F;
-        score[nt][2] = nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F
-                           ? exp2_approx((score[nt][2] - nm1) * Log2E)
-                           : 0.0F;
-        score[nt][3] = nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F
-                           ? exp2_approx((score[nt][3] - nm1) * Log2E)
-                           : 0.0F;
-        bl0 += score[nt][0] + score[nt][1];
-        bl1 += score[nt][2] + score[nt][3];
+        for (int nt = 0; nt < QKNt; ++nt) {
+            score[nt][0] = exp2_approx((score[nt][0] - nm0) * Log2E);
+            score[nt][1] = exp2_approx((score[nt][1] - nm0) * Log2E);
+            score[nt][2] = exp2_approx((score[nt][2] - nm1) * Log2E);
+            score[nt][3] = exp2_approx((score[nt][3] - nm1) * Log2E);
+            bl0 += score[nt][0] + score[nt][1];
+            bl1 += score[nt][2] + score[nt][3];
+        }
+    } else {
+#pragma unroll
+        for (int nt = 0; nt < QKNt; ++nt) {
+            score[nt][0] = nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F
+                               ? exp2_approx((score[nt][0] - nm0) * Log2E)
+                               : 0.0F;
+            score[nt][1] = nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F
+                               ? exp2_approx((score[nt][1] - nm0) * Log2E)
+                               : 0.0F;
+            score[nt][2] = nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F
+                               ? exp2_approx((score[nt][2] - nm1) * Log2E)
+                               : 0.0F;
+            score[nt][3] = nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F
+                               ? exp2_approx((score[nt][3] - nm1) * Log2E)
+                               : 0.0F;
+            bl0 += score[nt][0] + score[nt][1];
+            bl1 += score[nt][2] + score[nt][3];
+        }
     }
     bl0 = warp_sum<4>(bl0, FullMask);
     bl1 = warp_sum<4>(bl1, FullMask);
