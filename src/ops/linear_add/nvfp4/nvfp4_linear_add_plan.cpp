@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: report the pre-quantized W4A4 route.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 
@@ -59,6 +62,12 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
     return resolve_route(output_rows, input_rows, policy, max_tokens) == Nvfp4LinearAddRoute::W4A4
                ? nvfp4_w4a4_workspace_capacity_bytes(max_tokens, input_rows)
                : 0;
+}
+
+bool nvfp4_linear_add_takes_quantized(std::int32_t output_rows, std::int32_t input_rows,
+                                      LinearPolicy policy, std::int32_t tokens) {
+    return resolve_route(output_rows, input_rows, policy, tokens) == Nvfp4LinearAddRoute::W4A4 &&
+           !nvfp4_linear_add_w4a4_tma_route(tokens);
 }
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,

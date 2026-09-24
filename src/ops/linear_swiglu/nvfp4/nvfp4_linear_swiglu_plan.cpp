@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: report the quantized-activation W4A4 route.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
@@ -111,6 +114,11 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
         maximum = std::max(maximum, baseline_workspace_bytes(last_baseline));
     }
     return maximum;
+}
+
+bool nvfp4_linear_swiglu_quantizes_activation(LinearPolicy policy, std::int32_t tokens) {
+    return tokens <= kNvfp4LinearSwiGluQuantizedMaxTokens &&
+           resolve_route(policy, tokens) == Nvfp4LinearSwiGluRoute::FusedW4A4;
 }
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,

@@ -1,3 +1,6 @@
+# Modified by satellitedown for Cinference: register the rmsnorm_swiglu_ffn sources.
+# See NOTICE and upstream-provenance.json for upstream attribution.
+
 # Compile policy is owned here; each semantic family explicitly contributes sources.
 add_library(ninfer_ops STATIC)
 ninfer_internal_includes(ninfer_ops)
@@ -27,5 +30,6 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_topk/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm_rope/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm_swiglu_ffn/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/sparse_moe/sources.cmake")

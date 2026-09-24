@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: add small-token W4A4 LinearAdd schedules.
+// Modified by satellitedown for Cinference: small-token schedules; pre-quantized input.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -25,9 +25,6 @@ using M64N128           = Nvfp4W4a4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
 using M128N128Pipelined = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
 using M128N128Resident  = Nvfp4W4a4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
 
-// This projection selects its own route, so the layout the quantizer writes below must be derived
-// from the same predicate; the two are read together at the call site for that reason.
-constexpr bool w4a4_tma_route(std::int32_t tokens) { return tokens >= 1024; }
 
 template <class Geometry, class Schedule>
 void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace workspace,
@@ -70,11 +67,12 @@ void launch_problem(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace w
 void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
-    launch_nvfp4_w4a4_quantize(
-        x, weight, workspace,
-        w4a4_tma_route(tokens) ? Nvfp4ScaleLayout::Tiled : Nvfp4ScaleLayout::RowMajor, stream);
+    launch_nvfp4_w4a4_quantize(x, weight, workspace,
+                               nvfp4_linear_add_w4a4_tma_route(tokens) ? Nvfp4ScaleLayout::Tiled
+                                                                       : Nvfp4ScaleLayout::RowMajor,
+                               stream);
     const Nvfp4GeometryId problem = resolve_nvfp4_geometry(weight.n, weight.k);
-    if (w4a4_tma_route(tokens)) {
+    if (nvfp4_linear_add_w4a4_tma_route(tokens)) {
         const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
         launch_nvfp4_w4a4_tma_linear_add(problem, workspace.codes, workspace.scales,
                                          static_cast<const std::uint8_t*>(weight.qdata),
@@ -96,6 +94,28 @@ void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
         break;
     }
     throw std::invalid_argument("nvfp4 linear_add: unsupported problem");
+}
+
+void nvfp4_linear_add_w4a4_quantized_launch(const Weight& weight, Tensor& residual,
+                                            Nvfp4W4a4Workspace activation, std::int32_t tokens,
+                                            cudaStream_t stream) {
+    // The caller quantized with row-major scales, which only the routes below the TMA floor read.
+    if (tokens <= 0 || nvfp4_linear_add_w4a4_tma_route(tokens)) {
+        throw std::invalid_argument("nvfp4 linear_add pre-quantized input: unsupported T");
+    }
+    switch (resolve_nvfp4_geometry(weight.n, weight.k)) {
+    case Nvfp4GeometryId::N5120K6144:
+        launch_problem<Nvfp4N5120K6144>(weight, residual, activation, tokens, stream);
+        return;
+    case Nvfp4GeometryId::N5120K17408:
+        launch_problem<Nvfp4N5120K17408>(weight, residual, activation, tokens, stream);
+        return;
+    case Nvfp4GeometryId::N14336K5120:
+    case Nvfp4GeometryId::N16384K5120:
+    case Nvfp4GeometryId::N34816K5120:
+        break;
+    }
+    throw std::invalid_argument("nvfp4 linear_add pre-quantized input: unsupported problem");
 }
 
 } // namespace ninfer::ops::detail

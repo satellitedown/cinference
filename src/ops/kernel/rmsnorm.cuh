@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: let the wide-row kernel hand pairs to an output policy.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 // ninfer::ops - RMSNorm kernels over contiguous BF16 rows.
@@ -8,6 +11,7 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -135,16 +139,40 @@ __launch_bounds__(Block) __global__
                               rmsnorm_epilogue<Epilogue>(x1.y, inv, w1.y, z1.y));
 }
 
+// Default output of the wide-row kernel: each normalized BF16 pair lands at its row position.
+struct RmsPairOutput {
+    static constexpr int kRowSlices = 1;
+
+    __nv_bfloat162* data;
+
+    __host__ __device__ RmsPairOutput(__nv_bfloat162* pointer) : data(pointer) {}
+
+    __device__ __forceinline__ void store(std::int64_t row_base, int pair,
+                                          __nv_bfloat162 value) const {
+        data[row_base + pair] = value;
+    }
+};
+
 // Fast geometry for wide rows. One CTA owns one row and keeps up to MaxPairsPerThread BF16x2
 // values per lane. The launcher admits only widths evenly divisible by the CTA vector span.
-template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread, bool Prefetch, int FixedD = 0>
+// Output receives every normalized pair; a policy other than the plain store sees pair
+// threadIdx.x + k * Block on every lane for each k, since a fixed width leaves no lane idle.
+// Output::kRowSlices CTAs may share a row: each forms the complete sum of squares (so all derive
+// the same factor) and hands over only its own contiguous run of k.
+template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread, bool Prefetch, int FixedD = 0,
+          class Output = RmsPairOutput>
 __launch_bounds__(Block) __global__
     void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                   const __nv_bfloat162* z, __nv_bfloat162* out,
+                                   const __nv_bfloat162* z, std::type_identity_t<Output> out,
                                    std::int32_t input_d, std::int64_t rows, float eps) {
     const int d = FixedD ? FixedD : input_d;
     static_assert(Block % kWarpSize == 0);
-    const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
+    constexpr int kSlices = Output::kRowSlices;
+    static_assert(kSlices == 1 || (FixedD != 0 && MaxPairsPerThread % kSlices == 0 &&
+                                   FixedD / 2 == Block * MaxPairsPerThread));
+    constexpr int kSliceSteps = MaxPairsPerThread / kSlices;
+    const std::int64_t row    = static_cast<std::int64_t>(blockIdx.x) / kSlices;
+    const int first_step      = static_cast<int>(blockIdx.x % kSlices) * kSliceSteps;
     if (row >= rows) { return; }
 
     const int pairs             = d / 2;
@@ -182,7 +210,7 @@ __launch_bounds__(Block) __global__
 
 #pragma unroll
     for (int k = 0; k < MaxPairsPerThread; ++k) {
-        if (k < pairs_per_thread) {
+        if (k < pairs_per_thread && k >= first_step && k < first_step + kSliceSteps) {
             const int pair  = static_cast<int>(threadIdx.x) + k * Block;
             const float2 xf = __bfloat1622float2(values[k]);
             __nv_bfloat162 w_pair;
@@ -197,9 +225,9 @@ __launch_bounds__(Block) __global__
             const float2 wf = __bfloat1622float2(w_pair);
             float2 zf{0.0f, 0.0f};
             if constexpr (Epilogue == RmsEpilogue::Gated) { zf = __bfloat1622float2(z_pair); }
-            out[row_base + pair] =
-                __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
-                                      rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
+            out.store(row_base, pair,
+                      __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
+                                            rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y)));
         }
     }
 }

@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: run dense FFN blocks through rmsnorm_swiglu_ffn.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
@@ -29,6 +32,7 @@
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/rmsnorm_swiglu_ffn.h"
 #include "ninfer/ops/rope.h"
 #include "ninfer/ops/sparse_moe.h"
 #include "ninfer/ops/scatter.h"
@@ -406,7 +410,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
     {
         auto post_mixer_scope = work_.scope();
-        ffn(mh, mtp_->ffn, x, {}, work_, s, true);
+        ffn(mh, mtp_->ffn, x, {}, work_, s);
     }
 
     Tensor flat_mtp_hidden = mtp_hidden.view({dimension(config_.hidden_size), T});
@@ -554,7 +558,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rmsnorm(x_last, mtp_->post_attention_norm, config_.rms_norm_eps, true, mh, s);
         {
             auto post_mixer_scope = work_.scope();
-            ffn(mh, mtp_->ffn, x_last, {}, work_, s, true);
+            ffn(mh, mtp_->ffn, x_last, {}, work_, s);
         }
         ops::rmsnorm(x_last, mtp_->final_norm, config_.rms_norm_eps, true, *final_hidden, s);
         proposal_argmax(*final_hidden, *logits, *draft_token);
@@ -1068,6 +1072,12 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase,
                            const ops::SparseMoeHints& hints) {
+    if (const auto* dense = std::get_if<DenseParameters>(&weights.ffn)) {
+        ops::rmsnorm_swiglu_ffn(x, weights.post_attention_norm, config_.rms_norm_eps, true,
+                                dense->gate_up.weight, dense->gate_up.policy, dense->down.weight,
+                                dense->down.policy, work_, ctx_.stream);
+        return;
+    }
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
     ffn(h, weights.ffn, x, hints, work_, ctx_.stream);

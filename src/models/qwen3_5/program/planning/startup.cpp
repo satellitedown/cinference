@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: support MTP-10 planning and matching range diagnostics.
+// Modified by satellitedown for Cinference: MTP-10 planning and diagnostics; fused dense FFN.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/execution/attention.h"
@@ -20,6 +20,7 @@
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/rmsnorm_swiglu_ffn.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -359,8 +360,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 }
             }
             auto stage = layout.scope();
-            (void)workspace::post_mixer_hidden(layout, config, last);
-            scratch(layout, execution::ffn_workspace_bytes(block.ffn, first, last));
+            if (const auto* dense = std::get_if<execution::DenseParameters>(&block.ffn)) {
+                scratch(layout, ops::rmsnorm_swiglu_ffn_workspace_capacity_bytes(
+                                    dense->gate_up.weight, dense->gate_up.policy,
+                                    dense->down.weight, dense->down.policy, first, last));
+            } else {
+                (void)workspace::post_mixer_hidden(layout, config, last);
+                scratch(layout, execution::ffn_workspace_bytes(block.ffn, first, last));
+            }
         }
         if (!plan.causal_scoring) {
             linear_scratch(layout, parameters.text.output_head, first, last);
@@ -368,7 +375,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
         linear_scratch(layout, parameters.mtp->output, first, last);
-        scratch(layout, execution::ffn_workspace_bytes(parameters.mtp->ffn, first, last, true));
+        scratch(layout, execution::ffn_workspace_bytes(parameters.mtp->ffn, first, last));
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {

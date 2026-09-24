@@ -19,8 +19,9 @@ schedules, a double-buffered K-split FP8 LinearAdd, staged GDN records with
 lane-shared reductions, a warp-specialized K8V4 attention kernel with
 loader-assisted PV products, evict-first L2 fills for once-read verify weights,
 proposal-head and GDN convolution staging, a bank-conflict-free Q4 proposal
-head, retuned small-token A8 tiles, a wider argmax, and a GDN record
-convolution fused into its input projection. Publication changes add fork
+head, retuned small-token A8 tiles, a wider argmax, a GDN record convolution
+fused into its input projection, and a fused RMSNorm-SwiGLU FFN that hands
+both NVFP4 projections pre-quantized inputs. Publication changes add fork
 branding, provenance and measurement scope, correct stale range text, make
 local-path instructions portable, and omit machine-local agent automation and
 unrelated sponsorship configuration. Modified retained files carry modification

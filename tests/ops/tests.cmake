@@ -1,3 +1,6 @@
+# Modified by satellitedown for Cinference: register the rmsnorm_swiglu_ffn test.
+# See NOTICE and upstream-provenance.json for upstream attribution.
+
 set(ninfer_op_tests
   add_bias
   gelu
@@ -67,6 +70,10 @@ ninfer_add_op_test(ninfer_kv_cache_append_test
 
 ninfer_add_op_test(ninfer_rmsnorm_rope_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rmsnorm_rope.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_rmsnorm_swiglu_ffn_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rmsnorm_swiglu_ffn.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_context_kv_materialize_test

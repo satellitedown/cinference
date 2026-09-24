@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: mark single-token-tile weight fills evict-first in L2.
+// Modified by satellitedown for Cinference: evict-first weight fills; tile-finishing outputs.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -15,6 +15,13 @@
 #include <cstdint>
 
 namespace ninfer::ops::detail {
+
+// An output policy that finishes the whole staged BF16 tile ([token][local row], row stride
+// `stride`; with PairRows the paired rows follow the first half) instead of taking row vectors.
+template <class Output>
+concept Nvfp4W4a4TileFinisher = requires(const Output& output, const __nv_bfloat16* tile) {
+    output.finish_tile(tile, 0, 0, 0, 0);
+};
 
 template <int BlockM, int BlockN, int BlockK, int WarpsM, int WarpsN, int Stages,
           int MinBlocksPerSm>
@@ -367,23 +374,27 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
         }
     }
     __syncthreads();
-    constexpr int kStoredRows    = PairRows ? Schedule::kBlockN / 2 : Schedule::kBlockN;
-    constexpr int kVectorsPerRow = kStoredRows / 8;
-    constexpr int kOutputVectors = Schedule::kBlockM * kVectorsPerRow;
-    for (int task = static_cast<int>(threadIdx.x); task < kOutputVectors;
-         task += Schedule::kThreads) {
-        const int token_local = task / kVectorsPerRow;
-        const int row_vector  = task - token_local * kVectorsPerRow;
-        const int token       = token_begin + token_local;
-        if (token < tokens) {
-            const uint4 values =
-                load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
-            if constexpr (PairRows) {
-                const uint4 paired = load_vec<uint4>(shared_output + token_local * kOutputStride +
-                                                     kStoredRows + row_vector * 8);
-                output.store_pair_vector(row_begin + row_vector * 8, token, values, paired);
-            } else {
-                output.store_vector(row_begin + row_vector * 8, token, values);
+    if constexpr (Nvfp4W4a4TileFinisher<OutputPolicy>) {
+        output.finish_tile(shared_output, kOutputStride, row_begin, token_begin, tokens);
+    } else {
+        constexpr int kStoredRows    = PairRows ? Schedule::kBlockN / 2 : Schedule::kBlockN;
+        constexpr int kVectorsPerRow = kStoredRows / 8;
+        constexpr int kOutputVectors = Schedule::kBlockM * kVectorsPerRow;
+        for (int task = static_cast<int>(threadIdx.x); task < kOutputVectors;
+             task += Schedule::kThreads) {
+            const int token_local = task / kVectorsPerRow;
+            const int row_vector  = task - token_local * kVectorsPerRow;
+            const int token       = token_begin + token_local;
+            if (token < tokens) {
+                const uint4 values =
+                    load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
+                if constexpr (PairRows) {
+                    const uint4 paired = load_vec<uint4>(
+                        shared_output + token_local * kOutputStride + kStoredRows + row_vector * 8);
+                    output.store_pair_vector(row_begin + row_vector * 8, token, values, paired);
+                } else {
+                    output.store_vector(row_begin + row_vector * 8, token, values);
+                }
             }
         }
     }

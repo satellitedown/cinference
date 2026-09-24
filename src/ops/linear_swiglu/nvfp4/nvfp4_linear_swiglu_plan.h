@@ -1,9 +1,13 @@
+// Modified by satellitedown for Cinference: declare the quantized-activation W4A4 launcher.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
+#include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 
 #include <cuda_runtime.h>
 
@@ -22,6 +26,20 @@ void nvfp4_linear_swiglu_small_t_launch(const Tensor& x, const Weight& weight, T
                                         cudaStream_t stream);
 void nvfp4_linear_swiglu_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                      WorkspaceArena& workspace, cudaStream_t stream);
+
+// The W4A4 single-token-tile route can hand its activation straight to a following W4A4
+// projection: given the quantized input, it writes the activation's codes and row-major scales
+// (quantized with that projection's input divisor) instead of the BF16 activation.
+inline constexpr std::int32_t kNvfp4LinearSwiGluQuantizedMaxTokens = 16;
+
+// True when T takes that route under the policy.
+[[nodiscard]] bool nvfp4_linear_swiglu_quantizes_activation(LinearPolicy policy,
+                                                            std::int32_t tokens);
+
+void nvfp4_linear_swiglu_w4a4_quantized_launch(Nvfp4W4a4Workspace input, const Weight& weight,
+                                               std::int32_t tokens, Nvfp4W4a4Workspace activation,
+                                               float activation_input_scale_divisor,
+                                               cudaStream_t stream);
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                   LinearPolicy policy, WorkspaceArena& workspace,
