@@ -1,0 +1,76 @@
+{
+  "scope": "Engine-level DFlash2 verification speedup for fafstmobel on one RTX 5090 (32 GB), second kernel pass. Round time is the controlled metric; tokens/s also depends on draft acceptance. The second-pass changes are bit-exact, so f6a654c and the new revision accept identical drafts; b4e8ed4 differs at 32K because the first pass changed attention numerics.",
+  "hardware": "NVIDIA GeForce RTX 5090 32 GB; desktop GPU workloads active during measurement",
+  "model": "fafstmobel NInfer v3 artifact; DFlash2 with 15 draft tokens; optimized proposal head (--lm-head-draft); K8V4 KV cache",
+  "revisions": {
+    "baseline": "b4e8ed40458fce5b1b6374131783aca6123f9a22",
+    "first_pass": "f6a654c",
+    "second_pass": "6b1c3fa (double-buffered K-split LinearAdd, lane-shared GDN record reductions, evict-first L2 fills for once-read verify weights, loader-assisted K8V4 PV)"
+  },
+  "product_benchmark": {
+    "tool": "ninfer_bench --spec dflash2 --draft-tokens 15 --lm-head-draft --kv-dtype k8v4 --warmup 1 -r 2; greedy; 256 generated tokens",
+    "protocol": "the three binaries alternate for four runs (8K, 32K) or three runs (131K); median of runs",
+    "points": [
+      {
+        "prompt_tokens": 8192,
+        "ms_per_round": {
+          "baseline": 19.751,
+          "first_pass": 17.623,
+          "second_pass": 17.128
+        },
+        "tokens_per_second": {
+          "baseline": 381.4,
+          "first_pass": 427.3,
+          "second_pass": 439.6
+        },
+        "tokens_per_round": {
+          "baseline": 7.53,
+          "first_pass": 7.53,
+          "second_pass": 7.53
+        },
+        "round_time_change_percent_vs_baseline": -13.3,
+        "round_time_change_percent_vs_first_pass": -2.8
+      },
+      {
+        "prompt_tokens": 32768,
+        "ms_per_round": {
+          "baseline": 21.006,
+          "first_pass": 18.171,
+          "second_pass": 17.494
+        },
+        "tokens_per_second": {
+          "baseline": 435.3,
+          "first_pass": 521.9,
+          "second_pass": 542.0
+        },
+        "tokens_per_round": {
+          "baseline": 9.14,
+          "first_pass": 9.48,
+          "second_pass": 9.48
+        },
+        "round_time_change_percent_vs_baseline": -16.7,
+        "round_time_change_percent_vs_first_pass": -3.7
+      },
+      {
+        "prompt_tokens": 131072,
+        "ms_per_round": {
+          "baseline": 24.871,
+          "first_pass": 21.522,
+          "second_pass": 20.87
+        },
+        "tokens_per_second": {
+          "baseline": 411.8,
+          "first_pass": 476.2,
+          "second_pass": 490.9
+        },
+        "tokens_per_round": {
+          "baseline": 10.24,
+          "first_pass": 10.24,
+          "second_pass": 10.24
+        },
+        "round_time_change_percent_vs_baseline": -16.1,
+        "round_time_change_percent_vs_first_pass": -3.0
+      }
+    ]
+  }
+}

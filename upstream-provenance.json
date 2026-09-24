@@ -113,7 +113,8 @@
       "upstream-provenance.json",
       "results/rtx5090-archive-recall.json",
       "src/ops/linear_add/fp8/fp8_linear_add_mma.cu",
-      "results/rtx5090-fafstmobel-dflash2-kernels.json"
+      "results/rtx5090-fafstmobel-dflash2-kernels.json",
+      "results/rtx5090-fafstmobel-dflash2-kernels-2.json"
     ],
     "excluded_source_paths": [
       ".codex/hooks.json",

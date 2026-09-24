@@ -11,7 +11,7 @@ Built from [NInfer](https://github.com/Neroued/ninfer), with source-level change
 - **MTP-10 decoding:** raised the draft window from 5 to 10 tokens. Longer proposals let the engine emit more tokens per verification round when the drafts are accepted.
 - **Capture-based CUDA Graph reuse:** reworked MTP graph matching to use the captured node types and kernel functions. Profiles with matching signatures and batch sizes share an executable, rather than relying only on planned context ranges.
 - **Expanded CPU/GPU round handling:** enlarged draft and token-position buffers and updated native validation for the longer windows. This carries MTP-10 through the decoding path, not just the command-line options.
-- **Faster DFlash2 verification:** rewrote the verify-width kernels behind fafstmobel's DFlash2-15 rounds: small-token FP8/NVFP4 projection schedules, a K-split FP8 LinearAdd, staged GDN replay records, a warp-specialized K8V4 attention kernel that accumulates PV products in FP16 from exactly widened V, and wider proposal-head tiles. Each kernel is qualified against the existing independent oracles; greedy speculative output still matches plain target decoding.
+- **Faster DFlash2 verification:** rewrote the verify-width kernels behind fafstmobel's DFlash2-15 rounds: small-token FP8/NVFP4 projection schedules, a double-buffered K-split FP8 LinearAdd, staged GDN replay records with lane-shared reductions, a warp-specialized K8V4 attention kernel that accumulates PV products in FP16 from exactly widened V and balances them across SM sub-partitions, evict-first L2 fills for once-read verify weights, and wider proposal-head tiles. Each kernel is qualified against the existing independent oracles; greedy speculative output still matches plain target decoding.
 - **Ready-to-run fafstmobel setup:** a Swift-based Qwen3.8-27B derivative with Huihui's abliteration delta and NVFP4/FP8 text weights. One ~23.7 GB NInfer v3 file bundles text, vision, MTP, and the pretrained DFlash2 draft; no local conversion or separate draft download is needed. The recommended installer uses the engine's existing DFlash2 support, not MTP-10.
 
 ## Run
@@ -44,17 +44,19 @@ The [fafstmobel model card](https://huggingface.co/satellitedown/fafstmobel#meas
 
 ### DFlash2 verification speedup
 
-fafstmobel with DFlash2-15, before (`b4e8ed4`) and after the kernel changes above:
+fafstmobel with DFlash2-15, before (`b4e8ed4`) and after the kernel changes above (`6b1c3fa`):
 
 | Prompt tokens | Round time before → after | Tokens/s before → after |
 |---:|---:|---:|
-| 8,192 | 19.42 → 17.34 ms (−10.7%) | 387.8 → **434.3** (+12.0%) |
-| 32,768 | 20.70 → 18.11 ms (−12.5%) | 441.8 → **523.7** (+18.5%)¹ |
-| 131,072 | 24.19 → 20.39 ms (−15.7%) | 423.4 → **502.3** (+18.6%) |
+| 8,192 | 19.75 → 17.13 ms (−13.3%) | 381.4 → **439.6** (+15.3%) |
+| 32,768 | 21.01 → 17.49 ms (−16.7%) | 435.3 → **542.0** (+24.5%)¹ |
+| 131,072 | 24.87 → 20.87 ms (−16.1%) | 411.8 → **490.9** (+19.2%) |
 
-`ninfer_bench`, greedy, 256 generated tokens, optimized proposal head, K8V4, alternating builds on one RTX 5090 with desktop GPU workloads running. At 8K and 131K both builds accepted the same drafts, so the tokens/s gain is engine speed alone. ¹ At 32K the optimized build also accepted more drafts (9.14 → 9.48 tokens/round); engine speed alone accounts for about +14%.
+`ninfer_bench`, greedy, 256 generated tokens, optimized proposal head, K8V4, alternating builds on one RTX 5090 with desktop GPU workloads running. At 8K and 131K both builds accepted the same drafts, so the tokens/s gain is engine speed alone. ¹ At 32K the optimized build also accepted more drafts (9.14 → 9.48 tokens/round); engine speed alone accounts for about +20%.
 
-A serving sweep on a synthetic Python coding prompt (512 output tokens, 1K–190K context) measured 10–21% shorter rounds. Its single-sample tokens/s varied more because greedy trajectories, and therefore acceptance, differ between builds. [Measurements](results/rtx5090-fafstmobel-dflash2-kernels.json).
+The second kernel pass is bit-exact: against the previous release (`f6a654c`) it accepts the same drafts and shortens rounds by 2.8% at 8K, 3.7% at 32K and 3.0% at 131K. [Measurements](results/rtx5090-fafstmobel-dflash2-kernels-2.json).
+
+A serving sweep of the first kernel pass on a synthetic Python coding prompt (512 output tokens, 1K–190K context) measured 10–21% shorter rounds. Its single-sample tokens/s varied more because greedy trajectories, and therefore acceptance, differ between builds. [Measurements](results/rtx5090-fafstmobel-dflash2-kernels.json).
 
 ### Historical Huihui measurements
 
