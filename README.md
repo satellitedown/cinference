@@ -44,15 +44,17 @@ The [fafstmobel model card](https://huggingface.co/satellitedown/fafstmobel#meas
 
 ### DFlash2 verification speedup
 
-Time per DFlash2-15 verification round for fafstmobel, before (`b4e8ed4`) and after the kernel changes above:
+fafstmobel with DFlash2-15, before (`b4e8ed4`) and after the kernel changes above:
 
-| Prompt tokens | Before (ms/round) | After (ms/round) | Round time |
-|---:|---:|---:|---:|
-| 8,192 | 19.42 | 17.34 | −10.7% |
-| 32,768 | 20.70 | 18.11 | −12.5% |
-| 131,072 | 24.19 | 20.39 | −15.7% |
+| Prompt tokens | Round time before → after | Tokens/s before → after |
+|---:|---:|---:|
+| 8,192 | 19.42 → 17.34 ms (−10.7%) | 387.8 → **434.3** (+12.0%) |
+| 32,768 | 20.70 → 18.11 ms (−12.5%) | 441.8 → **523.7** (+18.5%)¹ |
+| 131,072 | 24.19 → 20.39 ms (−15.7%) | 423.4 → **502.3** (+18.6%) |
 
-`ninfer_bench`, greedy, 256 generated tokens, optimized proposal head, K8V4, alternating builds on one RTX 5090 with desktop GPU workloads running. A serving sweep on a synthetic Python coding prompt (512 output tokens, 1K–190K context) measured 10–21% shorter rounds. Tokens/s also depends on how many drafts are accepted, which varies by prompt and between builds, so it is reported per point rather than as one speedup. [Measurements](results/rtx5090-fafstmobel-dflash2-kernels.json).
+`ninfer_bench`, greedy, 256 generated tokens, optimized proposal head, K8V4, alternating builds on one RTX 5090 with desktop GPU workloads running. At 8K and 131K both builds accepted the same drafts, so the tokens/s gain is engine speed alone. ¹ At 32K the optimized build also accepted more drafts (9.14 → 9.48 tokens/round); engine speed alone accounts for about +14%.
+
+A serving sweep on a synthetic Python coding prompt (512 output tokens, 1K–190K context) measured 10–21% shorter rounds. Its single-sample tokens/s varied more because greedy trajectories, and therefore acceptance, differ between builds. [Measurements](results/rtx5090-fafstmobel-dflash2-kernels.json).
 
 ### Historical Huihui measurements
 
