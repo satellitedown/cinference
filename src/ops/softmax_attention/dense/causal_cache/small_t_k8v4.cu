@@ -16,48 +16,31 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
                          PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                          std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
                          Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
-    constexpr int RowCount             = TokenTile * Geometry::GroupSize;
-    constexpr int RowTiles             = (RowCount + 15) / 16;
-    // More than three row tiles is a complete wide verify block. Two consumer warps per row tile
-    // keep the PV accumulator at sixteen n-tiles, and the double-buffered 32-key tile keeps
-    // Q, P, two packed K/V stages and the widened V tile within one CTA's shared memory.
-    constexpr bool Wide     = RowTiles > 3;
-    constexpr int Warps     = Wide ? 2 * RowTiles : (RowTiles == 3 ? 12 : 8);
-    constexpr int KeyBlock  = TokenTile == 1 || Wide ? 32 : 64;
-    constexpr int Stages    = Wide ? 2 : 1;
-    constexpr int MinBlocks            = TokenTile == 1 ? 2 : 1;
-    constexpr std::size_t DynamicBytes =
-        static_cast<std::size_t>(Stages) * 3u * KeyBlock * kCausalHeadDim / 2u +
-        2u * KeyBlock * kCausalHeadDim;
-    using KernelInput                  = CacheInput;
+    constexpr int RowCount = TokenTile * Geometry::GroupSize;
+    constexpr int RowTiles = (RowCount + 15) / 16;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
-    const auto launch = [&]() {
-        auto kernel =
-            causal_attention_small_t_k8v4_tiled_kernel<Geometry, TokenTile, Warps, MinBlocks,
-                                                       KeyBlock, true, MultiBatch, Masked,
-                                                       KernelInput, Stages>;
-        static const cudaError_t attr = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(DynamicBytes));
-        CUDA_CHECK(attr);
+    const auto q_ptr         = static_cast<const __nv_bfloat16*>(q.data);
+    const auto positions_ptr = static_cast<const std::int32_t*>(positions.data);
+    const auto cache_k_ptr   = static_cast<std::uint8_t*>(cache.k_pages.data);
+    const auto cache_v_ptr   = static_cast<std::uint8_t*>(cache.v_pages.data);
+    const auto k_scale_ptr   = static_cast<__half*>(cache.k_scale_pages.data);
+    const auto v_scale_ptr   = static_cast<std::uint8_t*>(cache.v_scale_pages.data);
+    const auto tables_ptr    = static_cast<const std::int32_t*>(cache.block_tables.data);
+    const auto valid_ptr  = invocation.valid_columns == nullptr
+                                ? nullptr
+                                : static_cast<const std::int32_t*>(invocation.valid_columns->data);
+    const auto rows_ptr   = invocation.table_rows == nullptr
+                                ? nullptr
+                                : static_cast<const std::int32_t*>(invocation.table_rows->data);
+    auto* partial_acc_ptr = static_cast<float*>(partial_acc.data);
+    auto* partial_m_ptr   = static_cast<float*>(partial_m.data);
+    auto* partial_l_ptr   = static_cast<float*>(partial_l.data);
 
-        const auto q_ptr         = static_cast<const __nv_bfloat16*>(q.data);
-        const auto positions_ptr = static_cast<const std::int32_t*>(positions.data);
-        const auto cache_k_ptr   = static_cast<std::uint8_t*>(cache.k_pages.data);
-        const auto cache_v_ptr   = static_cast<std::uint8_t*>(cache.v_pages.data);
-        const auto k_scale_ptr   = static_cast<__half*>(cache.k_scale_pages.data);
-        const auto v_scale_ptr   = static_cast<std::uint8_t*>(cache.v_scale_pages.data);
-        const auto tables_ptr    = static_cast<const std::int32_t*>(cache.block_tables.data);
-        const auto valid_ptr =
-            invocation.valid_columns == nullptr
-                ? nullptr
-                : static_cast<const std::int32_t*>(invocation.valid_columns->data);
-        const auto rows_ptr   = invocation.table_rows == nullptr
-                                    ? nullptr
-                                    : static_cast<const std::int32_t*>(invocation.table_rows->data);
-        auto* partial_acc_ptr = static_cast<float*>(partial_acc.data);
-        auto* partial_m_ptr   = static_cast<float*>(partial_m.data);
-        auto* partial_l_ptr   = static_cast<float*>(partial_l.data);
-        kernel<<<grid, Warps * 32, DynamicBytes, stream>>>(
+    const auto launch = [&](auto kernel, int threads, std::size_t dynamic_bytes) {
+        static const cudaError_t attr = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(dynamic_bytes));
+        CUDA_CHECK(attr);
+        kernel<<<grid, threads, dynamic_bytes, stream>>>(
             q_ptr, input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr, v_scale_ptr,
             tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0], invocation.full_width,
             invocation.column_begin, logical_capacity, scale, partial_acc_ptr, partial_m_ptr,
@@ -65,7 +48,23 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
         CUDA_CHECK(cudaGetLastError());
     };
 
-    launch();
+    if constexpr (RowTiles > 3) {
+        // A complete wide verify block: compute warps own whole 16-row tiles for the split.
+        using Schedule = K8V4WideSchedule<Geometry, TokenTile>;
+        launch(causal_attention_small_t_k8v4_wide_kernel<Geometry, TokenTile, MultiBatch, Masked,
+                                                         CacheInput>,
+               Schedule::Threads, static_cast<std::size_t>(Schedule::DynamicBytes));
+    } else {
+        constexpr int Warps     = RowTiles == 3 ? 12 : 8;
+        constexpr int KeyBlock  = TokenTile == 1 ? 32 : 64;
+        constexpr int MinBlocks = TokenTile == 1 ? 2 : 1;
+        constexpr std::size_t DynamicBytes =
+            3u * KeyBlock * kCausalHeadDim / 2u + 2u * KeyBlock * kCausalHeadDim;
+        launch(causal_attention_small_t_k8v4_tiled_kernel<Geometry, TokenTile, Warps, MinBlocks,
+                                                          KeyBlock, true, MultiBatch, Masked,
+                                                          CacheInput>,
+               Warps * 32, DynamicBytes);
+    }
 }
 
 template <typename Geometry, bool MultiBatch, bool Masked>

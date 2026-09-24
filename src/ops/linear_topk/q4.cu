@@ -37,22 +37,26 @@ struct Q4KSplitTopKOutput {
     }
 };
 
+// Four 16-row tiles per CTA share each staged activation slice, so the 131072-row head stages the
+// verify block's activations once per 64 rows instead of once per 16.
+constexpr int kRowTiles = 4;
+
 template <int Capacity>
 void launch_ksplit(const Tensor& hidden, const Weight& head, const Tensor& row_to_global_ids,
                    const LinearTopKWorkspace& workspace, cudaStream_t stream) {
     using Geometry             = Q4LinearGeometry<131072, kLinearTopKHidden>;
     using Schedule             = Q4KSplitMmaSchedule;
     constexpr int kTileColumns = ((Capacity + 7) / 8) * 8;
-    constexpr int kBlocks      = Geometry::kOutputRows / Schedule::kRowsPerCta;
+    constexpr int kBlocks      = Geometry::kOutputRows / (Schedule::kRowsPerCta * kRowTiles);
+    static_assert(Geometry::kOutputRows % (Schedule::kRowsPerCta * kRowTiles) == 0);
     const Q4KSplitTopKOutput output{static_cast<std::uint64_t*>(workspace.partial_keys.data),
                                     static_cast<const std::int32_t*>(row_to_global_ids.data),
                                     workspace.producer_groups, hidden.ne[1]};
-    q4_ksplit_mma_kernel<Geometry, kTileColumns, Capacity, Q4KSplitTopKOutput,
-                          Q4KSplitIdentityRows, true>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(hidden.data),
-                                                     static_cast<const std::uint8_t*>(head.qdata),
-                                                     static_cast<const std::uint8_t*>(head.scales),
-                                                     nullptr, output, Q4KSplitIdentityRows{}, hidden.ne[1]);
+    q4_ksplit_mma_kernel<Geometry, kTileColumns, Capacity, Q4KSplitTopKOutput, Q4KSplitIdentityRows,
+                         true, kRowTiles><<<kBlocks, Schedule::kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(hidden.data),
+        static_cast<const std::uint8_t*>(head.qdata), static_cast<const std::uint8_t*>(head.scales),
+        nullptr, output, Q4KSplitIdentityRows{}, hidden.ne[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 

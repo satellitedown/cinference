@@ -11,7 +11,9 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <int Channels, int QueryRows, int KeyRows, int ValueRows, int StaticWidth, class Publish>
+// MaxWidth > 0 bounds the width at compile time: every projected input of the row is loaded up
+// front, so the per-token loads overlap instead of serializing one global-load latency per token.
+template <int Channels, int QueryRows, int KeyRows, int ValueRows, int MaxWidth, class Publish>
 __global__ void gdn_projected_conv_kernel(
     const __nv_bfloat16* __restrict__ projected, const __nv_bfloat16* __restrict__ conv_weight,
     const __nv_bfloat16* __restrict__ state_read, const std::int32_t* __restrict__ valid_columns,
@@ -22,7 +24,6 @@ __global__ void gdn_projected_conv_kernel(
     const std::int32_t row = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
     if (row >= Channels) { return; }
     const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
-    if constexpr (StaticWidth != 0) { width = StaticWidth; }
 
     std::int32_t valid                 = valid_columns == nullptr ? width : valid_columns[batch];
     valid                              = valid < 0 ? 0 : (valid > width ? width : valid);
@@ -37,7 +38,11 @@ __global__ void gdn_projected_conv_kernel(
     const float w2 = __bfloat162float(conv_weight[2LL * Channels + row]);
     const float w3 = __bfloat162float(conv_weight[3LL * Channels + row]);
 
-    for (std::int32_t token = 0; token < width; ++token) {
+    const auto input = [&](std::int32_t token) {
+        const std::int64_t column = static_cast<std::int64_t>(batch) * width + token;
+        return __bfloat162float(projected[column * Channels + row]);
+    };
+    const auto step = [&](std::int32_t token, float p) {
         const std::int64_t column = static_cast<std::int64_t>(batch) * width + token;
         if (token >= valid) {
             if (row < QueryRows) {
@@ -47,10 +52,9 @@ __global__ void gdn_projected_conv_kernel(
             } else {
                 value[column * ValueRows + row - QueryRows - KeyRows] = __float2bfloat16_rn(0.0F);
             }
-            continue;
+            return;
         }
 
-        const float p              = __bfloat162float(projected[column * Channels + row]);
         float conv                 = fmaf(w0, s0, 0.0F);
         conv                       = fmaf(w1, s1, conv);
         conv                       = fmaf(w2, s2, conv);
@@ -67,6 +71,23 @@ __global__ void gdn_projected_conv_kernel(
         s0 = s1;
         s1 = s2;
         s2 = p;
+    };
+
+    if constexpr (MaxWidth > 0) {
+        float inputs[MaxWidth];
+#pragma unroll
+        for (std::int32_t token = 0; token < MaxWidth; ++token) {
+            inputs[token] = token < valid ? input(token) : 0.0F;
+        }
+#pragma unroll
+        for (std::int32_t token = 0; token < MaxWidth; ++token) {
+            if (token >= width) { break; }
+            step(token, inputs[token]);
+        }
+    } else {
+        for (std::int32_t token = 0; token < width; ++token) {
+            step(token, token < valid ? input(token) : 0.0F);
+        }
     }
 }
 
@@ -74,39 +95,30 @@ template <int Channels, int QueryRows, int KeyRows, int ValueRows, class Publish
 void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& state_read,
             const Tensor& valid_columns, const Tensor& initial_state_slots, Tensor& query,
             Tensor& key, Tensor& value, Publish publish, cudaStream_t stream) {
-    constexpr int kDefaultThreads = 256;
-    const std::int32_t width      = projected.ne[1];
-    const std::int32_t batch      = projected.ne[2];
-    if constexpr (Channels == 10240) {
-        if (width == 4 && batch == 1) {
-            constexpr int kT4Threads = 64;
-            gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, 4>
-                <<<(Channels + kT4Threads - 1) / kT4Threads, kT4Threads, 0, stream>>>(
-                    static_cast<const __nv_bfloat16*>(projected.data),
-                    static_cast<const __nv_bfloat16*>(conv_weight.data),
-                    static_cast<const __nv_bfloat16*>(state_read.data),
-                    valid_columns.data == nullptr
-                        ? nullptr
-                        : static_cast<const std::int32_t*>(valid_columns.data),
-                    static_cast<const std::int32_t*>(initial_state_slots.data),
-                    static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
-                    static_cast<__nv_bfloat16*>(value.data), width, publish);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
+    const std::int32_t width = projected.ne[1];
+    const std::int32_t batch = projected.ne[2];
+    const auto run           = [&]<int MaxWidth, int Threads>() {
+        const dim3 grid((Channels + Threads - 1) / Threads, static_cast<unsigned>(batch));
+        gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, MaxWidth>
+            <<<grid, Threads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(projected.data),
+                static_cast<const __nv_bfloat16*>(conv_weight.data),
+                static_cast<const __nv_bfloat16*>(state_read.data),
+                valid_columns.data == nullptr
+                    ? nullptr
+                    : static_cast<const std::int32_t*>(valid_columns.data),
+                static_cast<const std::int32_t*>(initial_state_slots.data),
+                static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
+                static_cast<__nv_bfloat16*>(value.data), width, publish);
+    };
+    // Short speculative widths use narrow CTAs so a single row of work spreads over the SMs.
+    if (width <= 4) {
+        run.template operator()<4, 64>();
+    } else if (width <= 16) {
+        run.template operator()<16, 64>();
+    } else {
+        run.template operator()<0, 256>();
     }
-    const dim3 grid((Channels + kDefaultThreads - 1) / kDefaultThreads,
-                    static_cast<unsigned>(batch));
-    gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, 0>
-        <<<grid, kDefaultThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(projected.data),
-            static_cast<const __nv_bfloat16*>(conv_weight.data),
-            static_cast<const __nv_bfloat16*>(state_read.data),
-            valid_columns.data == nullptr ? nullptr
-                                          : static_cast<const std::int32_t*>(valid_columns.data),
-            static_cast<const std::int32_t*>(initial_state_slots.data),
-            static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
-            static_cast<__nv_bfloat16*>(value.data), width, publish);
     CUDA_CHECK(cudaGetLastError());
 }
 

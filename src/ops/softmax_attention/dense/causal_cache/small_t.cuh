@@ -121,7 +121,7 @@ __device__ __forceinline__ int causal_small_t_active_splits(int window, int laun
 
 // A wide K8V4 verify block (more than eight columns) keeps one CTA per SM for the whole pass, so
 // its grid is limited to one resident 170-SM wave; each split then covers more keys, which the
-// double-buffered tile loop streams without the partial second wave or extra split partials.
+// warp-specialized kernel streams without the partial second wave or extra split partials.
 inline constexpr int kCausalWideTokenTile = 8;
 
 template <typename Geometry>

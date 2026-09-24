@@ -56,9 +56,13 @@ __device__ __forceinline__ unsigned q4_ksplit_bf16_pair(std::uint8_t packed) {
     return result.bits;
 }
 
+// A CTA owns RowTiles 16-row weight tiles and splits K across eight warps. The staged activation
+// slice of each K group feeds every row tile of the CTA, so wide heads amortize the activation
+// traffic over RowTiles weight tiles. Each output keeps the single-tile arithmetic: the same MMA
+// sequence per 64-wide group, the same scale application and the same cross-warp reduction order.
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4KSplitStoreEpilogue,
-          class RowPolicy = Q4KSplitIdentityRows, bool MaskedColumns = false>
-__launch_bounds__(256, 6) __global__
+          class RowPolicy = Q4KSplitIdentityRows, bool MaskedColumns = false, int RowTiles = 1>
+__launch_bounds__(256, RowTiles == 1 ? 6 : 2) __global__
     void q4_ksplit_mma_kernel(const __nv_bfloat16* __restrict__ x,
                               const std::uint8_t* __restrict__ codes,
                               const std::uint8_t* __restrict__ scales,
@@ -68,25 +72,28 @@ __launch_bounds__(256, 6) __global__
     constexpr int kHidden       = Geometry::kInputRows;
     constexpr int kTileK        = Schedule::kTileKPerWarp;
     constexpr int kWarps        = Schedule::kKWarps;
-    constexpr int kRowsPerCta   = Schedule::kRowsPerCta;
+    constexpr int kTileRows     = Schedule::kRowsPerCta;
+    constexpr int kRows         = kTileRows * RowTiles;
     constexpr int kGroupK       = Schedule::kGroupK;
     constexpr int kGroups       = kHidden / kGroupK;
     constexpr int kCodeRowBytes = kHidden / 2;
     constexpr int kTileCols     = TileCols;
     constexpr int kNt           = kTileCols / 8;
+    constexpr int kCodeChunks   = kGroupK / 32;
     static_assert(kTileCols >= 8 && kTileCols <= 32 && (kTileCols % 8) == 0);
     static_assert(ActiveCols >= 1 && ActiveCols <= kTileCols && ActiveCols > kTileCols - 8);
     static_assert((kHidden % kGroupK) == 0);
-    static_assert(RowPolicy::kOutputRowsPerCta <= kRowsPerCta);
+    static_assert(RowPolicy::kOutputRowsPerCta <= kTileRows);
+    static_assert(RowTiles >= 1);
 
     union SharedStorage {
         struct {
-            std::uint8_t codes[kRowsPerCta][kGroupK / 2];
+            std::uint8_t codes[kRows][kGroupK / 2];
             __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
-            std::uint16_t scales[kRowsPerCta][kWarps];
+            std::uint16_t scales[kRows][kWarps];
         } staging;
 
-        float partial[kWarps * kNt * 32 * 4];
+        float partial[kWarps * RowTiles * kNt * 32 * 4];
     };
 
     __shared__ __align__(16) SharedStorage shared;
@@ -100,8 +107,11 @@ __launch_bounds__(256, 6) __global__
     const int gid          = lane >> 2;
     const int lid          = lane & 3;
     const int k_split      = warp;
-    const int row0         = static_cast<int>(blockIdx.x) * RowPolicy::kOutputRowsPerCta;
+    const int cta_row0     = static_cast<int>(blockIdx.x) * RowTiles * RowPolicy::kOutputRowsPerCta;
     const int live_columns = MaskedColumns ? columns : ActiveCols;
+    const auto output_row0 = [&](int tile) {
+        return cta_row0 + tile * RowPolicy::kOutputRowsPerCta;
+    };
 
     const auto stage_x = [&](int group_k0) {
         constexpr int kItemsPerSplit = ActiveCols * (kTileK / 8);
@@ -123,19 +133,19 @@ __launch_bounds__(256, 6) __global__
     };
 
     const auto stage_weight = [&](int group_k0) {
-#pragma unroll
-        for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
-            const int row        = warp * Schedule::kRowsPerLoaderWarp + row_item;
-            const int weight_row = row_policy.weight_row(row0, row);
-            for (int chunk = lane; chunk < kGroupK / 32; chunk += 32) {
-                cp_async<16, Schedule::kCodeCache>(
-                    &code_shared[row][chunk * 16],
-                    codes + static_cast<std::int64_t>(weight_row) * kCodeRowBytes + group_k0 / 2 +
-                        chunk * 16);
-            }
+        for (int task = tid; task < kRows * kCodeChunks; task += kWarps * 32) {
+            const int row        = task / kCodeChunks;
+            const int chunk      = task - row * kCodeChunks;
+            const int tile       = row / kTileRows;
+            const int weight_row = row_policy.weight_row(output_row0(tile), row - tile * kTileRows);
+            cp_async<16, Schedule::kCodeCache>(
+                &code_shared[row][chunk * 16],
+                codes + static_cast<std::int64_t>(weight_row) * kCodeRowBytes + group_k0 / 2 +
+                    chunk * 16);
         }
-        for (int row = tid; row < kRowsPerCta; row += kWarps * 32) {
-            const int weight_row = row_policy.weight_row(row0, row);
+        for (int row = tid; row < kRows; row += kWarps * 32) {
+            const int tile       = row / kTileRows;
+            const int weight_row = row_policy.weight_row(output_row0(tile), row - tile * kTileRows);
             cp_async<16>(&scale_shared[row][0],
                          scales + (static_cast<std::int64_t>(weight_row) * Geometry::kGroupsPerRow +
                                    group_k0 / 64) *
@@ -143,10 +153,10 @@ __launch_bounds__(256, 6) __global__
         }
     };
 
-    const int b_rin     = lane & 7;
-    const int b_koff    = ((lane >> 3) & 1) << 3;
-    const int warp_koff = k_split * kTileK;
-    float acc[kNt][4]   = {};
+    const int b_rin             = lane & 7;
+    const int b_koff            = ((lane >> 3) & 1) << 3;
+    const int warp_koff         = k_split * kTileK;
+    float acc[RowTiles][kNt][4] = {};
 
     stage_weight(0);
     stage_x(0);
@@ -156,36 +166,47 @@ __launch_bounds__(256, 6) __global__
 
 #pragma unroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
-        const int group_k0      = group_index * kGroupK;
-        float group_acc[kNt][4] = {};
+        const int group_k0                = group_index * kGroupK;
+        float group_acc[RowTiles][kNt][4] = {};
 
 #pragma unroll
         for (int ks = 0; ks < 4; ++ks) {
-            const int byte_col = warp_koff / 2 + ks * 8 + lid;
-            const unsigned af0 = q4_ksplit_bf16_pair(code_shared[gid][byte_col]);
-            const unsigned af1 = q4_ksplit_bf16_pair(code_shared[gid + 8][byte_col]);
-            const unsigned af2 = q4_ksplit_bf16_pair(code_shared[gid][byte_col + 4]);
-            const unsigned af3 = q4_ksplit_bf16_pair(code_shared[gid + 8][byte_col + 4]);
+            unsigned bf[kNt][2];
 #pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
-                unsigned bf0, bf1;
                 const int br = nt * 8 + b_rin;
-                ldmatrix_x2(bf0, bf1,
+                ldmatrix_x2(bf[nt][0], bf[nt][1],
                             smem_addr(&x_shared[k_split][br * kTileK + q4_ksplit_swizzle_64(
                                                                            br, ks * 16 + b_koff)]));
-                mma_bf16(group_acc[nt][0], group_acc[nt][1], group_acc[nt][2], group_acc[nt][3],
-                         af0, af1, af2, af3, bf0, bf1);
+            }
+            const int byte_col = warp_koff / 2 + ks * 8 + lid;
+#pragma unroll
+            for (int tile = 0; tile < RowTiles; ++tile) {
+                const int r0       = tile * kTileRows + gid;
+                const unsigned af0 = q4_ksplit_bf16_pair(code_shared[r0][byte_col]);
+                const unsigned af1 = q4_ksplit_bf16_pair(code_shared[r0 + 8][byte_col]);
+                const unsigned af2 = q4_ksplit_bf16_pair(code_shared[r0][byte_col + 4]);
+                const unsigned af3 = q4_ksplit_bf16_pair(code_shared[r0 + 8][byte_col + 4]);
+#pragma unroll
+                for (int nt = 0; nt < kNt; ++nt) {
+                    mma_bf16(group_acc[tile][nt][0], group_acc[tile][nt][1], group_acc[tile][nt][2],
+                             group_acc[tile][nt][3], af0, af1, af2, af3, bf[nt][0], bf[nt][1]);
+                }
             }
         }
 
-        const float top_scale = __half2float(__ushort_as_half(scale_shared[gid][k_split]));
-        const float bot_scale = __half2float(__ushort_as_half(scale_shared[gid + 8][k_split]));
 #pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            acc[nt][0] = fmaf(group_acc[nt][0], top_scale, acc[nt][0]);
-            acc[nt][1] = fmaf(group_acc[nt][1], top_scale, acc[nt][1]);
-            acc[nt][2] = fmaf(group_acc[nt][2], bot_scale, acc[nt][2]);
-            acc[nt][3] = fmaf(group_acc[nt][3], bot_scale, acc[nt][3]);
+        for (int tile = 0; tile < RowTiles; ++tile) {
+            const int r0          = tile * kTileRows + gid;
+            const float top_scale = __half2float(__ushort_as_half(scale_shared[r0][k_split]));
+            const float bot_scale = __half2float(__ushort_as_half(scale_shared[r0 + 8][k_split]));
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                acc[tile][nt][0] = fmaf(group_acc[tile][nt][0], top_scale, acc[tile][nt][0]);
+                acc[tile][nt][1] = fmaf(group_acc[tile][nt][1], top_scale, acc[tile][nt][1]);
+                acc[tile][nt][2] = fmaf(group_acc[tile][nt][2], bot_scale, acc[tile][nt][2]);
+                acc[tile][nt][3] = fmaf(group_acc[tile][nt][3], bot_scale, acc[tile][nt][3]);
+            }
         }
 
         if (group_index + 1 < kGroups) {
@@ -199,28 +220,38 @@ __launch_bounds__(256, 6) __global__
     }
 
     __syncthreads();
-    auto* partial = shared.partial;
+    auto* partial      = shared.partial;
+    const auto slot_of = [&](int split, int tile, int nt) {
+        return partial + (((split * RowTiles + tile) * kNt + nt) * 32 + lane) * 4;
+    };
     if ((k_split & 1) != 0) {
 #pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            store_vec(partial + ((k_split * kNt + nt) * 32 + lane) * 4,
-                      make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]));
+        for (int tile = 0; tile < RowTiles; ++tile) {
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                store_vec(slot_of(k_split, tile, nt),
+                          make_float4(acc[tile][nt][0], acc[tile][nt][1], acc[tile][nt][2],
+                                      acc[tile][nt][3]));
+            }
         }
     }
     __syncthreads();
 
     if ((k_split & 1) == 0) {
 #pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            const float4 partner =
-                load_vec<float4>(partial + (((k_split + 1) * kNt + nt) * 32 + lane) * 4);
-            acc[nt][0] += partner.x;
-            acc[nt][1] += partner.y;
-            acc[nt][2] += partner.z;
-            acc[nt][3] += partner.w;
-            if (k_split != 0) {
-                store_vec(partial + ((k_split * kNt + nt) * 32 + lane) * 4,
-                          make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]));
+        for (int tile = 0; tile < RowTiles; ++tile) {
+#pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                const float4 partner = load_vec<float4>(slot_of(k_split + 1, tile, nt));
+                acc[tile][nt][0] += partner.x;
+                acc[tile][nt][1] += partner.y;
+                acc[tile][nt][2] += partner.z;
+                acc[tile][nt][3] += partner.w;
+                if (k_split != 0) {
+                    store_vec(slot_of(k_split, tile, nt),
+                              make_float4(acc[tile][nt][0], acc[tile][nt][1], acc[tile][nt][2],
+                                          acc[tile][nt][3]));
+                }
             }
         }
     }
@@ -228,33 +259,37 @@ __launch_bounds__(256, 6) __global__
 
     if (k_split == 0) {
 #pragma unroll
-        for (int nt = 0; nt < kNt; ++nt) {
-            float4 sum = make_float4(acc[nt][0], acc[nt][1], acc[nt][2], acc[nt][3]);
+        for (int tile = 0; tile < RowTiles; ++tile) {
+            const int row0 = output_row0(tile);
 #pragma unroll
-            for (int split = 2; split < kWarps; split += 2) {
-                const float4 value =
-                    load_vec<float4>(partial + ((split * kNt + nt) * 32 + lane) * 4);
-                sum.x += value.x;
-                sum.y += value.y;
-                sum.z += value.z;
-                sum.w += value.w;
-            }
-            const int col0 = nt * 8 + 2 * lid;
-            if constexpr (std::is_same_v<Epilogue, Q4KSplitStoreEpilogue>) {
-                if (col0 < live_columns) {
-                    out[static_cast<std::int64_t>(col0) * Geometry::kOutputRows + row0 + gid] =
-                        __float2bfloat16_rn(sum.x);
-                    out[static_cast<std::int64_t>(col0) * Geometry::kOutputRows + row0 + gid + 8] =
-                        __float2bfloat16_rn(sum.z);
+            for (int nt = 0; nt < kNt; ++nt) {
+                float4 sum = make_float4(acc[tile][nt][0], acc[tile][nt][1], acc[tile][nt][2],
+                                         acc[tile][nt][3]);
+#pragma unroll
+                for (int split = 2; split < kWarps; split += 2) {
+                    const float4 value = load_vec<float4>(slot_of(split, tile, nt));
+                    sum.x += value.x;
+                    sum.y += value.y;
+                    sum.z += value.z;
+                    sum.w += value.w;
                 }
-                if (col0 + 1 < live_columns) {
-                    out[static_cast<std::int64_t>(col0 + 1) * Geometry::kOutputRows + row0 + gid] =
-                        __float2bfloat16_rn(sum.y);
-                    out[static_cast<std::int64_t>(col0 + 1) * Geometry::kOutputRows + row0 + gid +
-                        8] = __float2bfloat16_rn(sum.w);
+                const int col0 = nt * 8 + 2 * lid;
+                if constexpr (std::is_same_v<Epilogue, Q4KSplitStoreEpilogue>) {
+                    if (col0 < live_columns) {
+                        out[static_cast<std::int64_t>(col0) * Geometry::kOutputRows + row0 + gid] =
+                            __float2bfloat16_rn(sum.x);
+                        out[static_cast<std::int64_t>(col0) * Geometry::kOutputRows + row0 + gid +
+                            8] = __float2bfloat16_rn(sum.z);
+                    }
+                    if (col0 + 1 < live_columns) {
+                        out[static_cast<std::int64_t>(col0 + 1) * Geometry::kOutputRows + row0 +
+                            gid]     = __float2bfloat16_rn(sum.y);
+                        out[static_cast<std::int64_t>(col0 + 1) * Geometry::kOutputRows + row0 +
+                            gid + 8] = __float2bfloat16_rn(sum.w);
+                    }
+                } else {
+                    epilogue.template store<ActiveCols>(row0 + gid, col0, sum);
                 }
-            } else {
-                epilogue.template store<ActiveCols>(row0 + gid, col0, sum);
             }
         }
     }
