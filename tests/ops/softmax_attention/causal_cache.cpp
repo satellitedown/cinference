@@ -2388,6 +2388,12 @@ int run_k8v4_cases() {
                             {16, 180001, 180224, 820u}, MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
                             {15, 9001, 9216, 821u}, MappingPattern::Fragmented);
+    // Prompt blocks over many key tiles cycle the pipelined kernel's double-buffered K and P
+    // stages through several barrier phases, with a partial last query block.
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
+                            {64, 1000, 1088, 822u}, MappingPattern::Fragmented);
+    failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
+                            {130, 3900, 4096, 823u}, MappingPattern::Offset);
     failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {5, 17, 22, 809u},
                             MappingPattern::Identity);
     failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {7, 17, 24, 810u},

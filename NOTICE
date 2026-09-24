@@ -28,8 +28,9 @@ walk, L2 discards of consumed attention split numerators, a mask-free
 softmax path for unmasked K8V4 key tiles, GDN norm-gating CTAs that share x
 and weight rows across heads and token tiles, GDN replay records that warm
 the next layer's state in L2, a fused RMSNorm E4M3 producer for the FP8
-attention input and FFN projections, and wide K8V4 verify blocks whose
-otherwise idle compute warps accumulate part of the other rows' PV products.
+attention input and FFN projections, wide K8V4 verify blocks whose
+otherwise idle compute warps accumulate part of the other rows' PV products,
+and a K8V4 prompt kernel that pipelines score and PV warps across key tiles.
 Publication changes add fork branding, provenance and measurement scope,
 correct stale range text, make local-path instructions portable, and omit
 machine-local agent automation and unrelated sponsorship configuration.
