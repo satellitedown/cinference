@@ -35,7 +35,7 @@
     "summary": [
       "Raise the product MTP draft-token cap from five to ten and extend related round buffers, contracts, and coverage.",
       "Derive MTP CUDA Graph topology classes from captured node-type and kernel-function signatures while separating batch sizes.",
-      "Speed up fafstmobel DFlash2 verification: small-token FP8/NVFP4 projection schedules, a double-buffered K-split FP8 LinearAdd, staged GDN records with lane-shared row reductions, a warp-specialized wide K8V4 attention kernel with exact half-scale V widening, FP16-accumulated 32-key PV products and loader-assisted PV for Tensor Core balance, evict-first L2 fills for once-read verify weight streams, multi-tile Q4 proposal-head staging and preloaded GDN projected convolution, a bank-conflict-free Q4 proposal head with integer-free nibble widening, retuned small-token FP8 A8 tiles, a wider tiled argmax and a GDN record convolution fused into the FP8 A8 input projection epilogue and an RMSNorm-SwiGLU-FFN Op whose NVFP4 route writes both projection inputs pre-quantized.",
+      "Speed up fafstmobel DFlash2 verification: small-token FP8/NVFP4 projection schedules, a double-buffered K-split FP8 LinearAdd, staged GDN records with lane-shared row reductions, a warp-specialized wide K8V4 attention kernel with exact half-scale V widening, FP16-accumulated 32-key PV products and loader-assisted PV for Tensor Core balance, evict-first L2 fills for once-read verify weight streams, multi-tile Q4 proposal-head staging and preloaded GDN projected convolution, a bank-conflict-free Q4 proposal head with integer-free nibble widening, retuned small-token FP8 A8 tiles, a wider tiled argmax, a GDN record convolution fused into the FP8 A8 input projection epilogue, an RMSNorm-SwiGLU-FFN Op whose NVFP4 route writes both projection inputs pre-quantized, and a query/key RMSNorm-RoPE Op sharing a pinned RoPE rotation contraction.",
       "Preserve native binaries, API symbols, .ninfer format, and build organization."
     ]
   },
@@ -67,6 +67,8 @@
       "model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md",
       "src/core/decode_graph.cpp",
       "src/core/decode_graph.h",
+      "src/models/qwen3_5/execution/attention.cpp",
+      "src/models/qwen3_5/execution/attention.h",
       "src/models/qwen3_5/execution/ffn.cpp",
       "src/models/qwen3_5/execution/ffn.h",
       "src/models/qwen3_5/execution/text.cpp",
@@ -88,6 +90,7 @@
       "src/ops/kernel/argmax.cuh",
       "src/ops/kernel/mtp_round.cuh",
       "src/ops/kernel/rmsnorm.cuh",
+      "src/ops/kernel/rope.cuh",
       "src/ops/launcher/mtp_round.cu",
       "src/ops/linear/fp8/fp8_a16_ksplit_mma.cuh",
       "src/ops/linear/fp8/fp8_a8_mma.cuh",
@@ -126,16 +129,22 @@
     ],
     "added_paths": [
       "NOTICE",
+      "include/ninfer/ops/qk_rmsnorm_rope.h",
       "include/ninfer/ops/rmsnorm_swiglu_ffn.h",
       "results/rtx5090-archive-recall.json",
       "results/rtx5090-fafstmobel-dflash2-kernels-2.json",
       "results/rtx5090-fafstmobel-dflash2-kernels-3.json",
       "results/rtx5090-fafstmobel-dflash2-kernels.json",
       "src/ops/linear_add/fp8/fp8_linear_add_mma.cu",
+      "src/ops/qk_rmsnorm_rope/qk_rmsnorm_rope.cu",
+      "src/ops/qk_rmsnorm_rope/qk_rmsnorm_rope.h",
+      "src/ops/qk_rmsnorm_rope/sources.cmake",
       "src/ops/rmsnorm_swiglu_ffn/nvfp4_rmsnorm_quantize.cu",
       "src/ops/rmsnorm_swiglu_ffn/nvfp4_rmsnorm_quantize.h",
       "src/ops/rmsnorm_swiglu_ffn/sources.cmake",
+      "src/ops/wrapper/qk_rmsnorm_rope.cpp",
       "src/ops/wrapper/rmsnorm_swiglu_ffn.cpp",
+      "tests/ops/test_qk_rmsnorm_rope.cpp",
       "tests/ops/test_rmsnorm_swiglu_ffn.cpp",
       "upstream-provenance.json"
     ],

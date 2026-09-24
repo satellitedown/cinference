@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: pin the pair rotation to one FMA contraction.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 // Implements: include/ninfer/ops/rope.h
@@ -67,6 +70,14 @@ __device__ __forceinline__ void fixed_sincos(const std::int32_t* positions, int 
     }
 }
 
+// The rotation is pinned to one contraction so every kernel that rotates a pair agrees bit for bit:
+// products with the first-half value are fused, products with the second-half value rounded.
+__device__ __forceinline__ float2 rope_rotate_pair(float first, float second, float cosine,
+                                                   float sine) {
+    return make_float2(__fmaf_rn(first, cosine, -__fmul_rn(second, sine)),
+                       __fmaf_rn(first, sine, __fmul_rn(second, cosine)));
+}
+
 template <int HeadDim, int Half>
 __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_t token_stride,
                                                 int head, int token, int lane, float c0, float c1,
@@ -78,9 +89,10 @@ __device__ __forceinline__ void apply_rope_head(__nv_bfloat16* data, std::int64_
     auto* data2         = reinterpret_cast<__nv_bfloat162*>(data + base);
     const float2 first  = __bfloat1622float2(data2[lane]);
     const float2 second = __bfloat1622float2(data2[lane + kHalfPair]);
-    data2[lane] = __floats2bfloat162_rn(first.x * c0 - second.x * s0, first.y * c1 - second.y * s1);
-    data2[lane + kHalfPair] =
-        __floats2bfloat162_rn(second.x * c0 + first.x * s0, second.y * c1 + first.y * s1);
+    const float2 x          = rope_rotate_pair(first.x, second.x, c0, s0);
+    const float2 y          = rope_rotate_pair(first.y, second.y, c1, s1);
+    data2[lane]             = __floats2bfloat162_rn(x.x, y.x);
+    data2[lane + kHalfPair] = __floats2bfloat162_rn(x.y, y.y);
 }
 
 template <RopeKernelMode Mode, int QHeads, int KHeads>

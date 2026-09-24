@@ -20,13 +20,13 @@ lane-shared reductions, a warp-specialized K8V4 attention kernel with
 loader-assisted PV products, evict-first L2 fills for once-read verify weights,
 proposal-head and GDN convolution staging, a bank-conflict-free Q4 proposal
 head, retuned small-token A8 tiles, a wider argmax, a GDN record convolution
-fused into its input projection, and a fused RMSNorm-SwiGLU FFN that hands
-both NVFP4 projections pre-quantized inputs. Publication changes add fork
-branding, provenance and measurement scope, correct stale range text, make
-local-path instructions portable, and omit machine-local agent automation and
-unrelated sponsorship configuration. Modified retained files carry modification
-notices. upstream-provenance.json identifies the original changed-file set and
-subsequent publication edits.
+fused into its input projection, a fused RMSNorm-SwiGLU FFN that hands both
+NVFP4 projections pre-quantized inputs, and a fused query/key RMSNorm-RoPE.
+Publication changes add fork branding, provenance and measurement scope,
+correct stale range text, make local-path instructions portable, and omit
+machine-local agent automation and unrelated sponsorship configuration.
+Modified retained files carry modification notices. upstream-provenance.json
+identifies the original changed-file set and subsequent publication edits.
 
 The native NInfer binary names, API symbols, and .ninfer format are retained.
 Use of the NInfer name identifies the original project and its interfaces;

@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: run dense FFN blocks through rmsnorm_swiglu_ffn.
+// Modified by satellitedown for Cinference: fused dense FFN and query/key norm-RoPE blocks.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/program/internal.h"
@@ -355,10 +355,9 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
                                        dimension(config_.attention->num_attention_heads), T});
     Tensor kn = results.normalized_key.view({dimension(config_.attention->head_dim),
                                              dimension(config_.attention->num_key_value_heads), T});
-    ops::rmsnorm(q, mtp_->query_norm, config_.rms_norm_eps, true, qn, s);
-    ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    text_rope(rope_for_op, *config_.rope_parameters, qn, kn, s);
+    text_qk_rmsnorm_rope(rope_for_op, *config_.rope_parameters, q, k, mtp_->query_norm,
+                         mtp_->key_norm, config_.rms_norm_eps, qn, kn, s);
 
     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
                                        dimension(config_.attention->num_attention_heads), T});
@@ -873,14 +872,13 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                        dimension(config_.attention->num_attention_heads), T});
     Tensor kn = results.normalized_key.view({dimension(config_.attention->head_dim),
                                              dimension(config_.attention->num_key_value_heads), T});
-    ops::rmsnorm(q, p.query_norm, config_.rms_norm_eps, true, qn, s);
-    ops::rmsnorm(k, p.key_norm, config_.rms_norm_eps, true, kn, s);
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    text_rope(rope_for_op, *config_.rope_parameters, qn, kn, s);
+    text_qk_rmsnorm_rope(rope_for_op, *config_.rope_parameters, q, k, p.query_norm, p.key_norm,
+                         config_.rms_norm_eps, qn, kn, s);
 
     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
                                        dimension(config_.attention->num_attention_heads), T});

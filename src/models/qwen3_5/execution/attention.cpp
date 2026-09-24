@@ -1,6 +1,10 @@
+// Modified by satellitedown for Cinference: fuse query/key normalization with RoPE.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "models/qwen3_5/execution/attention.h"
 
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/qk_rmsnorm_rope.h"
 #include "ninfer/ops/rope.h"
 
 #include <stdexcept>
@@ -50,10 +54,14 @@ void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
     ops::rope(positions, dimension(config.rotary_dim), config.rope_theta, query, stream);
 }
 
-void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query, Tensor& key,
-               cudaStream_t stream) {
+void text_qk_rmsnorm_rope(const Tensor& positions, const RopeConfig& config, const Tensor& query,
+                          const Tensor& key, const Tensor& query_norm, const Tensor& key_norm,
+                          float eps, Tensor& normalized_query, Tensor& normalized_key,
+                          cudaStream_t stream) {
     require_rope_axes(positions, config);
-    ops::rope(positions, dimension(config.rotary_dim), config.rope_theta, query, key, stream);
+    ops::qk_rmsnorm_rope(query, key, query_norm, key_norm, eps, true, positions,
+                         dimension(config.rotary_dim), config.rope_theta, normalized_query,
+                         normalized_key, stream);
 }
 
 } // namespace ninfer::models::qwen3_5::execution
