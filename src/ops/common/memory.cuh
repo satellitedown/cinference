@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: add evict-first L2 fill policies.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include <cuda_pipeline.h>
@@ -62,6 +65,28 @@ __device__ __forceinline__ void cp_async_zfill(void* smem_dst, const void* gmem_
                      :
                      : "r"(smem_addr(smem_dst)), "l"(gmem_src), "n"(Bytes), "r"(src_bytes));
     }
+}
+
+// L2 priority for weight fills. A weight tile that a single CTA reads (one token tile) is streamed
+// once per call, and the weights of a layer are far larger than L2: evict-first fills leave the
+// small activation and record working set resident across layers instead of writing it back and
+// refetching it every layer. Tiles that several token-tile CTAs reuse keep the normal priority.
+__device__ __forceinline__ unsigned long long l2_weight_policy(bool read_once) {
+    unsigned long long policy;
+    if (read_once) {
+        asm("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(policy));
+    } else {
+        asm("createpolicy.fractional.L2::evict_normal.b64 %0, 1.0;" : "=l"(policy));
+    }
+    return policy;
+}
+
+// 16-byte cp.async.cg whose L2 fill carries `policy` (see l2_weight_policy).
+__device__ __forceinline__ void cp_async_cg_policy(void* smem_dst, const void* gmem_src,
+                                                   unsigned long long policy) {
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
+                 :
+                 : "r"(smem_addr(smem_dst)), "l"(gmem_src), "l"(policy));
 }
 
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }

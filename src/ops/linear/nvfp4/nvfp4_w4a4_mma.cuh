@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: mark single-token-tile weight fills evict-first in L2.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "ops/common/mma.cuh"
@@ -140,6 +143,7 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
                                                         int stage, int k_tile, int row_begin,
                                                         RowPolicy row_policy) {
     constexpr int kCodeTasks = Schedule::kBlockN * Schedule::kSegmentsPerRow;
+    const unsigned long long weight_policy = l2_weight_policy(gridDim.y == 1);
     for (int task = static_cast<int>(threadIdx.x); task < kCodeTasks; task += Schedule::kThreads) {
         const int row             = task / Schedule::kSegmentsPerRow;
         const int logical_segment = task - row * Schedule::kSegmentsPerRow;
@@ -149,7 +153,7 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
         const auto* input = codes +
                             static_cast<std::int64_t>(weight_row) * Geometry::kCodeBytesPerRow +
                             k_tile * Schedule::kCodeRowBytes + logical_segment * 16;
-        cp_async<16, Cache::cg>(destination, input);
+        cp_async_cg_policy(destination, input, weight_policy);
     }
 
     if constexpr (RowPolicy::kContiguous) {

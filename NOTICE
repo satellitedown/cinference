@@ -15,13 +15,15 @@ Modifications by satellitedown for Cinference extend MTP draft windows to ten,
 use capture-derived CUDA Graph topology classes for MTP profiles, and update
 associated round buffers, validation, tests, and documentation. Later
 performance changes speed up DFlash2 verification with small-token projection
-schedules, a K-split FP8 LinearAdd, staged GDN records, a warp-specialized K8V4
-attention kernel, and proposal-head and GDN convolution staging. Publication
-changes add fork branding, provenance and measurement scope, correct stale
-range text, make local-path instructions portable, and omit machine-local
-agent automation and unrelated sponsorship configuration. Modified retained
-files carry modification notices. upstream-provenance.json identifies the
-original changed-file set and subsequent publication edits.
+schedules, a double-buffered K-split FP8 LinearAdd, staged GDN records with
+lane-shared reductions, a warp-specialized K8V4 attention kernel with
+loader-assisted PV products, evict-first L2 fills for once-read verify weights,
+and proposal-head and GDN convolution staging. Publication changes add fork
+branding, provenance and measurement scope, correct stale range text, make
+local-path instructions portable, and omit machine-local agent automation and
+unrelated sponsorship configuration. Modified retained files carry modification
+notices. upstream-provenance.json identifies the original changed-file set and
+subsequent publication edits.
 
 The native NInfer binary names, API symbols, and .ninfer format are retained.
 Use of the NInfer name identifies the original project and its interfaces;

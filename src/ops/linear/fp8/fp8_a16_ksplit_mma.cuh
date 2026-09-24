@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: double-buffer K-split staging; evict-first weights.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 // Small-T row-scaled E4M3 weight x BF16 activation Tensor Core mainloop.
@@ -38,18 +41,18 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ks
     static_assert((kWarps & 1) == 0);
     constexpr unsigned kMask = 0xffffffffU;
 
+    constexpr int kStages = Schedule::kStages;
+
     union SharedStorage {
         struct {
-            std::uint8_t codes[kRowsPerCta][kGroupK];
-            __nv_bfloat16 activations[kWarps][kTileTokens * kTileK];
+            std::uint8_t codes[kStages][kRowsPerCta][kGroupK];
+            __nv_bfloat16 activations[kStages][kWarps][kTileTokens * kTileK];
         } staging;
 
         float partial[kWarps * kTokenMmas * 32 * 4];
     };
 
     __shared__ __align__(16) SharedStorage shared;
-    auto& code_shared = shared.staging.codes;
-    auto& x_shared    = shared.staging.activations;
 
     const int tid          = static_cast<int>(threadIdx.x);
     const int warp         = tid >> 5;
@@ -59,7 +62,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ks
     const int row0         = static_cast<int>(blockIdx.x) * kRowsPerCta;
     const int live_columns = MaskedColumns ? columns : ActiveTokens;
 
-    const auto stage_activation = [&](int group_k0) {
+    const auto stage_activation = [&](int stage, int group_k0) {
+        auto& x_shared = shared.staging.activations[stage];
         constexpr auto kActivationCache =
             Schedule::kActivationCache == Fp8A16KSplitCache::Default ? Cache::ca : Cache::cg;
         constexpr bool kPadded =
@@ -86,18 +90,26 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ks
         }
     };
 
-    const auto stage_codes = [&](int group_k0) {
-        constexpr auto kWeightCache =
-            Schedule::kWeightCache == Fp8A16KSplitCache::Default ? Cache::ca : Cache::cg;
+    // Every weight row belongs to one CTA, so an EvictFirst weight stream is read exactly once.
+    const unsigned long long weight_policy = l2_weight_policy(true);
+    const auto stage_codes                 = [&](int stage, int group_k0) {
+        auto& code_shared = shared.staging.codes[stage];
 #pragma unroll
         for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
             const int row = warp * Schedule::kRowsPerLoaderWarp + row_item;
             for (int chunk = lane; chunk < kGroupK / 16; chunk += 32) {
                 const int swizzled_chunk = chunk ^ (row & 7);
-                cp_async<16, kWeightCache>(&code_shared[row][swizzled_chunk * 16],
-                                           weight_codes +
-                                               static_cast<std::int64_t>(row0 + row) * kHidden +
-                                               group_k0 + chunk * 16);
+                auto* destination        = &code_shared[row][swizzled_chunk * 16];
+                const auto* source = weight_codes +
+                                     static_cast<std::int64_t>(row0 + row) * kHidden + group_k0 +
+                                     chunk * 16;
+                if constexpr (Schedule::kWeightCache == Fp8A16KSplitCache::Default) {
+                    cp_async<16, Cache::ca>(destination, source);
+                } else if constexpr (Schedule::kWeightCache == Fp8A16KSplitCache::Streaming) {
+                    cp_async<16, Cache::cg>(destination, source);
+                } else {
+                    cp_async_cg_policy(destination, source, weight_policy);
+                }
             }
         }
     };
@@ -107,14 +119,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ks
     const int warp_k0                 = warp * kTileK;
     float accumulators[kTokenMmas][4] = {};
 
-    stage_codes(0);
-    stage_activation(0);
-    cp_commit();
-    cp_wait<0>();
-    __syncthreads();
-
-#pragma unroll
-    for (int group_index = 0; group_index < kGroups; ++group_index) {
+    const auto multiply_group = [&](int stage) {
+        const auto& code_shared = shared.staging.codes[stage];
+        const auto& x_shared    = shared.staging.activations[stage];
 #pragma unroll
         for (int k_step = 0; k_step < kTileK / 16; ++k_step) {
             const int code_col        = k_step * 16 + lid * 2;
@@ -142,15 +149,51 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void fp8_a16_ks
                          b1);
             }
         }
+    };
 
-        if (group_index + 1 < kGroups) {
-            __syncthreads();
-            const int next_k0 = (group_index + 1) * kGroupK;
-            stage_codes(next_k0);
-            stage_activation(next_k0);
+    if constexpr (kStages == 1) {
+        stage_codes(0, 0);
+        stage_activation(0, 0);
+        cp_commit();
+        cp_wait<0>();
+        __syncthreads();
+
+#pragma unroll
+        for (int group_index = 0; group_index < kGroups; ++group_index) {
+            multiply_group(0);
+            if (group_index + 1 < kGroups) {
+                __syncthreads();
+                const int next_k0 = (group_index + 1) * kGroupK;
+                stage_codes(0, next_k0);
+                stage_activation(0, next_k0);
+                cp_commit();
+                cp_wait<0>();
+                __syncthreads();
+            }
+        }
+    } else {
+        // Groups 0..kStages-2 are in flight before the loop. Iteration g waits for group g, then
+        // refills the buffer group g - 1 used (every warp has passed the barrier, so it is no
+        // longer read) with group g + kStages - 1 before multiplying group g.
+#pragma unroll
+        for (int stage = 0; stage + 1 < kStages; ++stage) {
+            if (stage < kGroups) {
+                stage_codes(stage, stage * kGroupK);
+                stage_activation(stage, stage * kGroupK);
+            }
             cp_commit();
-            cp_wait<0>();
+        }
+#pragma unroll
+        for (int group_index = 0; group_index < kGroups; ++group_index) {
+            cp_wait<kStages - 2>();
             __syncthreads();
+            const int refill = group_index + kStages - 1;
+            if (refill < kGroups) {
+                stage_codes(refill % kStages, refill * kGroupK);
+                stage_activation(refill % kStages, refill * kGroupK);
+            }
+            cp_commit();
+            multiply_group(group_index % kStages);
         }
     }
 

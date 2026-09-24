@@ -12,10 +12,17 @@ namespace ninfer::ops::detail {
 namespace {
 
 // Sixteen-row CTAs split K over eight warps, so the 320 CTAs of a [5120,K] projection keep the
-// weight stream in flight while the MMA reuses each widened code across the whole token tile.
+// weight stream in flight while the MMA reuses each widened code across the whole token tile. The
+// grid is a single resident wave, so a 16-token tile double-buffers its groups (48 KiB of static
+// staging) to keep the next group's copies in flight while the current group multiplies. The
+// weights are read once, so their L2 fills are evict-first and leave the layer's activations
+// resident.
 template <class Geometry, int TileTokens>
 void launch_tile(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
-    using Schedule = Fp8A16KSplitSchedule<8, TileTokens, 2>;
+    using Schedule =
+        Fp8A16KSplitSchedule<8, TileTokens, 2, Fp8A16KSplitCache::Default,
+                             Fp8A16KSplitCache::EvictFirst, Fp8A16KSplitActivationStage::ActiveOnly,
+                             TileTokens <= 16 ? 2 : 1>;
     static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const Fp8AddResidualOutput output{static_cast<__nv_bfloat16*>(residual.data),

@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: mark single-token-tile weight fills evict-first in L2.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 // Row-scaled E4M3 weight x materialized row-scaled E4M3 activation Tensor Core GEMM.
@@ -142,6 +145,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     const int row_begin          = row_tile * rows_per_block;
     const int token_begin        = token_tile * BM;
 
+    const unsigned long long weight_policy = l2_weight_policy(token_tiles == 1);
     auto stage_inputs = [&](int stage, int k_tile) {
         const int k_begin      = k_tile * BK;
         auto* activation_stage = activation_shared + stage * BM * BK;
@@ -178,10 +182,16 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             const int logical_byte    = logical_segment * 16;
             const int physical_byte   = fp8_mma_shared_byte<Schedule>(row, logical_byte);
             const int weight_row      = row_policy.weight_row(row_begin, row);
-            cp_async<16, Schedule::kWeightCache>(
-                weight_stage + row * BK + physical_byte,
+            const auto* weight_source =
                 weight_codes + static_cast<std::int64_t>(weight_row) * Geometry::kInputRows +
-                    k_begin + logical_byte);
+                k_begin + logical_byte;
+            if constexpr (Schedule::kWeightCache == Cache::cg) {
+                cp_async_cg_policy(weight_stage + row * BK + physical_byte, weight_source,
+                                   weight_policy);
+            } else {
+                cp_async<16, Schedule::kWeightCache>(weight_stage + row * BK + physical_byte,
+                                                     weight_source);
+            }
         }
     };
 

@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: add K-split staging depth and L2 cache mode.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 #include "ops/linear/fp8/fp8_geometry.h"
 
@@ -71,20 +74,29 @@ enum class Fp8A16KSplitActivationStage : std::uint8_t {
     PaddedZero,
 };
 
+// Default fills L1 and L2; Streaming bypasses L1; EvictFirst also marks the L2 fill evict-first,
+// for a weight stream that a single wave reads once per call while the activation and record
+// working set of the surrounding layer should stay resident.
 enum class Fp8A16KSplitCache : std::uint8_t {
     Default,
     Streaming,
+    EvictFirst,
 };
 
+// Stages > 1 multi-buffers the per-group code and activation staging so the next group's copies
+// are in flight while the current group multiplies. One-wave shapes need it to keep the weight
+// stream busy; many-wave shapes hide latency across CTAs and keep the single-stage footprint.
 template <int KWarps, int TileTokens, int MinBlocksPerSm,
           Fp8A16KSplitCache ActivationCache           = Fp8A16KSplitCache::Default,
           Fp8A16KSplitCache WeightCache               = Fp8A16KSplitCache::Streaming,
-          Fp8A16KSplitActivationStage ActivationStage = Fp8A16KSplitActivationStage::ActiveOnly>
+          Fp8A16KSplitActivationStage ActivationStage = Fp8A16KSplitActivationStage::ActiveOnly,
+          int Stages                                  = 1>
 struct Fp8A16KSplitSchedule {
     static_assert(KWarps == 4 || KWarps == 8 || KWarps == 16);
     static_assert(TileTokens == 8 || TileTokens == 16 || TileTokens == 24 || TileTokens == 32 ||
                   TileTokens == 40 || TileTokens == 48);
     static_assert(MinBlocksPerSm > 0);
+    static_assert(Stages >= 1);
 
     static constexpr int kKWarps            = KWarps;
     static constexpr int kTileTokens        = TileTokens;
@@ -92,6 +104,7 @@ struct Fp8A16KSplitSchedule {
     static constexpr auto kActivationCache  = ActivationCache;
     static constexpr auto kWeightCache      = WeightCache;
     static constexpr auto kActivationStage  = ActivationStage;
+    static constexpr int kStages            = Stages;
     static constexpr int kThreads           = KWarps * 32;
     static constexpr int kTileKPerWarp      = 64;
     static constexpr int kGroupK            = KWarps * kTileKPerWarp;

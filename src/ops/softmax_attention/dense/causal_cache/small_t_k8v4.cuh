@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: add the warp-specialized wide kernel and FP16-accumulated PV.
+// Modified by satellitedown for Cinference: add a warp-specialized wide kernel with assisted PV.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -808,6 +808,12 @@ struct K8V4WideSchedule {
     static constexpr int Threads        = Warps * 32;
     static constexpr int ComputeThreads = ComputeWarps * 32;
     static constexpr int LoaderThreads  = LoaderWarps * 32;
+    // Warp w issues on SM sub-partition w % 4, so compute warps 4 and 5 share the Tensor Cores of
+    // sub-partitions 0 and 1 with compute warps 0 and 1 while the loader warps (6 and 7) sit on
+    // sub-partitions 2 and 3. Loader warp j therefore runs the PV product of row tile 4 + j from
+    // the P fragments that compute warp 4 + j hands over, which balances the Tensor Core work.
+    static constexpr int AssistedTiles = RowTiles > 4 ? RowTiles - 4 : 0;
+    static_assert(AssistedTiles <= LoaderWarps);
     static constexpr int Bc             = 32;
     // Copies run PackedStages - 2 tiles ahead of the widening, which runs one tile ahead of the
     // compute warps; three tiles in flight per SM keep the cache stream at DRAM bandwidth.
@@ -870,11 +876,20 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
     extern __shared__ __align__(16) std::uint8_t dynamic_arena[];
     __shared__ float q_scale_s[Schedule::RowTiles * 16];
     // Tile handoff. full[slot] completes once every loader thread has widened a tile into the
-    // slot; empty[slot] once every compute thread has finished it. Compute warps wait only on the
-    // loaders, never on one another, so their softmax and Tensor Core phases drift apart.
+    // slot; empty[slot] once every thread that reads it (compute warps, and loader warps running an
+    // assisted PV product) has finished it. Compute warps wait only on the loaders, never on one
+    // another, so their softmax and Tensor Core phases drift apart.
     __shared__ __align__(8) std::uint64_t full[2];
     __shared__ __align__(8) std::uint64_t empty[2];
     __shared__ std::int32_t physical_pages_s[Schedule::PageIds];
+    // Assisted row tiles: compute warp 4 + j leaves its FP16 P fragments (lane-major, in the
+    // m16n8k16 A-operand layout) and per-row rescale factors here for loader warp j. The buffer is
+    // single: p_full[j] publishes a tile, p_empty[j] releases it once the loader holds it.
+    constexpr int kAssistSlots = Schedule::AssistedTiles > 0 ? Schedule::AssistedTiles : 1;
+    __shared__ __align__(16) uint4 p_handoff[kAssistSlots][2][32];
+    __shared__ float alpha_handoff[kAssistSlots][16];
+    __shared__ __align__(8) std::uint64_t p_full[kAssistSlots];
+    __shared__ __align__(8) std::uint64_t p_empty[kAssistSlots];
     const auto packed = [&](int stage) {
         return dynamic_arena + stage * Schedule::PackedStageBytes;
     };
@@ -987,20 +1002,106 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
     if (tid == 0) {
         for (int slot = 0; slot < 2; ++slot) {
             cta_mbarrier_init(&full[slot], Schedule::LoaderThreads);
-            cta_mbarrier_init(&empty[slot], Schedule::ComputeThreads);
+            cta_mbarrier_init(&empty[slot],
+                              Schedule::ComputeThreads + Schedule::AssistedTiles * 32);
+        }
+        for (int j = 0; j < Schedule::AssistedTiles; ++j) {
+            cta_mbarrier_init(&p_full[j], 32);
+            cta_mbarrier_init(&p_empty[j], 32);
         }
         cta_mbarrier_fence_init();
     }
     // Its trailing CTA barrier also publishes the initialized mbarriers.
     k8v4_quantize_query<Geometry, TokenTile, Threads>(q, kv_head, q_s, q_scale_s, tid);
 
+    const int gid = lane >> 2;
+    const int lid = lane & 3;
+
+    // Adds one tile's PV product for a 16-row tile: rescale by the tile's row factors, then
+    // multiply the FP16 P fragments by the widened V slot.
+    const auto accumulate_pv = [&](float (&acc)[PVNt][4], const unsigned (&pf)[Bc / 16][4],
+                                   float alpha0, float alpha1, int slot) {
+        // Unchanged row maxima give alpha == 1 exactly; skip the no-op rescale.
+        if (__any_sync(0xffffffffU, alpha0 != 1.0F || alpha1 != 1.0F)) {
+#pragma unroll
+            for (int n = 0; n < PVNt; ++n) {
+                acc[n][0] *= alpha0;
+                acc[n][1] *= alpha0;
+                acc[n][2] *= alpha1;
+                acc[n][3] *= alpha1;
+            }
+        }
+        const __half* v_f16 = v_slot(slot);
+#pragma unroll
+        for (int n = 0; n < PVNt; ++n) {
+            unsigned vf[4];
+            ldmatrix_x4_t(vf[0], vf[1], vf[2], vf[3],
+                          smem_addr(&v_f16[lane * D + causal_small_t_tc_swz(lane, n * 8)]));
+            k8v4_pv_pair(acc[n], pf[0], pf[1], vf[0], vf[1], vf[2], vf[3]);
+        }
+    };
+
+    // Writes the split numerator of one 16-row tile (doubling the half-scale accumulator).
+    const auto write_numerator = [&](const float (&acc)[PVNt][4], int row_base) {
+        const int row0 = row_base + gid;
+        const int row1 = row0 + 8;
+        int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
+        causal_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head0, token0);
+        causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
+#pragma unroll
+        for (int n = 0; n < PVNt; ++n) {
+            const int d0 = n * 8 + 2 * lid;
+            if (row0 < RowCount) {
+                const std::int64_t dst =
+                    causal_partial_acc_index<Geometry>(q_head0, d0, token0, split, TokenTile);
+                *reinterpret_cast<float2*>(&partial_acc[dst]) =
+                    make_float2(2.0F * acc[n][0], 2.0F * acc[n][1]);
+            }
+            if (row1 < RowCount) {
+                const std::int64_t dst =
+                    causal_partial_acc_index<Geometry>(q_head1, d0, token1, split, TokenTile);
+                *reinterpret_cast<float2*>(&partial_acc[dst]) =
+                    make_float2(2.0F * acc[n][2], 2.0F * acc[n][3]);
+            }
+        }
+    };
+
     if (is_loader) {
+        const int loader_warp = warp - Schedule::ComputeWarps;
+        const bool assists    = loader_warp < Schedule::AssistedTiles;
+        float acc[PVNt][4];
+#pragma unroll
+        for (int n = 0; n < PVNt; ++n) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[n][i] = 0.0F;
+        }
+        // PV product of tile t for row tile 4 + loader_warp, from the handed-over P fragments.
+        const auto assist = [&](int t) {
+            const int j = loader_warp;
+            cta_mbarrier_wait(&p_full[j], t & 1);
+            unsigned pf[Bc / 16][4];
+#pragma unroll
+            for (int k = 0; k < Bc / 16; ++k) {
+                const uint4 bits = p_handoff[j][k][lane];
+                pf[k][0]         = bits.x;
+                pf[k][1]         = bits.y;
+                pf[k][2]         = bits.z;
+                pf[k][3]         = bits.w;
+            }
+            const float alpha0 = alpha_handoff[j][gid];
+            const float alpha1 = alpha_handoff[j][gid + 8];
+            cta_mbarrier_arrive(&p_empty[j]);
+            accumulate_pv(acc, pf, alpha0, alpha1, t & 1);
+            cta_mbarrier_arrive(&empty[t & 1]);
+        };
+
         // The first widened tiles overwrite the query tile.
         k8v4_bar_sync(barrier::kQueryReleased, Threads);
 
         for (int kb = 0; kb < range.key_blocks; ++kb) {
             const int slot = kb & 1;
-            // Tile kb - 2 used this V slot and the packed stage refilled below.
+            // Tile kb - 2 used this V slot and the packed stage refilled below. Its assisted PV
+            // products ran in the previous iteration.
             if (kb >= 2) cta_mbarrier_wait(&empty[slot], ((kb - 2) >> 1) & 1);
             const int prefetch = kb + Schedule::PackedStages - 2;
             if (prefetch < range.key_blocks) issue(prefetch);
@@ -1011,21 +1112,28 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
             k8v4_widen_v_tile<Bc, Schedule::LoaderThreads>(loader, packed_v(stage),
                                                            packed_v_scale(stage), v_slot(slot));
             cta_mbarrier_arrive(&full[slot]);
+            if (assists && kb >= 1) assist(kb - 1);
+        }
+        if (assists) {
+            assist(range.key_blocks - 1);
+            write_numerator(acc,
+                            (Schedule::ComputeWarps - Schedule::AssistedTiles + loader_warp) * 16);
         }
         return;
     }
 
-    // Compute warps: warp w owns query rows [16w, 16w + 16).
-    const int gid      = lane >> 2;
-    const int lid      = lane & 3;
-    const int a_mat    = lane >> 3;
-    const int a_rowoff = (lane & 7) + ((a_mat & 1) << 3);
-    const int a_coloff = (a_mat >> 1) << 3;
-    const int b_rin    = lane & 7;
-    const int b_koff   = ((lane >> 3) & 1) << 3;
-    const int row_base = warp * 16;
-    const int row0     = row_base + gid;
-    const int row1     = row0 + 8;
+    // Compute warps: warp w owns query rows [16w, 16w + 16). The last AssistedTiles of them score
+    // and hand their P fragments to a loader warp instead of running the PV product.
+    const int assisted_tile = warp - (Schedule::ComputeWarps - Schedule::AssistedTiles);
+    const bool assisted     = assisted_tile >= 0;
+    const int a_mat         = lane >> 3;
+    const int a_rowoff      = (lane & 7) + ((a_mat & 1) << 3);
+    const int a_coloff      = (a_mat >> 1) << 3;
+    const int b_rin         = lane & 7;
+    const int b_koff        = ((lane >> 3) & 1) << 3;
+    const int row_base      = warp * 16;
+    const int row0          = row_base + gid;
+    const int row1          = row0 + 8;
 
     unsigned qf[QKKs][4];
     {
@@ -1092,16 +1200,6 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
         k8v4_softmax_tile<Geometry, QKNt>(score, packed_k_scale(stage), q_scale_r0, q_scale_r1,
                                           row0 < RowCount, row1 < RowCount, qabs0, qabs1, k0, range,
                                           attention_scale, lid, m0, m1, l0, l1, alpha0, alpha1);
-        // Unchanged row maxima give alpha == 1 exactly; skip the no-op rescale.
-        if (__any_sync(0xffffffffU, alpha0 != 1.0F || alpha1 != 1.0F)) {
-#pragma unroll
-            for (int n = 0; n < PVNt; ++n) {
-                acc[n][0] *= alpha0;
-                acc[n][1] *= alpha0;
-                acc[n][2] *= alpha1;
-                acc[n][3] *= alpha1;
-            }
-        }
         // The score accumulator layout is the m16n8k16 A-operand layout: key tiles 2k and 2k + 1
         // form the FP16 P fragment of key step k.
         unsigned pf[Bc / 16][4];
@@ -1112,13 +1210,21 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
             pf[k][2] = k8v4_half2_bits(score[2 * k + 1][0], score[2 * k + 1][1]);
             pf[k][3] = k8v4_half2_bits(score[2 * k + 1][2], score[2 * k + 1][3]);
         }
-        const __half* v_f16 = v_slot(slot);
+        if (assisted) {
+            // The loader warp took the previous tile's fragments before this buffer is reused.
+            if (kb >= 1) cta_mbarrier_wait(&p_empty[assisted_tile], (kb - 1) & 1);
 #pragma unroll
-        for (int n = 0; n < PVNt; ++n) {
-            unsigned vf[4];
-            ldmatrix_x4_t(vf[0], vf[1], vf[2], vf[3],
-                          smem_addr(&v_f16[lane * D + causal_small_t_tc_swz(lane, n * 8)]));
-            k8v4_pv_pair(acc[n], pf[0], pf[1], vf[0], vf[1], vf[2], vf[3]);
+            for (int k = 0; k < Bc / 16; ++k) {
+                p_handoff[assisted_tile][k][lane] =
+                    make_uint4(pf[k][0], pf[k][1], pf[k][2], pf[k][3]);
+            }
+            if (lid == 0) {
+                alpha_handoff[assisted_tile][gid]     = alpha0;
+                alpha_handoff[assisted_tile][gid + 8] = alpha1;
+            }
+            cta_mbarrier_arrive(&p_full[assisted_tile]);
+        } else {
+            accumulate_pv(acc, pf, alpha0, alpha1, slot);
         }
         cta_mbarrier_arrive(&empty[slot]);
     }
@@ -1139,25 +1245,7 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
             partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, TokenTile)] = l1;
         }
     }
-    int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
-    causal_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head0, token0);
-    causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
-#pragma unroll
-    for (int n = 0; n < PVNt; ++n) {
-        const int d0 = n * 8 + 2 * lid;
-        if (row0 < RowCount) {
-            const std::int64_t dst =
-                causal_partial_acc_index<Geometry>(q_head0, d0, token0, split, TokenTile);
-            *reinterpret_cast<float2*>(&partial_acc[dst]) =
-                make_float2(2.0F * acc[n][0], 2.0F * acc[n][1]);
-        }
-        if (row1 < RowCount) {
-            const std::int64_t dst =
-                causal_partial_acc_index<Geometry>(q_head1, d0, token1, split, TokenTile);
-            *reinterpret_cast<float2*>(&partial_acc[dst]) =
-                make_float2(2.0F * acc[n][2], 2.0F * acc[n][3]);
-        }
-    }
+    if (!assisted) write_numerator(acc, row_base);
 }
 
 template <typename Geometry, bool MultiBatch, bool Masked, bool Offset>
