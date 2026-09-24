@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: add a warp-specialized wide kernel with assisted PV.
+// Modified by satellitedown for Cinference: warp-specialized wide kernel, prepared query tile.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -13,7 +13,9 @@
 // tile and publish P through shared memory to all warps for PV. Wide blocks (a complete 27B verify
 // width) use the warp-specialized kernel: each compute warp owns one 16-row tile for the whole
 // split and keeps its scores in registers as the PV operand, while two loader warps stream and
-// widen the K/V tiles, so the Tensor Core work of one warp overlaps the softmax of another.
+// widen the K/V tiles, so the Tensor Core work of one warp overlaps the softmax of another. Its
+// query tile is rotated and quantized once per block by a preceding kernel and copied by every
+// split, instead of being derived again in each split.
 
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/mma.cuh"
@@ -155,19 +157,42 @@ k8v4_append_split_columns(const CacheInput& input, const std::int32_t* positions
     }
 }
 
+// Rotates one query row, lane l holding dimension l + 32r in values[r], and row-quantizes it to
+// E4M3: codes[r] encodes dimension l + 32r and the return value is the row scale. The whole warp
+// must call it.
+__device__ __forceinline__ float k8v4_quantize_query_row(float (&values)[8], int lane,
+                                                         std::uint8_t (&codes)[8]) {
+    constexpr unsigned FullMask = 0xffffffffU;
+    normalized_hadamard_d256_inplace(values, lane);
+    float local_absmax = 0.0F;
+#pragma unroll
+    for (float value : values) local_absmax = fmaxf(local_absmax, fabsf(value));
+    const float absmax = warp_max(local_absmax, FullMask);
+    const float qs     = absmax > 0.0F ? absmax / kKVCacheFp8MaxFinite : 0.0F;
+    const float inv    = qs > 0.0F ? 1.0F / qs : 0.0F;
+#pragma unroll
+    for (int r = 0; r < 8; ++r) codes[r] = kv_cache_fp8_quant_code(values[r], inv);
+    return qs;
+}
+
+__device__ __forceinline__ void k8v4_load_query_row(const __nv_bfloat16* row, int lane,
+                                                    float (&values)[8]) {
+#pragma unroll
+    for (int r = 0; r < 8; ++r) values[r] = __bfloat162float(row[lane + 32 * r]);
+}
+
 // Rotates and row-quantizes the query rows of this KV head into the swizzled E4M3 tile q_s
 // (Br x D bytes, rows past RowCount zero) and their scales into q_scale. Every thread of the CTA
 // must call it; it returns after a CTA barrier.
 template <typename Geometry, int TokenTile, int Threads>
 __device__ __forceinline__ void k8v4_quantize_query(const __nv_bfloat16* q, int kv_head,
                                                     std::uint8_t* q_s, float* q_scale, int tid) {
-    constexpr int RowCount      = TokenTile * Geometry::GroupSize;
-    constexpr int Br            = ((RowCount + 15) / 16) * 16;
-    constexpr int D             = kCausalHeadDim;
-    constexpr int Warps         = Threads / 32;
-    constexpr unsigned FullMask = 0xffffffffU;
-    const int warp              = tid >> 5;
-    const int lane              = tid & 31;
+    constexpr int RowCount = TokenTile * Geometry::GroupSize;
+    constexpr int Br       = ((RowCount + 15) / 16) * 16;
+    constexpr int D        = kCausalHeadDim;
+    constexpr int Warps    = Threads / 32;
+    const int warp         = tid >> 5;
+    const int lane         = tid & 31;
     for (int index = tid; index < Br * D; index += Threads) q_s[index] = 0;
     for (int row = tid; row < Br; row += Threads) q_scale[row] = 0.0F;
     __syncthreads();
@@ -177,27 +202,83 @@ __device__ __forceinline__ void k8v4_quantize_query(const __nv_bfloat16* q, int 
         int token  = 0;
         causal_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
         float values[8];
-        float local_absmax = 0.0F;
+        k8v4_load_query_row(q + causal_q_index<Geometry>(q_head, 0, token), lane, values);
+        std::uint8_t codes[8];
+        const float qs = k8v4_quantize_query_row(values, lane, codes);
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
-            const int d = lane + 32 * r;
-            values[r]   = __bfloat162float(q[causal_q_index<Geometry>(q_head, d, token)]);
-        }
-        normalized_hadamard_d256_inplace(values, lane);
-#pragma unroll
-        for (float value : values) local_absmax = fmaxf(local_absmax, fabsf(value));
-        const float absmax = warp_max(local_absmax, FullMask);
-        const float qs     = absmax > 0.0F ? absmax / kKVCacheFp8MaxFinite : 0.0F;
-        const float inv    = qs > 0.0F ? 1.0F / qs : 0.0F;
-#pragma unroll
-        for (int r = 0; r < 8; ++r) {
-            const int d = lane + 32 * r;
-            causal_small_t_store_byte_swizzled(q_s, row, d, D / 2,
-                                               kv_cache_fp8_quant_code(values[r], inv));
+            causal_small_t_store_byte_swizzled(q_s, row, lane + 32 * r, D / 2, codes[r]);
         }
         if (lane == 0) q_scale[row] = qs;
     }
     __syncthreads();
+}
+
+// The wide kernel's query tile, prepared once per verify block instead of by every split CTA:
+// codes[((batch * KVHeads + kv_head) * RowCount + row) * D + d] and scales at the same row index,
+// with the kernel's row order (row = token * GroupSize + local query head).
+template <typename Geometry>
+__device__ __forceinline__ std::int64_t k8v4_prepared_row(int batch, int kv_head, int row,
+                                                          int row_count) {
+    return (static_cast<std::int64_t>(batch) * Geometry::KVHeads + kv_head) * row_count + row;
+}
+
+// One warp per prepared row: the rows k8v4_quantize_query would derive in every CTA of the block.
+template <typename Geometry, int TokenTile, bool MultiBatch>
+__launch_bounds__(128) __global__
+    void causal_attention_small_t_k8v4_prepare_query_kernel(const __nv_bfloat16* q,
+                                                            std::int32_t full_width,
+                                                            std::int32_t column_begin,
+                                                            std::int32_t batch_size,
+                                                            std::uint8_t* codes, float* scales) {
+    constexpr int RowCount = TokenTile * Geometry::GroupSize;
+    constexpr int D        = kCausalHeadDim;
+    const int lane         = static_cast<int>(threadIdx.x) & 31;
+    const int flat_row     = static_cast<int>(blockIdx.x) * 4 + static_cast<int>(threadIdx.x) / 32;
+    const int row          = flat_row % RowCount;
+    const int kv_head      = flat_row / RowCount % Geometry::KVHeads;
+    const int batch        = flat_row / (RowCount * Geometry::KVHeads);
+    if (batch >= batch_size) return;
+    std::int64_t column_base = column_begin;
+    if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
+    int q_head = 0;
+    int token  = 0;
+    causal_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
+    float values[8];
+    k8v4_load_query_row(q + static_cast<std::int64_t>(D) * Geometry::QHeads * column_base +
+                            causal_q_index<Geometry>(q_head, 0, token),
+                        lane, values);
+    std::uint8_t row_codes[8];
+    const float qs          = k8v4_quantize_query_row(values, lane, row_codes);
+    const std::int64_t base = k8v4_prepared_row<Geometry>(batch, kv_head, row, RowCount);
+#pragma unroll
+    for (int r = 0; r < 8; ++r) codes[base * D + lane + 32 * r] = row_codes[r];
+    if (lane == 0) scales[base] = qs;
+}
+
+// Copies this KV head's prepared query tile into q_s/q_scale with k8v4_quantize_query's layout
+// (rows past RowCount zero) and commits it as one cp.async group. Every thread must call it.
+template <typename Geometry, int TokenTile, int Threads>
+__device__ __forceinline__ void
+k8v4_copy_prepared_query(const std::uint8_t* codes, const float* scales, int batch, int kv_head,
+                         std::uint8_t* q_s, float* q_scale, int tid) {
+    constexpr int RowCount   = TokenTile * Geometry::GroupSize;
+    constexpr int Br         = ((RowCount + 15) / 16) * 16;
+    constexpr int D          = kCausalHeadDim;
+    constexpr int Chunks     = RowCount * (D / 16);
+    const std::int64_t first = k8v4_prepared_row<Geometry>(batch, kv_head, 0, RowCount);
+    for (int chunk = tid; chunk < Chunks; chunk += Threads) {
+        const int row = chunk / (D / 16);
+        const int c   = chunk - row * (D / 16);
+        cp_async<16, Cache::cg>(q_s + row * D + ((c ^ (row & 7)) << 4),
+                                codes + (first + row) * D + c * 16);
+    }
+    for (int row = tid; row < RowCount; row += Threads) {
+        cp_async<4>(&q_scale[row], scales + first + row);
+    }
+    for (int index = RowCount * D + tid; index < Br * D; index += Threads) q_s[index] = 0;
+    for (int row = RowCount + tid; row < Br; row += Threads) q_scale[row] = 0.0F;
+    cp_commit();
 }
 
 // Issues the copies of one packed Bc-key tile: swizzled E4M3 K codes, packed NVFP4 V codes and
@@ -854,9 +935,9 @@ __device__ __forceinline__ void k8v4_bar_arrive(int id, int threads) {
 template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
 __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
     void causal_attention_small_t_k8v4_wide_kernel(
-        const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
-        std::uint8_t* cache_k, std::uint8_t* cache_v, __half* cache_k_scale,
-        std::uint8_t* cache_v_scale, const std::int32_t* block_tables,
+        const std::uint8_t* query_codes, const float* query_scales, CacheInput input,
+        const std::int32_t* positions, std::uint8_t* cache_k, std::uint8_t* cache_v,
+        __half* cache_k_scale, std::uint8_t* cache_v_scale, const std::int32_t* block_tables,
         const std::int32_t* valid_columns, const std::int32_t* table_rows,
         std::int32_t table_stride, std::int32_t full_width, std::int32_t column_begin,
         std::int32_t logical_capacity, float attention_scale, float* partial_acc, float* partial_m,
@@ -920,7 +1001,6 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
     }
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
-    q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
     positions += column_base;
     if constexpr (CacheInput::writes_cache) {
         input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
@@ -960,6 +1040,9 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
         write_neutral();
         return;
     }
+    // The prepared query tile streams in first, while the block table and the first tiles load.
+    k8v4_copy_prepared_query<Geometry, TokenTile, Threads>(query_codes, query_scales, batch,
+                                                           kv_head, q_s, q_scale_s, tid);
     const int first_page = range.first_tile >> kPagedKVPageShift;
     const int page_count = ((range.split_end - 1) >> kPagedKVPageShift) - first_page + 1;
     for (int page = tid; page < min(page_count, Schedule::PageIds); page += Threads) {
@@ -991,13 +1074,16 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
             tile_k0, page_of(tile_k0), range, kv_head, cache_k, cache_v, cache_k_scale,
             cache_v_scale);
     };
-    // The first tiles stream in while the query tile is rotated and quantized.
     if (is_loader) {
 #pragma unroll
         for (int tile = 0; tile < Schedule::PackedStages - 2; ++tile) {
             if (tile < range.key_blocks) issue(tile);
             cp_commit();
         }
+        // The query group precedes the tile groups.
+        cp_wait<Schedule::PackedStages - 2>();
+    } else {
+        cp_wait<0>();
     }
     if (tid == 0) {
         for (int slot = 0; slot < 2; ++slot) {
@@ -1011,8 +1097,8 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
         }
         cta_mbarrier_fence_init();
     }
-    // Its trailing CTA barrier also publishes the initialized mbarriers.
-    k8v4_quantize_query<Geometry, TokenTile, Threads>(q, kv_head, q_s, q_scale_s, tid);
+    // Publishes the query tile and the initialized mbarriers.
+    __syncthreads();
 
     const int gid = lane >> 2;
     const int lid = lane & 3;

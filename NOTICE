@@ -21,7 +21,8 @@ loader-assisted PV products, evict-first L2 fills for once-read verify weights,
 proposal-head and GDN convolution staging, a bank-conflict-free Q4 proposal
 head, retuned small-token A8 tiles, a wider argmax, a GDN record convolution
 fused into its input projection, a fused RMSNorm-SwiGLU FFN that hands both
-NVFP4 projections pre-quantized inputs, and a fused query/key RMSNorm-RoPE.
+NVFP4 projections pre-quantized inputs, a fused query/key RMSNorm-RoPE, and a
+K8V4 verify query prepared once per block instead of in every attention split.
 Publication changes add fork branding, provenance and measurement scope,
 correct stale range text, make local-path instructions portable, and omit
 machine-local agent automation and unrelated sponsorship configuration.

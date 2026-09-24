@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: size wide K8V4 split capacity for one resident wave.
+// Modified by satellitedown for Cinference: wide K8V4 split capacity and prepared-query workspace.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 // ninfer::ops - split-KV causal small-T launcher and unified route dispatcher. INT8 Q/K
@@ -384,11 +384,12 @@ void causal_attention_small_t_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& pos,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& query_codes,
+    Tensor& query_scales, Tensor& out, cudaStream_t stream) {
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_small_t_k8v4_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
                                              envelope, column_begin, width, partial_acc, partial_m,
-                                             partial_l, out, stream);
+                                             partial_l, query_codes, query_scales, out, stream);
         return;
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
@@ -428,10 +429,13 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
                                             const PagedKVLayerView& cache,
                                             CausalAttentionExecutionEnvelope envelope,
                                             Tensor& partial_acc, Tensor& partial_m,
-                                            Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+                                            Tensor& partial_l, Tensor& query_codes,
+                                            Tensor& query_scales, Tensor& out,
+                                            cudaStream_t stream) {
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         causal_attention_cached_small_t_k8v4_launch(q, pos, scale, cache, envelope, partial_acc,
-                                                    partial_m, partial_l, out, stream);
+                                                    partial_m, partial_l, query_codes, query_scales,
+                                                    out, stream);
         return;
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {

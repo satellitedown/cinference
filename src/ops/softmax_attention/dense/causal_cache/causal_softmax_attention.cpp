@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: chunk K8V4 verify blocks at sixteen tokens.
+// Modified by satellitedown for Cinference: K8V4 verify chunks and their prepared-query workspace.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 // ninfer::ops - causal cached Softmax Attention validation and finite route dispatch.
@@ -274,17 +274,28 @@ struct SmallTWorkspace {
     Tensor acc;
     Tensor m;
     Tensor l;
+    Tensor query_codes;
+    Tensor query_scales;
 };
 
 template <class Allocator>
-SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_heads,
-                                           std::int32_t tokens, std::int32_t splits,
-                                           std::int32_t batch_size) {
-    return {
+SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, KvCacheStorage storage,
+                                           std::int32_t q_heads, std::int32_t tokens,
+                                           std::int32_t splits, std::int32_t batch_size) {
+    SmallTWorkspace result{
         workspace.alloc(DType::FP32, {kHeadDim, q_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
         workspace.alloc(DType::FP32, {q_heads, tokens, splits * batch_size}),
+        {},
+        {},
     };
+    if (storage == KvCacheStorage::Fp8KeyNvfp4Value &&
+        detail::causal_attention_small_t_k8v4_prepares_query(q_heads, tokens)) {
+        result.query_codes =
+            workspace.alloc(DType::FP8_E4M3FN, {kHeadDim, q_heads, tokens, batch_size});
+        result.query_scales = workspace.alloc(DType::FP32, {q_heads, tokens, batch_size});
+    }
+    return result;
 }
 
 template <typename Launch>
@@ -299,7 +310,8 @@ void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceA
         auto chunk_scope = workspace.scope();
         const std::int32_t splits =
             detail::causal_attention_split_capacity(q.ne[1], count, cache_storage, envelope);
-        SmallTWorkspace partial = allocate_small_t_workspace(workspace, q.ne[1], count, splits, 1);
+        SmallTWorkspace partial =
+            allocate_small_t_workspace(workspace, cache_storage, q.ne[1], count, splits, 1);
         Tensor q_chunk          = q.slice(2, begin, count);
         Tensor position_chunk   = positions.slice(0, begin, count);
         Tensor out_chunk        = out.slice(2, begin, count);
@@ -322,10 +334,11 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
         const std::int32_t splits = detail::causal_attention_split_capacity(
             q.ne[1], count, cache.storage, envelope, q.ne[3]);
         SmallTWorkspace partial =
-            allocate_small_t_workspace(workspace, q.ne[1], count, splits, q.ne[3]);
+            allocate_small_t_workspace(workspace, cache.storage, q.ne[1], count, splits, q.ne[3]);
         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, table_rows,
                                                 scale, cache, envelope, begin, count, partial.acc,
-                                                partial.m, partial.l, out, stream);
+                                                partial.m, partial.l, partial.query_codes,
+                                                partial.query_scales, out, stream);
     }
 }
 
@@ -337,9 +350,9 @@ void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, flo
         q, positions, workspace, cache.storage, envelope, out,
         [&](std::int32_t, std::int32_t, const Tensor& q_chunk, const Tensor& position_chunk,
             SmallTWorkspace& partial, Tensor& out_chunk) {
-            detail::causal_attention_cached_small_t_launch(q_chunk, position_chunk, scale, cache,
-                                                           envelope, partial.acc, partial.m,
-                                                           partial.l, out_chunk, stream);
+            detail::causal_attention_cached_small_t_launch(
+                q_chunk, position_chunk, scale, cache, envelope, partial.acc, partial.m, partial.l,
+                partial.query_codes, partial.query_scales, out_chunk, stream);
         });
 }
 
@@ -420,7 +433,7 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         const std::int32_t splits = detail::causal_attention_split_capacity(
             q_heads, width, cache_storage, envelope, batch_size);
         WorkspaceLayoutBuilder layout;
-        (void)allocate_small_t_workspace(layout, q_heads, width, splits, batch_size);
+        (void)allocate_small_t_workspace(layout, cache_storage, q_heads, width, splits, batch_size);
         return layout.peak_bytes(1);
     };
     const auto exact_capacity = [&](std::int32_t width) {
@@ -483,10 +496,11 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         const std::int32_t splits =
             detail::causal_attention_split_capacity(q.ne[1], width, cache.storage, envelope, batch);
         SmallTWorkspace partial =
-            allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
+            allocate_small_t_workspace(workspace, cache.storage, q.ne[1], width, splits, batch);
         detail::causal_attention_small_t_launch(q, k, v, positions, valid_columns, kv_table_rows,
                                                 scale, cache, envelope, 0, width, partial.acc,
-                                                partial.m, partial.l, out, stream);
+                                                partial.m, partial.l, partial.query_codes,
+                                                partial.query_scales, out, stream);
         return;
     }
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
@@ -512,9 +526,10 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         const std::int32_t splits =
             detail::causal_attention_split_capacity(q.ne[1], q.ne[2], cache.storage, envelope);
         SmallTWorkspace partial =
-            allocate_small_t_workspace(workspace, q.ne[1], q.ne[2], splits, 1);
+            allocate_small_t_workspace(workspace, cache.storage, q.ne[1], q.ne[2], splits, 1);
         detail::causal_attention_cached_small_t_launch(
-            q, positions, scale, cache, envelope, partial.acc, partial.m, partial.l, out, stream);
+            q, positions, scale, cache, envelope, partial.acc, partial.m, partial.l,
+            partial.query_codes, partial.query_scales, out, stream);
         return;
     }
     detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);

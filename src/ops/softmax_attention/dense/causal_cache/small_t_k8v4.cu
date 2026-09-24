@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: dispatch wide verify blocks to the warp-specialized kernel.
+// Modified by satellitedown for Cinference: prepare wide verify queries once for the wide kernel.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 // ninfer::ops::detail - asymmetric FP8-K/NVFP4-V split-KV small-T launch ownership.
@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <tuple>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -18,7 +19,8 @@ template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typena
 void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positions, float scale,
                          PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                          std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
-                         Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
+                         Tensor& partial_m, Tensor& partial_l, Tensor& query_codes,
+                         Tensor& query_scales, cudaStream_t stream) {
     constexpr int RowCount = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles = (RowCount + 15) / 16;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
@@ -39,24 +41,40 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
     auto* partial_m_ptr   = static_cast<float*>(partial_m.data);
     auto* partial_l_ptr   = static_cast<float*>(partial_l.data);
 
-    const auto launch = [&](auto kernel, int threads, std::size_t dynamic_bytes) {
+    const auto launch = [&](auto kernel, int threads, std::size_t dynamic_bytes,
+                            const auto& query) {
         static const cudaError_t attr = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(dynamic_bytes));
         CUDA_CHECK(attr);
-        kernel<<<grid, threads, dynamic_bytes, stream>>>(
-            q_ptr, input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr, v_scale_ptr,
-            tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0], invocation.full_width,
-            invocation.column_begin, logical_capacity, scale, partial_acc_ptr, partial_m_ptr,
-            partial_l_ptr);
+        std::apply(
+            [&](const auto&... query_args) {
+                kernel<<<grid, threads, dynamic_bytes, stream>>>(
+                    query_args..., input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr,
+                    v_scale_ptr, tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0],
+                    invocation.full_width, invocation.column_begin, logical_capacity, scale,
+                    partial_acc_ptr, partial_m_ptr, partial_l_ptr);
+            },
+            query);
         CUDA_CHECK(cudaGetLastError());
     };
 
     if constexpr (RowTiles > 3) {
-        // A complete wide verify block: compute warps own whole 16-row tiles for the split.
-        using Schedule = K8V4WideSchedule<Geometry, TokenTile>;
+        // A complete wide verify block: compute warps own whole 16-row tiles for the split. The
+        // block's query tile is rotated and quantized once here instead of in every split CTA.
+        using Schedule          = K8V4WideSchedule<Geometry, TokenTile>;
+        auto* const codes_ptr   = static_cast<std::uint8_t*>(query_codes.data);
+        auto* const scales_ptr  = static_cast<float*>(query_scales.data);
+        const int prepared_rows = RowCount * Geometry::KVHeads * invocation.batch_size;
+        causal_attention_small_t_k8v4_prepare_query_kernel<Geometry, TokenTile, MultiBatch>
+            <<<(prepared_rows + 3) / 4, 128, 0, stream>>>(
+                q_ptr, invocation.full_width, invocation.column_begin, invocation.batch_size,
+                codes_ptr, scales_ptr);
+        CUDA_CHECK(cudaGetLastError());
         launch(causal_attention_small_t_k8v4_wide_kernel<Geometry, TokenTile, MultiBatch, Masked,
                                                          CacheInput>,
-               Schedule::Threads, static_cast<std::size_t>(Schedule::DynamicBytes));
+               Schedule::Threads, static_cast<std::size_t>(Schedule::DynamicBytes),
+               std::make_tuple(static_cast<const std::uint8_t*>(codes_ptr),
+                               static_cast<const float*>(scales_ptr)));
     } else {
         constexpr int Warps     = RowTiles == 3 ? 12 : 8;
         constexpr int KeyBlock  = TokenTile == 1 ? 32 : 64;
@@ -66,7 +84,7 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
         launch(causal_attention_small_t_k8v4_tiled_kernel<Geometry, TokenTile, Warps, MinBlocks,
                                                           KeyBlock, true, MultiBatch, Masked,
                                                           CacheInput>,
-               Warps * 32, DynamicBytes);
+               Warps * 32, DynamicBytes, std::make_tuple(q_ptr));
     }
 }
 
@@ -98,13 +116,12 @@ void launch_k8v4_reduce(const Tensor& positions, const CausalSmallTInvocation& i
 }
 
 template <typename Geometry, typename CacheInput>
-void causal_attention_small_t_k8v4_launch_for(const Tensor& q, CacheInput input,
-                                              const Tensor& positions, float scale,
-                                              PagedKVBatchLayerView cache,
-                                              const CausalSmallTInvocation& invocation,
-                                              CausalAttentionExecutionEnvelope envelope,
-                                              Tensor& partial_acc, Tensor& partial_m,
-                                              Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+void causal_attention_small_t_k8v4_launch_for(
+    const Tensor& q, CacheInput input, const Tensor& positions, float scale,
+    PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
+    CausalAttentionExecutionEnvelope envelope, Tensor& partial_acc, Tensor& partial_m,
+    Tensor& partial_l, Tensor& query_codes, Tensor& query_scales, Tensor& out,
+    cudaStream_t stream) {
     const auto logical_capacity = static_cast<std::int32_t>(envelope.max_visible_keys);
     const auto splits           = causal_attention_split_capacity(
         Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
@@ -112,7 +129,7 @@ void causal_attention_small_t_k8v4_launch_for(const Tensor& q, CacheInput input,
     const auto launch_partial = [&]<int Tokens, bool MultiBatch, bool Masked>() {
         launch_k8v4_partial<Geometry, Tokens, MultiBatch, Masked>(
             q, input, positions, scale, cache, invocation, logical_capacity, splits, partial_acc,
-            partial_m, partial_l, stream);
+            partial_m, partial_l, query_codes, query_scales, stream);
     };
     const auto dispatch_metadata = [&]<int Tokens>() {
         const bool masked = invocation.valid_columns != nullptr;
@@ -222,11 +239,19 @@ void causal_attention_small_t_k8v4_launch_for(const Tensor& q, CacheInput input,
 
 } // namespace
 
+bool causal_attention_small_t_k8v4_prepares_query(std::int32_t q_heads, std::int32_t width) {
+    // The wide kernel owns more than three 16-row query tiles.
+    const std::int32_t group = q_heads == CausalD256H24Kv4::QHeads ? CausalD256H24Kv4::GroupSize
+                                                                   : CausalD256H16Kv2::GroupSize;
+    return (width * group + 15) / 16 > 3;
+}
+
 void causal_attention_small_t_k8v4_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
     const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
     CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& query_codes,
+    Tensor& query_scales, Tensor& out, cudaStream_t stream) {
     const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                   static_cast<const __nv_bfloat16*>(v.data)};
     const CausalSmallTInvocation invocation{
@@ -240,19 +265,20 @@ void causal_attention_small_t_k8v4_launch(
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_k8v4_launch_for<CausalD256H24Kv4>(
             q, input, positions, scale, cache, invocation, envelope, partial_acc, partial_m,
-            partial_l, out, stream);
+            partial_l, query_codes, query_scales, out, stream);
         return;
     }
-    causal_attention_small_t_k8v4_launch_for<CausalD256H16Kv2>(q, input, positions, scale, cache,
-                                                               invocation, envelope, partial_acc,
-                                                               partial_m, partial_l, out, stream);
+    causal_attention_small_t_k8v4_launch_for<CausalD256H16Kv2>(
+        q, input, positions, scale, cache, invocation, envelope, partial_acc, partial_m, partial_l,
+        query_codes, query_scales, out, stream);
 }
 
 void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor& positions,
                                                  float scale, const PagedKVLayerView& cache,
                                                  CausalAttentionExecutionEnvelope envelope,
                                                  Tensor& partial_acc, Tensor& partial_m,
-                                                 Tensor& partial_l, Tensor& out,
+                                                 Tensor& partial_l, Tensor& query_codes,
+                                                 Tensor& query_scales, Tensor& out,
                                                  cudaStream_t stream) {
     const CausalCachedInput input{};
     const CausalSmallTInvocation invocation{
@@ -267,12 +293,12 @@ void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor& 
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_k8v4_launch_for<CausalD256H24Kv4>(
             q, input, positions, scale, batch_cache, invocation, envelope, partial_acc, partial_m,
-            partial_l, out, stream);
+            partial_l, query_codes, query_scales, out, stream);
         return;
     }
     causal_attention_small_t_k8v4_launch_for<CausalD256H16Kv2>(
         q, input, positions, scale, batch_cache, invocation, envelope, partial_acc, partial_m,
-        partial_l, out, stream);
+        partial_l, query_codes, query_scales, out, stream);
 }
 
 } // namespace ninfer::ops::detail
