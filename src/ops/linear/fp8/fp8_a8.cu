@@ -1,9 +1,13 @@
+// Modified by satellitedown for Cinference: share the token quantization with fused producers.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
 #include "core/device.h"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/linear/fp8/fp8_a8_quantize.cuh"
 #include "ops/linear/fp8/fp8_a8_schedule.cuh"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_output.cuh"
@@ -53,17 +57,16 @@ __global__ __launch_bounds__(Threads,
     if (warp == 0) {
         maximum = lane < warps ? warp_maxima[lane] : 0.0F;
         maximum = warp_max(maximum);
-        if (lane == 0) { token_scale = maximum > 0.0F ? maximum / 448.0F : 0.0F; }
+        if (lane == 0) { token_scale = fp8_a8_token_scale(maximum); }
     }
     __syncthreads();
 
     const float scale   = token_scale;
-    const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+    const float inverse = fp8_a8_inverse_scale(scale);
 #pragma unroll
     for (int item = 0; item < pairs_per_thread; ++item) {
-        const int pair      = tid + item * Threads;
-        const float2 scaled = make_float2(values[item].x * inverse, values[item].y * inverse);
-        output_pairs[pair]  = __nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3);
+        const int pair     = tid + item * Threads;
+        output_pairs[pair] = fp8_a8_encode_pair(values[item], inverse);
     }
     if (tid == 0) { scales[token] = scale; }
 }

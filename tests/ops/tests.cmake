@@ -1,4 +1,4 @@
-# Modified by satellitedown for Cinference: register the fused FFN and q/k norm-RoPE tests.
+# Modified by satellitedown for Cinference: register the fused FFN, attention input and q/k tests.
 # See NOTICE and upstream-provenance.json for upstream attribution.
 
 set(ninfer_op_tests
@@ -74,6 +74,10 @@ ninfer_add_op_test(ninfer_rmsnorm_rope_test
 
 ninfer_add_op_test(ninfer_rmsnorm_swiglu_ffn_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rmsnorm_swiglu_ffn.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_rmsnorm_attn_input_proj_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rmsnorm_attn_input_proj.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_qk_rmsnorm_rope_test

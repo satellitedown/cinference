@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: fuse query/key normalization with RoPE.
+// Modified by satellitedown for Cinference: fused input norm-projection and q/k norm-RoPE.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -8,11 +8,14 @@
 namespace ninfer::models::qwen3_5::execution {
 
 [[nodiscard]] std::size_t
-attention_projection_workspace_bytes(const AttentionParameters& parameters, std::int32_t first,
-                                     std::int32_t last);
-void attention_projection(const Tensor& hidden, const AttentionParameters& parameters,
-                          Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
-                          WorkspaceArena& workspace, cudaStream_t stream);
+attention_norm_projection_workspace_bytes(const AttentionParameters& parameters, std::int32_t first,
+                                          std::int32_t last);
+// Unit-offset RMSNorm of the residual then the Q/gate/K/V projection. `hidden` receives the
+// normalized rows only where the projection reads them as BF16 (the paired-parent form).
+void attention_norm_projection(const Tensor& residual, const Tensor& norm, float eps,
+                               const AttentionParameters& parameters, Tensor& hidden, Tensor& query,
+                               Tensor& gate, Tensor& key, Tensor& value, WorkspaceArena& workspace,
+                               cudaStream_t stream);
 
 void text_rope(const Tensor& positions, const RopeConfig& config, Tensor& query,
                cudaStream_t stream);

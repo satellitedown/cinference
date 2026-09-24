@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: report whether a width takes the A8 route.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 
@@ -46,6 +49,10 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 }
 
 } // namespace
+
+bool fp8_linear_swiglu_uses_a8(LinearPolicy policy, std::int32_t tokens) {
+    return resolve_route(policy, tokens) == Fp8LinearSwiGluRoute::A8;
+}
 
 std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
                                                        std::int32_t max_tokens) {

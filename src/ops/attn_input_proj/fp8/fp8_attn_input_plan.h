@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: expose the pre-quantized A8 attention input route.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "core/weight.h"
@@ -33,6 +36,15 @@ void fp8_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor
 
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream);
+
+// The A8 route of fp8_attn_input_dispatch on an already quantized input (the codes and scales
+// launch_fp8_a8_quantize writes for the BF16 input).
+void fp8_attn_input_a8_quantized_launch(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
+                                        Tensor& v, Fp8A8Workspace input, std::int32_t tokens,
+                                        cudaStream_t stream);
+
+// Whether fp8_attn_input_dispatch takes its A8 route (quantizing the input) at this width.
+[[nodiscard]] bool fp8_attn_input_uses_a8(LinearPolicy policy, std::int32_t tokens);
 
 void fp8_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                              Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,

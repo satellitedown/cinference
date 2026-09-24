@@ -1,3 +1,6 @@
+# Modified by satellitedown for Cinference: build the fused RMSNorm attention input Op.
+# See NOTICE and upstream-provenance.json for upstream attribution.
+
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_attn_input_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_attn_input_gemm_mma.cu"
@@ -23,4 +26,5 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_dflash2_attn_input.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_attn_input_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/attn_input_proj.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/../wrapper/rmsnorm_attn_input_proj.cpp"
 )

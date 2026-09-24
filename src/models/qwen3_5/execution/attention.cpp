@@ -1,10 +1,12 @@
-// Modified by satellitedown for Cinference: fuse query/key normalization with RoPE.
+// Modified by satellitedown for Cinference: fused input norm-projection and q/k norm-RoPE.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/execution/attention.h"
 
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/qk_rmsnorm_rope.h"
+#include "ninfer/ops/rmsnorm.h"
+#include "ninfer/ops/rmsnorm_attn_input_proj.h"
 #include "ninfer/ops/rope.h"
 
 #include <stdexcept>
@@ -23,28 +25,29 @@ void require_rope_axes(const Tensor& positions, const RopeConfig& config) {
 
 } // namespace
 
-std::size_t attention_projection_workspace_bytes(const AttentionParameters& parameters,
-                                                 std::int32_t first, std::int32_t last) {
+std::size_t attention_norm_projection_workspace_bytes(const AttentionParameters& parameters,
+                                                      std::int32_t first, std::int32_t last) {
     if (first <= 0 || last < first) {
         throw std::invalid_argument("attention projection: invalid column interval");
     }
     if (const auto* single = std::get_if<LinearParameters>(&parameters.projection)) {
-        const auto& weight = single->weight;
-        return ops::attn_input_proj_workspace_capacity_bytes(weight.qtype, weight.n, weight.k,
-                                                             single->policy, first, last);
+        return ops::rmsnorm_attn_input_proj_workspace_capacity_bytes(single->weight, single->policy,
+                                                                     first, last);
     }
     return 0;
 }
 
-void attention_projection(const Tensor& hidden, const AttentionParameters& parameters,
-                          Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
-                          WorkspaceArena& workspace, cudaStream_t stream) {
+void attention_norm_projection(const Tensor& residual, const Tensor& norm, float eps,
+                               const AttentionParameters& parameters, Tensor& hidden, Tensor& query,
+                               Tensor& gate, Tensor& key, Tensor& value, WorkspaceArena& workspace,
+                               cudaStream_t stream) {
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
+        ops::rmsnorm(residual, norm, eps, true, hidden, stream);
         ops::attn_input_proj(hidden, pair->first, pair->second, query, gate, key, value, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
-        ops::attn_input_proj(hidden, single.weight, query, gate, key, value, single.policy,
-                             workspace, stream);
+        ops::rmsnorm_attn_input_proj(residual, norm, eps, true, single.weight, query, gate, key,
+                                     value, single.policy, workspace, stream);
     }
 }
 

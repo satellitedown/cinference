@@ -164,7 +164,8 @@ int run_profile(const Profile& profile, const std::vector<Case>& cases, std::uin
     int failures = 0;
     for (const Case& c : cases) {
         failures += run_case(profile, c, norm_weight_storage, residual,
-                             c.tokens == 16 && c.gate_up_policy == ops::LinearPolicy::AllowA4);
+                             c.tokens == 16 && (c.gate_up_policy == ops::LinearPolicy::AllowA4 ||
+                                                c.gate_up_policy == ops::LinearPolicy::AllowA8));
         // Every single-width requirement fits inside the capacity reported for an interval
         // containing it.
         const std::size_t interval = ops::rmsnorm_swiglu_ffn_workspace_capacity_bytes(
@@ -232,9 +233,11 @@ int main() {
         const Profile profile{"FP8", gate_up.device_weight(gate_up_storage.p),
                               down.device_weight(down_storage.p)};
         std::vector<Case> cases;
-        for (const std::int32_t tokens : {4, 16, 17}) {
+        for (const std::int32_t tokens : {1, 2, 3, 4, 16, 17, 40}) {
             cases.push_back({tokens, LinearPolicy::AllowA8, LinearPolicy::AllowA8, true});
         }
+        cases.push_back({16, LinearPolicy::AllowA8, LinearPolicy::AllowA8, false});
+        cases.push_back({16, LinearPolicy::A16Only, LinearPolicy::AllowA8, true});
         failures += run_profile(profile, cases, 925U);
     }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " rmsnorm_swiglu_ffn\n";

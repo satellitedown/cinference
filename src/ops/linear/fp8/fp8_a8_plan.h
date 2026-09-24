@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: declare the fused RMSNorm E4M3 activation producer.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "core/weight.h"
@@ -48,6 +51,15 @@ inline std::size_t fp8_a8_workspace_capacity_bytes(std::int32_t tokens, std::int
 
 void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspace workspace,
                             cudaStream_t stream);
+
+// Row width of fp8_rmsnorm_quantize_launch.
+inline constexpr std::int32_t kFp8RmsNormQuantizeWidth = 5120;
+
+// rmsnorm(x, norm_weight, eps, unit_offset) followed by launch_fp8_a8_quantize of the result, in
+// one kernel: `out` receives the same codes and scales without the BF16 row being materialized.
+// x is contiguous 4-byte aligned BF16 [5120, T].
+void fp8_rmsnorm_quantize_launch(const Tensor& x, const Tensor& norm_weight, float eps,
+                                 bool unit_offset, Fp8A8Workspace out, cudaStream_t stream);
 
 
 } // namespace ninfer::ops::detail

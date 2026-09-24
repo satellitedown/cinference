@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: MTP-10 planning and diagnostics; fused dense FFN.
+// Modified by satellitedown for Cinference: MTP-10 planning, diagnostics; fused FFN, input norm.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/execution/attention.h"
@@ -320,8 +320,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 if (const auto* attention =
                         std::get_if<execution::AttentionParameters>(&block.mixer)) {
                     (void)workspace::text_attention_projection(layout, config, last);
-                    scratch(layout, execution::attention_projection_workspace_bytes(*attention,
-                                                                                    first, last));
+                    scratch(layout, execution::attention_norm_projection_workspace_bytes(
+                                        *attention, first, last));
                     (void)workspace::text_attention_results(layout, config, last);
                     scratch(layout,
                             ops::causal_softmax_attention_workspace_capacity_bytes(

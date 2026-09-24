@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: route verify-width tokens to the small-token A8 schedule.
+// Modified by satellitedown for Cinference: small-token A8 schedule; pre-quantized input launch.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -57,6 +57,13 @@ void run(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream) {
     launch_fp8_a8_quantize(x, weight, workspace, stream);
+    fp8_attn_input_a8_quantized_launch(weight, q, gate, k, v, workspace, x.ne[1], stream);
+}
+
+void fp8_attn_input_a8_quantized_launch(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k,
+                                        Tensor& v, Fp8A8Workspace input, std::int32_t tokens,
+                                        cudaStream_t stream) {
+    const Fp8A8Workspace workspace = input;
     // This Op owns its tile choices; the generic Linear schedules do not describe four-output
     // projection's short-column cost. All variants share the same activation representation.
     using Small32   = Fp8MmaSchedule<32, 64, 128, 1, 2, 3, 2, Cache::cg, Cache::cg,
@@ -71,19 +78,19 @@ void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, 
                                      Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
     using Prefill   = Fp8MmaSchedule<64, 128, 128, 2, 4, 2, 2, Cache::cg, Cache::cg,
                                      Fp8MmaFragmentPipeline::PingPong, Fp8MmaRaster::TokenFast>;
-    if (x.ne[1] <= kFp8A8SmallTokenLimit)
-        run<Fp8A8SmallTokenSchedule>(weight, q, gate, k, v, workspace, x.ne[1], stream);
-    else if (x.ne[1] <= 32)
-        run<Small32>(weight, q, gate, k, v, workspace, x.ne[1], stream);
-    else if (x.ne[1] <= 64)
-        run<Small64>(weight, q, gate, k, v, workspace, x.ne[1], stream);
-    else if (x.ne[1] <= 96)
-        run<ShortTail>(weight, q, gate, k, v, workspace, x.ne[1], stream);
-    else if (x.ne[1] <= 128)
-        run<Wide128>(weight, q, gate, k, v, workspace, x.ne[1], stream);
-    else if (x.ne[1] <= 144)
-        run<Tail144>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+    if (tokens <= kFp8A8SmallTokenLimit)
+        run<Fp8A8SmallTokenSchedule>(weight, q, gate, k, v, workspace, tokens, stream);
+    else if (tokens <= 32)
+        run<Small32>(weight, q, gate, k, v, workspace, tokens, stream);
+    else if (tokens <= 64)
+        run<Small64>(weight, q, gate, k, v, workspace, tokens, stream);
+    else if (tokens <= 96)
+        run<ShortTail>(weight, q, gate, k, v, workspace, tokens, stream);
+    else if (tokens <= 128)
+        run<Wide128>(weight, q, gate, k, v, workspace, tokens, stream);
+    else if (tokens <= 144)
+        run<Tail144>(weight, q, gate, k, v, workspace, tokens, stream);
     else
-        run<Prefill>(weight, q, gate, k, v, workspace, x.ne[1], stream);
+        run<Prefill>(weight, q, gate, k, v, workspace, tokens, stream);
 }
 } // namespace ninfer::ops::detail

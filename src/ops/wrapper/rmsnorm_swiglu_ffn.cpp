@@ -4,9 +4,11 @@
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/rmsnorm.h"
+#include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_plan.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
+#include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/rmsnorm_swiglu_ffn/nvfp4_rmsnorm_quantize.h"
 
@@ -44,6 +46,40 @@ bool quantized_route(const FfnProfile& profile, std::int32_t tokens) {
            detail::nvfp4_linear_swiglu_quantizes_activation(profile.gate_up_policy, tokens) &&
            detail::nvfp4_linear_add_takes_quantized(profile.down.n, profile.down.k,
                                                     profile.down_policy, tokens);
+}
+
+// The FP8 SwiGLU quantizes its input to E4M3 rows at this width, so the norm writes those codes
+// directly; the SwiGLU activation and the down projection stay as in the composition.
+bool fp8_quantized_route(const FfnProfile& profile, std::int32_t tokens) {
+    return profile.gate_up.qtype == QType::FP8_E4M3FN_ROW_BF16 &&
+           profile.gate_up.k == detail::kFp8RmsNormQuantizeWidth &&
+           detail::fp8_linear_swiglu_uses_a8(profile.gate_up_policy, tokens);
+}
+
+struct Fp8QuantizedWorkspace {
+    detail::Fp8A8Workspace hidden;
+    Tensor activation;
+};
+
+template <class Allocator>
+Fp8QuantizedWorkspace allocate_fp8_quantized(Allocator& allocator, const FfnProfile& profile,
+                                             std::int32_t tokens) {
+    Fp8QuantizedWorkspace out;
+    out.hidden     = detail::allocate_fp8_a8_workspace(allocator, tokens, profile.gate_up.k);
+    out.activation = allocator.alloc(DType::BF16, {profile.down.k, tokens}, 256);
+    return out;
+}
+
+std::size_t fp8_quantized_bytes(const FfnProfile& profile, std::int32_t tokens) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_fp8_quantized(layout, profile, tokens);
+    {
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(
+            linear_add_workspace_capacity_bytes(profile.down.qtype, profile.down.n, profile.down.k,
+                                                profile.down_policy, tokens, tokens));
+    }
+    return layout.peak_bytes(1);
 }
 
 struct QuantizedWorkspace {
@@ -107,23 +143,35 @@ std::size_t rmsnorm_swiglu_ffn_workspace_capacity_bytes(
     }
     const FfnProfile profile{gate_up_weight, gate_up_policy, down_weight, down_policy};
     validate_profile(profile);
-    // The quantized route covers one contiguous run of short widths; the rest compose.
-    std::int32_t first_quantized = 0;
-    std::int32_t last_quantized  = -1;
-    for (std::int32_t tokens = min_tokens;
-         tokens <= std::min(max_tokens, detail::kNvfp4LinearSwiGluQuantizedMaxTokens); ++tokens) {
-        if (quantized_route(profile, tokens)) {
-            if (first_quantized == 0) { first_quantized = tokens; }
-            last_quantized = tokens;
+    // Each width takes one route: the NVFP4 quantized route covers one contiguous run of short
+    // widths, the FP8 one a run whose peak grows with the width, and every remaining run of widths
+    // composes over its own interval.
+    std::size_t maximum             = 0;
+    std::int32_t composed_first     = 0;
+    std::int32_t composed_last      = 0;
+    std::int32_t last_fp8_quantized = 0;
+    const auto close_composed_run   = [&] {
+        if (composed_first != 0) {
+            maximum = std::max(maximum, composed_bytes(profile, composed_first, composed_last));
+            composed_first = 0;
+        }
+    };
+    for (std::int32_t tokens = min_tokens; tokens <= max_tokens; ++tokens) {
+        if (tokens <= detail::kNvfp4LinearSwiGluQuantizedMaxTokens &&
+            quantized_route(profile, tokens)) {
+            close_composed_run();
+            maximum = std::max(maximum, quantized_bytes(profile, tokens));
+        } else if (fp8_quantized_route(profile, tokens)) {
+            close_composed_run();
+            last_fp8_quantized = tokens;
+        } else {
+            if (composed_first == 0) { composed_first = tokens; }
+            composed_last = tokens;
         }
     }
-    if (first_quantized == 0) { return composed_bytes(profile, min_tokens, max_tokens); }
-    std::size_t maximum = quantized_bytes(profile, last_quantized);
-    if (min_tokens < first_quantized) {
-        maximum = std::max(maximum, composed_bytes(profile, min_tokens, first_quantized - 1));
-    }
-    if (max_tokens > last_quantized) {
-        maximum = std::max(maximum, composed_bytes(profile, last_quantized + 1, max_tokens));
+    close_composed_run();
+    if (last_fp8_quantized != 0) {
+        maximum = std::max(maximum, fp8_quantized_bytes(profile, last_fp8_quantized));
     }
     return maximum;
 }
@@ -159,6 +207,15 @@ void rmsnorm_swiglu_ffn(Tensor& residual, const Tensor& norm_weight, float eps, 
                                                           down_weight.input_scale_divisor, stream);
         detail::nvfp4_linear_add_w4a4_quantized_launch(down_weight, residual, scratch.activation,
                                                        tokens, stream);
+        return;
+    }
+    if (fp8_quantized_route(profile, tokens)) {
+        Fp8QuantizedWorkspace scratch = allocate_fp8_quantized(workspace, profile, tokens);
+        detail::fp8_rmsnorm_quantize_launch(residual, norm_weight, eps, unit_offset, scratch.hidden,
+                                            stream);
+        detail::fp8_linear_swiglu_a8_quantized_launch(gate_up_weight, scratch.activation,
+                                                      scratch.hidden, tokens, stream);
+        linear_add(scratch.activation, down_weight, residual, down_policy, workspace, stream);
         return;
     }
     ComposedWorkspace scratch = allocate_composed(workspace, profile, tokens);

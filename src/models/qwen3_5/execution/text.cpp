@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: fused FFN and norm-RoPE blocks, GDN state prefetch.
+// Modified by satellitedown for Cinference: fused FFN, input-norm and norm-RoPE; GDN prefetch.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/program/internal.h"
@@ -850,7 +850,6 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
 
     const auto projection = workspace::text_attention_projection(work_, config_, T);
     Tensor h              = projection.hidden;
-    ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
 
     Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
                                               dimension(config_.attention->num_attention_heads), T});
@@ -864,7 +863,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
-    attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s);
+    attention_norm_projection(x, w.input_norm, config_.rms_norm_eps, p, h, q_flat, gate_flat,
+                              k_flat, v_flat, work_, s);
 
     const auto results = workspace::text_attention_results(work_, config_, T);
     Tensor qn =

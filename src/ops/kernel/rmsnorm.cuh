@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: wide-row output policy, pinned pair square sum.
+// Modified by satellitedown for Cinference: wide-row output policies, pinned pair square sums.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -165,7 +165,8 @@ struct RmsPairOutput {
 // Output receives every normalized pair; a policy other than the plain store sees pair
 // threadIdx.x + k * Block on every lane for each k, since a fixed width leaves no lane idle.
 // Output::kRowSlices CTAs may share a row: each forms the complete sum of squares (so all derive
-// the same factor) and hands over only its own contiguous run of k.
+// the same factor) and hands over only its own contiguous run of k. A policy with finish_row(row)
+// is called once more by every thread after its last pair of the row.
 template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread, bool Prefetch, int FixedD = 0,
           class Output = RmsPairOutput>
 __launch_bounds__(Block) __global__
@@ -203,8 +204,7 @@ __launch_bounds__(Block) __global__
                 weights[k] = weight[pair];
                 if constexpr (Epilogue == RmsEpilogue::Gated) { gates[k] = z[row_base + pair]; }
             }
-            const float2 xf = __bfloat1622float2(values[k]);
-            sum += xf.x * xf.x + xf.y * xf.y;
+            sum = __fadd_rn(sum, rmsnorm_pair_square_sum(__bfloat1622float2(values[k])));
         }
     }
 
@@ -237,6 +237,7 @@ __launch_bounds__(Block) __global__
                                             rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y)));
         }
     }
+    if constexpr (requires { out.finish_row(row); }) { out.finish_row(row); }
 }
 
 // Implements: include/ninfer/ops/rmsnorm.h

@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: route verify-width tokens to the small-token A8 schedule.
+// Modified by satellitedown for Cinference: small-token A8 schedule; pre-quantized input launch.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -67,10 +67,15 @@ void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& 
     const Fp8A8Workspace scratch =
         allocate_fp8_a8_workspace(workspace, x.ne[1], Geometry::kInputRows);
     launch_fp8_a8_quantize(x, weight, scratch, stream);
-    if (x.ne[1] <= kFp8A8SmallTokenLimit) {
-        run<Fp8A8SmallTokenSchedule>(weight, out, scratch, x.ne[1], stream);
+    fp8_linear_swiglu_a8_quantized_launch(weight, out, scratch, x.ne[1], stream);
+}
+
+void fp8_linear_swiglu_a8_quantized_launch(const Weight& weight, Tensor& out, Fp8A8Workspace input,
+                                           std::int32_t tokens, cudaStream_t stream) {
+    if (tokens <= kFp8A8SmallTokenLimit) {
+        run<Fp8A8SmallTokenSchedule>(weight, out, input, tokens, stream);
     } else {
-        run<Fp8A8DefaultSchedule>(weight, out, scratch, x.ne[1], stream);
+        run<Fp8A8DefaultSchedule>(weight, out, input, tokens, stream);
     }
 }
 
