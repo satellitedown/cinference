@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: exercise the next-layer state hint.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "ninfer/ops/gated_delta_net.h"
 #include "core/device.h"
 
@@ -150,7 +153,9 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     };
     const auto launch_record = [&] {
         ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, record_states,
-            valid, initial, key_record_tensor, value_record_tensor, gate_record_tensor, record_output, stream);
+                                           valid, initial, key_record_tensor, value_record_tensor,
+                                           gate_record_tensor, record_output, reference_states,
+                                           stream);
     };
     launch_reference();
     launch_record();

@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: pass no next-layer state hint.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 // ReplaySSM recurrent-Record and all-layer Fold benchmark.
 //
 // Each timed GPU body is exactly one public Op call. Row-control construction, buffer
@@ -397,7 +400,8 @@ public:
         Tensor gate_record(gate_record_.p, DType::FP32, {2, profile_.value_heads, width_, batch_});
         Tensor out(record_out_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
         ops::gated_delta_net_replay_record(q, k, v, g, beta, scale(), states, valid, initial,
-                                           key_record, value_record, gate_record, out, stream);
+                                           key_record, value_record, gate_record, out, Tensor{},
+                                           stream);
     }
 
 private:

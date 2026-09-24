@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: stage verify-width GDN records; share row reductions.
+// Modified by satellitedown for Cinference: staged verify-width GDN records, next-state prefetch.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -368,6 +368,8 @@ struct RecordAccess {
     std::int32_t width;
     std::int64_t state_slot_stride;
     float scale;
+    // Optional states laid out like `states` whose tiles are warmed into L2 (never read).
+    const float* next_states;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
@@ -819,6 +821,22 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
         }
     }
     __syncthreads();
+
+    // The recurrence below leaves DRAM idle, so the CTA requests the same tile of the next
+    // layer's state now; that layer's record then finds it in L2 instead of waiting on DRAM.
+    if (access.next_states != nullptr) {
+        constexpr int kLinesPerRow = kStateDim * static_cast<int>(sizeof(float)) / 128;
+        if (thread < kBlockDv * kLinesPerRow) {
+            const float* next_tile =
+                access.next_states +
+                static_cast<std::int64_t>(access.initial_slots[coord.batch]) *
+                    access.state_slot_stride +
+                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
+            prefetch_l2(next_tile +
+                        static_cast<std::int64_t>(tile_dv + thread / kLinesPerRow) * kStateDim +
+                        thread % kLinesPerRow * (128 / sizeof(float)));
+        }
+    }
 
     const int local_dv  = coord.warp * kDvPerWarp;
     const int owned_row = (coord.lane >> 3) & (kDvPerWarp - 1);

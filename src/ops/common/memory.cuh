@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: L2 fill policies, evict-last stores, line discards.
+// Modified by satellitedown for Cinference: L2 policies, evict-last stores, discards, prefetch.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -104,6 +104,11 @@ __device__ __forceinline__ void store_u64_evict_last(std::uint64_t* dst, std::ui
 // is dead: every later read of the line must follow a new write.
 __device__ __forceinline__ void discard_l2_line(const void* line) {
     asm volatile("discard.global.L2 [%0], 128;\n" ::"l"(line) : "memory");
+}
+
+// Requests the L2 line holding `address` without waiting for it or touching registers.
+__device__ __forceinline__ void prefetch_l2(const void* address) {
+    asm volatile("prefetch.global.L2 [%0];\n" ::"l"(address));
 }
 
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }

@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: pass no next-layer state hint.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -690,10 +693,10 @@ int run_record_fold_rounds() {
                                                   true, recurrent_states, source, destination,
                                                   out_step, nullptr);
             }
-            ops::gated_delta_net_replay_record(record_q_view, record_k_view, record_v_view, g, beta,
-                                               kScale, recurrent_states, valid, initial_selector,
-                                               layer_records.key, layer_records.value,
-                                               layer_records.gate, record_output, nullptr);
+            ops::gated_delta_net_replay_record(
+                record_q_view, record_k_view, record_v_view, g, beta, kScale, recurrent_states,
+                valid, initial_selector, layer_records.key, layer_records.value, layer_records.gate,
+                record_output, Tensor{}, nullptr);
             cuda_synchronize();
 
             const std::string label = "record-fold pair round=" + std::to_string(round) +

@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: let replay records warm the next layer's state.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "core/arena.h"
@@ -93,12 +96,16 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
  * pairwise non-overlapping. Valid outputs must be bit-identical to the normalized recurrent
  * execution from the same FP32 initial state and represented inputs; no independent FP64
  * comparison is needed to establish this record/snapshot equivalence.
+ *
+ * next_states is empty or shaped like ssm_states (typically the next layer's pool). Its tiles at
+ * initial_state_slots are only requested into L2, for a following record that reads them; it is
+ * never read into registers and does not affect any result.
  */
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream);
+                                   const Tensor& next_states, cudaStream_t stream);
 
 } // namespace ninfer::ops

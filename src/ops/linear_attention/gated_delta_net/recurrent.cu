@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: stage verify-width GDN record inputs once per CTA.
+// Modified by satellitedown for Cinference: staged GDN record inputs and next-state prefetch.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "ops/linear_attention/gated_delta_net/launch.h"
@@ -75,7 +75,7 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream) {
+                                   const Tensor& next_states, cudaStream_t stream) {
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
                     static_cast<unsigned>(kStateDim / kBlockDv));
@@ -99,6 +99,7 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         q.ne[2],
         state_slot_stride,
         scale,
+        static_cast<const float*>(next_states.data),
     };
     if (q.ne[2] <= kStagedRecordMaxWidth) {
         recurrent_record_staged_kernel<Masked><<<grid, block, 0, stream>>>(access);
@@ -182,15 +183,15 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& beta, float scale, const Tensor& ssm_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                             Tensor& out, cudaStream_t stream) {
+                             Tensor& out, const Tensor& next_states, cudaStream_t stream) {
     if (valid_columns.data == nullptr) {
         launch_recurrent_record_fixed<false>(q, k, v, g, beta, scale, ssm_states, valid_columns,
                                              initial_state_slots, key_record, value_record,
-                                             gate_record, out, stream);
+                                             gate_record, out, next_states, stream);
     } else {
         launch_recurrent_record_fixed<true>(q, k, v, g, beta, scale, ssm_states, valid_columns,
                                             initial_state_slots, key_record, value_record,
-                                            gate_record, out, stream);
+                                            gate_record, out, next_states, stream);
     }
 }
 

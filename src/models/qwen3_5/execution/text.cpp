@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: fused dense FFN and query/key norm-RoPE blocks.
+// Modified by satellitedown for Cinference: fused FFN and norm-RoPE blocks, GDN state prefetch.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/program/internal.h"
@@ -1027,12 +1027,17 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
+            // The next GDN layer's record reads the same slots of its own pool.
+            const auto next_layer    = static_cast<std::uint32_t>(gidx) + 1;
+            const Tensor next_states = next_layer < state_.layer_count()
+                                           ? state_.layer_view(next_layer).recurrent
+                                           : Tensor{};
             ops::gated_delta_net_replay_record(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
                 static_cast<float>(
                     1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
                 recurrent_states, valid, *active_linear_state_source_slots_, records.key,
-                records.value, records.gate, out_batch, s);
+                records.value, records.gate, out_batch, next_states, s);
         } else {
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
