@@ -2376,7 +2376,8 @@ int run_k8v4_cases() {
                             {1, 64, 65, 808u, false, true}, MappingPattern::Fragmented);
     // The 27B verify block is one 96-row pass with a double-buffered key loop. Cover odd and full
     // widths, split boundaries inside key tiles, and a context long enough for a split to span
-    // more than 64 pages under the one-wave split limit.
+    // more than 64 pages under the one-wave split limit. Width 15 keeps six row tiles (compute
+    // warps 4 and 5 run the PV tails of row tiles 0-3) with a partial last one.
     failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
                             {16, 4077, 4096, 816u}, MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
@@ -2385,6 +2386,8 @@ int run_k8v4_cases() {
                             MappingPattern::Identity);
     failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
                             {16, 180001, 180224, 820u}, MappingPattern::Fragmented);
+    failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
+                            {15, 9001, 9216, 821u}, MappingPattern::Fragmented);
     failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {5, 17, 22, 809u},
                             MappingPattern::Identity);
     failures += run_a1_case(kGeometries[1], KvCacheStorage::Fp8KeyNvfp4Value, {7, 17, 24, 810u},
