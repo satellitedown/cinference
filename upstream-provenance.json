@@ -35,7 +35,7 @@
     "summary": [
       "Raise the product MTP draft-token cap from five to ten and extend related round buffers, contracts, and coverage.",
       "Derive MTP CUDA Graph topology classes from captured node-type and kernel-function signatures while separating batch sizes.",
-      "Speed up fafstmobel DFlash2 verification: small-token FP8/NVFP4 projection schedules, a double-buffered K-split FP8 LinearAdd, staged GDN records with lane-shared row reductions, a warp-specialized wide K8V4 attention kernel with exact half-scale V widening, FP16-accumulated 32-key PV products and loader-assisted PV for Tensor Core balance, evict-first L2 fills for once-read verify weight streams, multi-tile Q4 proposal-head staging and preloaded GDN projected convolution.",
+      "Speed up fafstmobel DFlash2 verification: small-token FP8/NVFP4 projection schedules, a double-buffered K-split FP8 LinearAdd, staged GDN records with lane-shared row reductions, a warp-specialized wide K8V4 attention kernel with exact half-scale V widening, FP16-accumulated 32-key PV products and loader-assisted PV for Tensor Core balance, evict-first L2 fills for once-read verify weight streams, multi-tile Q4 proposal-head staging and preloaded GDN projected convolution, a bank-conflict-free Q4 proposal head with integer-free nibble widening, retuned small-token FP8 A8 tiles, a wider tiled argmax and a GDN record convolution fused into the FP8 A8 input projection epilogue.",
       "Preserve native binaries, API symbols, .ninfer format, and build organization."
     ]
   },
@@ -75,8 +75,13 @@
       "src/ops/attn_input_proj/fp8/fp8_attn_input_a8.cu",
       "src/ops/common/memory.cuh",
       "src/ops/common/mma.cuh",
+      "src/ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.cpp",
       "src/ops/gdn_input_proj/fp8/fp8_gdn_input_a8.cu",
+      "src/ops/gdn_input_proj/fp8/fp8_gdn_input_output.cuh",
+      "src/ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h",
+      "src/ops/gdn_input_proj/gdn_conv.cuh",
       "src/ops/gdn_input_proj/gdn_projected_conv.cu",
+      "src/ops/kernel/argmax.cuh",
       "src/ops/kernel/mtp_round.cuh",
       "src/ops/launcher/mtp_round.cu",
       "src/ops/linear/fp8/fp8_a16_ksplit_mma.cuh",

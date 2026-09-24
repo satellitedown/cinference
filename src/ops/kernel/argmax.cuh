@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: eight items per thread in the tiled argmax.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 // Implements: include/ninfer/ops/argmax.h
@@ -17,7 +20,7 @@ namespace ninfer::ops {
 // execution dispatches registered vocab profiles to a smaller block so the much
 // larger 2-D grid exposes enough resident CTAs without oversized reductions.
 inline constexpr int kArgmaxBlock          = 512;
-inline constexpr int kArgmaxItemsPerThread = 1;
+inline constexpr int kArgmaxItemsPerThread = 8;
 
 __device__ __forceinline__ bool argmax_better(float value, std::int32_t index, float best_value,
                                               std::int32_t best_index) {

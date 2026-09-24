@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: mark single-token-tile weight fills evict-first in L2.
+// Modified by satellitedown for Cinference: evict-first weight fills; tile-finishing outputs.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -36,6 +36,13 @@ struct Fp8MmaIdentityRows {
         return row_begin + local_row;
     }
 };
+
+// An output policy may also consume each complete staged tile after its vector stores. It names a
+// per-thread TileState that begin_tile loads before the main loop, so those loads overlap the
+// weight stream, and finish_tile receives it with the BF16 tile ([token][row], row stride
+// `stride`).
+template <class Output>
+concept Fp8MmaTileFinisher = requires { typename Output::TileState; };
 
 template <int BlockTokens, int BlockRows, int BlockK, int WarpsTokens, int WarpsRows, int Stages,
           int MinBlocksPerSm, Cache WeightCache, Cache ActivationCache,
@@ -200,6 +207,13 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
         stage_inputs(stage, stage);
         cp_commit();
     }
+    [[maybe_unused]] const auto tile_state = [&] {
+        if constexpr (Fp8MmaTileFinisher<Output>) {
+            return output.begin_tile(row_begin, token_begin, tokens);
+        } else {
+            return 0;
+        }
+    }();
 
     float accumulators[Schedule::kMmaTokens][Schedule::kMmaRows][4] = {};
     const int a_matrix                                              = lane >> 3;
@@ -376,6 +390,10 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                 output.store_vector(row_begin + row_vector * 8, token, values);
             }
         }
+    }
+    if constexpr (Fp8MmaTileFinisher<Output>) {
+        output.finish_tile(tile_state, shared_output, output_stride, row_begin, token_begin,
+                           tokens);
     }
 }
 

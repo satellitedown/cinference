@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: add the small-token A8 MMA schedule.
+// Modified by satellitedown for Cinference: add and retune the small-token A8 MMA schedule.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -10,10 +10,11 @@ using Fp8A8DefaultSchedule =
                    Fp8MmaRaster::TokenFast>;
 
 // Speculative verify widths (T<=16) are weight-bandwidth bound. A 16-token tile removes the idle
-// token half of the default tile, and 64-row tiles with four stages keep enough weight bytes in
-// flight for the small-N projections to stream near the device read bandwidth.
+// token half of the default tile. 32-row tiles double the CTA count, so four resident CTAs per SM
+// each keep a 256-wide K tile in flight behind the one they multiply. Every output keeps the same
+// k32 MMA sequence under any row or K tiling.
 inline constexpr int kFp8A8SmallTokenLimit = 16;
 using Fp8A8SmallTokenSchedule =
-    Fp8MmaSchedule<16, 64, 128, 1, 4, 4, 2, Cache::cg, Cache::cg, Fp8MmaFragmentPipeline::PingPong,
+    Fp8MmaSchedule<16, 32, 256, 1, 4, 2, 4, Cache::cg, Cache::cg, Fp8MmaFragmentPipeline::PingPong,
                    Fp8MmaRaster::TokenFast>;
 } // namespace ninfer::ops::detail

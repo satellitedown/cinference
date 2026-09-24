@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: fuse the width-16 A8 record convolution.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 
@@ -186,6 +189,14 @@ void launch_record_plan(const Tensor& x, const Weight& weight, const Tensor& con
     Tensor x_flat(x.data, DType::BF16, {Fp8N16384K5120::kInputRows, aggregate_columns});
     Tensor record_flat(conv_record.data, DType::BF16, {kChannels, aggregate_columns});
     Tensor z_flat(z.data, DType::BF16, {kZRows, aggregate_columns});
+    if (plan.schedule == Fp8GdnConvScheduleId::MaterializedA8 && batch == 1 &&
+        width == kFp8GdnRecordConvWidth) {
+        const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(workspace, width, weight.k);
+        fp8_gdn_record_conv_a8_launch(x_flat, weight, conv_weight, conv_states, valid_columns,
+                                      initial_slot, record_flat, query, key, value, z_flat, scratch,
+                                      stream);
+        return;
+    }
     launch_projection(x_flat, weight, record_flat, z_flat, plan.schedule, workspace, stream);
     gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states, valid_columns,
                                      initial_slot, query, key, value, stream);

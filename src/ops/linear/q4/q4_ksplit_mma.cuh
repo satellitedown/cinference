@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: share staged activations across multiple 16-row weight tiles per CTA.
+// Modified by satellitedown for Cinference: multi-tile staging; rotated codes; magic widening.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -51,12 +51,23 @@ union Q4KSplitBf16PairBits {
     unsigned bits;
 };
 
+// Rebiases each signed nibble n into the mantissa of 128 (the BF16 ulp there is 1), so the pair
+// holds 128 + (n ^ 8) exactly and one subtraction of 136 leaves the exact integer n in [-8, 7].
 __device__ __forceinline__ unsigned q4_ksplit_bf16_pair(std::uint8_t packed) {
-    const int q0 = (static_cast<int>(packed & 0x0fu) ^ 0x08) - 0x08;
-    const int q1 = (static_cast<int>(packed >> 4) ^ 0x08) - 0x08;
+    const unsigned value = packed;
+    Q4KSplitBf16PairBits biased;
+    biased.bits = ((value & 0x0fu) | ((value & 0xf0u) << 12)) ^ 0x43084308u;
+    Q4KSplitBf16PairBits bias;
+    bias.bits = 0x43084308u;
     Q4KSplitBf16PairBits result;
-    result.pair = __floats2bfloat162_rn(static_cast<float>(q0), static_cast<float>(q1));
+    result.pair = __hsub2_rn(biased.pair, bias.pair);
     return result.bits;
+}
+
+// Rows sit 256 bytes apart, so the eight rows a warp reads at one K offset share a bank unless the
+// 16-byte chunks of row r are rotated by r & 7.
+__device__ __forceinline__ int q4_ksplit_code_offset(int row, int byte) {
+    return (((byte >> 4) ^ (row & 7)) << 4) | (byte & 15);
 }
 
 // A CTA owns RowTiles 16-row weight tiles and splits K across eight warps. The staged activation
@@ -142,7 +153,7 @@ __launch_bounds__(256, RowTiles == 1 ? 6 : 2) __global__
             const int tile       = row / kTileRows;
             const int weight_row = row_policy.weight_row(output_row0(tile), row - tile * kTileRows);
             cp_async<16, Schedule::kCodeCache>(
-                &code_shared[row][chunk * 16],
+                &code_shared[row][q4_ksplit_code_offset(row, chunk * 16)],
                 codes + static_cast<std::int64_t>(weight_row) * kCodeRowBytes + group_k0 / 2 +
                     chunk * 16);
         }
@@ -186,10 +197,12 @@ __launch_bounds__(256, RowTiles == 1 ? 6 : 2) __global__
 #pragma unroll
             for (int tile = 0; tile < RowTiles; ++tile) {
                 const int r0       = tile * kTileRows + gid;
-                const unsigned af0 = q4_ksplit_bf16_pair(code_shared[r0][byte_col]);
-                const unsigned af1 = q4_ksplit_bf16_pair(code_shared[r0 + 8][byte_col]);
-                const unsigned af2 = q4_ksplit_bf16_pair(code_shared[r0][byte_col + 4]);
-                const unsigned af3 = q4_ksplit_bf16_pair(code_shared[r0 + 8][byte_col + 4]);
+                // Rows r0 and r0 + 8 share the rotation, and byte_col + 4 stays in its chunk.
+                const int offset   = q4_ksplit_code_offset(gid, byte_col);
+                const unsigned af0 = q4_ksplit_bf16_pair(code_shared[r0][offset]);
+                const unsigned af1 = q4_ksplit_bf16_pair(code_shared[r0 + 8][offset]);
+                const unsigned af2 = q4_ksplit_bf16_pair(code_shared[r0][offset + 4]);
+                const unsigned af3 = q4_ksplit_bf16_pair(code_shared[r0 + 8][offset + 4]);
 #pragma unroll
                 for (int nt = 0; nt < kNt; ++nt) {
                     mma_bf16(group_acc[tile][nt][0], group_acc[tile][nt][1], group_acc[tile][nt][2],

@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: declare the record-route convolution launcher.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "core/weight.h"
@@ -25,6 +28,16 @@ void fp8_gdn_input_matrix_launch(const Tensor& x, const Weight& weight, Tensor& 
 
 void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                              Fp8A8Workspace workspace, cudaStream_t stream);
+
+// The A8 record route of a single width-16 block convolves each channel inside the projection's
+// epilogue: the projection still lands in conv_record, and query/key/value are complete on return.
+inline constexpr std::int32_t kFp8GdnRecordConvWidth = 16;
+
+void fp8_gdn_record_conv_a8_launch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+                                   const Tensor& conv_states, const Tensor& valid_columns,
+                                   const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
+                                   Tensor& key, Tensor& value, Tensor& z, Fp8A8Workspace workspace,
+                                   cudaStream_t stream);
 
 // Exact contraction mechanisms shared by G1/G2/G3. Semantic Ops own their route frontier and
 // call one of these launchers after resolving their complete-form plan.

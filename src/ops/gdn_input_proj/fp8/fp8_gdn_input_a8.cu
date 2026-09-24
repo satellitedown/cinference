@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: route verify-width tokens to the small-token A8 schedule.
+// Modified by satellitedown for Cinference: small-token A8 schedule; record-route convolution.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -13,26 +13,25 @@
 #include <cuda_bf16.h>
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
 
 using Geometry = Fp8N16384K5120;
 
-template <class Schedule, bool FullTokens>
-void launch_mma(const Weight& weight, Tensor& qkv, Tensor& z, Fp8A8Workspace workspace,
+template <class Schedule, bool FullTokens, class Output>
+void launch_mma(const Weight& weight, const Output& output, Fp8A8Workspace workspace,
                 std::int32_t tokens, cudaStream_t stream) {
     static_assert((Fp8GdnInputOutput::kQkvRows % Schedule::kBlockRows) == 0);
     static_assert((Fp8GdnInputOutput::kZRows % Schedule::kBlockRows) == 0);
     constexpr int kRowTiles = Geometry::kOutputRows / Schedule::kBlockRows;
     const int token_tiles   = (tokens + Schedule::kBlockTokens - 1) / Schedule::kBlockTokens;
     const int blocks        = kRowTiles * token_tiles;
-    const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
-                                   static_cast<__nv_bfloat16*>(z.data)};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
         static const cudaError_t attribute = cudaFuncSetAttribute(
-            fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue, Fp8GdnInputOutput>,
+            fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue, Output>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
         CUDA_CHECK(attribute);
     }
@@ -47,10 +46,12 @@ void launch_mma(const Weight& weight, Tensor& qkv, Tensor& z, Fp8A8Workspace wor
 template <class Schedule>
 void run(const Weight& weight, Tensor& qkv, Tensor& z, Fp8A8Workspace workspace,
          std::int32_t tokens, cudaStream_t stream) {
+    const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
+                                   static_cast<__nv_bfloat16*>(z.data)};
     if ((tokens % Schedule::kBlockTokens) == 0) {
-        launch_mma<Schedule, true>(weight, qkv, z, workspace, tokens, stream);
+        launch_mma<Schedule, true>(weight, output, workspace, tokens, stream);
     } else {
-        launch_mma<Schedule, false>(weight, qkv, z, workspace, tokens, stream);
+        launch_mma<Schedule, false>(weight, output, workspace, tokens, stream);
     }
 }
 
@@ -64,6 +65,42 @@ void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
     } else {
         run<Fp8A8DefaultSchedule>(weight, qkv, z, workspace, x.ne[1], stream);
     }
+}
+
+void fp8_gdn_record_conv_a8_launch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
+                                   const Tensor& conv_states, const Tensor& valid_columns,
+                                   const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
+                                   Tensor& key, Tensor& value, Tensor& z, Fp8A8Workspace workspace,
+                                   cudaStream_t stream) {
+    using Schedule = Fp8A8SmallTokenSchedule;
+    using Output   = Fp8GdnRecordConvOutput<Schedule::kBlockRows, Schedule::kThreads>;
+    static_assert(Schedule::kBlockTokens == Output::kWidth);
+    if (x.ne[1] != kFp8GdnRecordConvWidth) {
+        throw std::invalid_argument("fp8 GDN record convolution: unsupported block width");
+    }
+    launch_fp8_a8_quantize(x, weight, workspace, stream);
+    const Output output{
+        {static_cast<__nv_bfloat16*>(conv_record.data), static_cast<__nv_bfloat16*>(z.data)},
+        {
+            static_cast<const __nv_bfloat16*>(conv_weight.data),
+            static_cast<const __nv_bfloat16*>(conv_states.data),
+            static_cast<const std::int32_t*>(initial_slot.data),
+            valid_columns.data == nullptr ? nullptr
+                                          : static_cast<const std::int32_t*>(valid_columns.data),
+            static_cast<__nv_bfloat16*>(query.data),
+            static_cast<__nv_bfloat16*>(key.data),
+            static_cast<__nv_bfloat16*>(value.data),
+            Fp8GdnInputOutput::kQkvRows,
+            Fp8GdnInputOutput::kQueryRows,
+            Fp8GdnInputOutput::kKeyRows,
+            Fp8GdnInputOutput::kValueRows,
+            0,
+            Output::kWidth,
+            0,
+            NoHistoryPublish{},
+        },
+    };
+    launch_mma<Schedule, true>(weight, output, workspace, x.ne[1], stream);
 }
 
 } // namespace ninfer::ops::detail
