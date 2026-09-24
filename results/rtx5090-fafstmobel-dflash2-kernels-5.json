@@ -1,0 +1,94 @@
+{
+  "scope": "Engine-level DFlash2 decode and prompt-prefill speedup for fafstmobel on one RTX 5090 (32 GB), fifth kernel pass. Round time is the controlled decode metric; tokens/s also depends on draft acceptance. The second- through fifth-pass changes are bit-exact, so 4994a0c and the new revision accept identical drafts; b4e8ed4 accepts slightly different drafts because the first pass changed attention numerics.",
+  "hardware": "NVIDIA GeForce RTX 5090 32 GB; desktop GPU workloads active during measurement; the board runs at its 575 W power limit",
+  "model": "fafstmobel NInfer v3 artifact; DFlash2 with 15 draft tokens; optimized proposal head (--lm-head-draft); K8V4 KV cache; 1024-token prefill chunks",
+  "revisions": {
+    "baseline": "b4e8ed40458fce5b1b6374131783aca6123f9a22",
+    "fourth_pass": "4994a0c",
+    "fifth_pass": "2d77e27 (decode: dd69e4c, 410d10e, 37814b1, e1f1d19, e165ffb: grouped GDN norm-gating CTAs, next-layer GDN state warmed in L2 during replay records, RMSNorm fused with the E4M3 quantization of the attention and FP8 FFN inputs, wide K8V4 verify blocks whose idle compute warps take part of the other rows' PV products; prefill: 42e4b36, 2d77e27: pipelined K8V4 prompt attention with alternating score warp groups)"
+  },
+  "product_benchmark": {
+    "tool": "ninfer_bench --spec dflash2 --draft-tokens 15 --lm-head-draft --kv-dtype k8v4 --warmup 1 -r 2; greedy; 256 generated tokens",
+    "protocol": "the three binaries alternate for four runs (8K, 32K) or three runs (131K); median of runs",
+    "points": [
+      {
+        "prompt_tokens": 8192,
+        "ms_per_round": {
+          "baseline": 20.74,
+          "fourth_pass": 17.34,
+          "fifth_pass": 17.129
+        },
+        "tokens_per_second": {
+          "baseline": 363.0,
+          "fourth_pass": 434.2,
+          "fifth_pass": 439.6
+        },
+        "tokens_per_round": {
+          "baseline": 7.53,
+          "fourth_pass": 7.53,
+          "fifth_pass": 7.53
+        },
+        "prefill_tokens_per_second": {
+          "baseline": 9226.0,
+          "fourth_pass": 9228.0,
+          "fifth_pass": 9416.0
+        },
+        "round_time_change_percent_vs_baseline": -17.4,
+        "round_time_change_percent_vs_fourth_pass": -1.2,
+        "prefill_change_percent_vs_fourth_pass": 2.0
+      },
+      {
+        "prompt_tokens": 32768,
+        "ms_per_round": {
+          "baseline": 22.267,
+          "fourth_pass": 17.962,
+          "fifth_pass": 17.695
+        },
+        "tokens_per_second": {
+          "baseline": 410.6,
+          "fourth_pass": 527.9,
+          "fifth_pass": 535.8
+        },
+        "tokens_per_round": {
+          "baseline": 9.14,
+          "fourth_pass": 9.48,
+          "fifth_pass": 9.48
+        },
+        "prefill_tokens_per_second": {
+          "baseline": 7099.0,
+          "fourth_pass": 7096.0,
+          "fifth_pass": 7629.0
+        },
+        "round_time_change_percent_vs_baseline": -20.5,
+        "round_time_change_percent_vs_fourth_pass": -1.5,
+        "prefill_change_percent_vs_fourth_pass": 7.5
+      },
+      {
+        "prompt_tokens": 131072,
+        "ms_per_round": {
+          "baseline": 26.34,
+          "fourth_pass": 20.018,
+          "fifth_pass": 19.215
+        },
+        "tokens_per_second": {
+          "baseline": 388.8,
+          "fourth_pass": 511.6,
+          "fifth_pass": 533.0
+        },
+        "tokens_per_round": {
+          "baseline": 10.24,
+          "fourth_pass": 10.24,
+          "fifth_pass": 10.24
+        },
+        "prefill_tokens_per_second": {
+          "baseline": 3755.0,
+          "fourth_pass": 3827.0,
+          "fifth_pass": 4575.0
+        },
+        "round_time_change_percent_vs_baseline": -27.1,
+        "round_time_change_percent_vs_fourth_pass": -4.0,
+        "prefill_change_percent_vs_fourth_pass": 19.5
+      }
+    ]
+  }
+}

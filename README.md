@@ -11,7 +11,8 @@ Built from [NInfer](https://github.com/Neroued/ninfer), with source-level change
 - **MTP-10 decoding:** raised the draft window from 5 to 10 tokens. Longer proposals let the engine emit more tokens per verification round when the drafts are accepted.
 - **Capture-based CUDA Graph reuse:** reworked MTP graph matching to use the captured node types and kernel functions. Profiles with matching signatures and batch sizes share an executable, rather than relying only on planned context ranges.
 - **Expanded CPU/GPU round handling:** enlarged draft and token-position buffers and updated native validation for the longer windows. This carries MTP-10 through the decoding path, not just the command-line options.
-- **Faster DFlash2 verification:** rewrote the verify-width kernels behind fafstmobel's DFlash2-15 rounds: small-token FP8/NVFP4 projection schedules, a double-buffered K-split FP8 LinearAdd, staged GDN replay records with lane-shared reductions, a warp-specialized K8V4 attention kernel that accumulates PV products in FP16 from exactly widened V and balances them across SM sub-partitions, evict-first L2 fills for once-read verify weights, wider bank-conflict-free proposal-head tiles, a GDN record convolution fused into its input projection, a fused RMSNorm-SwiGLU FFN that hands both NVFP4 projections pre-quantized inputs, a fused query/key RMSNorm-RoPE, a K8V4 verify query prepared once per block, mask-free softmax for unmasked key tiles, L2 discards of consumed attention partials, and warp-merged proposal top-k groups. Each kernel is qualified against the existing independent oracles; greedy speculative output still matches plain target decoding.
+- **Faster DFlash2 verification:** rewrote the verify-width kernels behind fafstmobel's DFlash2-15 rounds: small-token FP8/NVFP4 projection schedules, a double-buffered K-split FP8 LinearAdd, staged GDN replay records with lane-shared reductions, a warp-specialized K8V4 attention kernel that accumulates PV products in FP16 from exactly widened V and balances them across SM sub-partitions, evict-first L2 fills for once-read verify weights, wider bank-conflict-free proposal-head tiles, a GDN record convolution fused into its input projection, a fused RMSNorm-SwiGLU FFN that hands both NVFP4 projections pre-quantized inputs, a fused query/key RMSNorm-RoPE, a K8V4 verify query prepared once per block, mask-free softmax for unmasked key tiles, L2 discards of consumed attention partials, warp-merged proposal top-k groups, GDN norm-gating blocks that share inputs across heads and token tiles, next-layer GDN state warmed in L2 during replay records, RMSNorm fused with the E4M3 quantization of the attention and FP8 FFN inputs, and verify attention blocks whose otherwise idle compute warps take part of the other rows' PV products. Each kernel is qualified against the existing independent oracles; greedy speculative output still matches plain target decoding.
+- **Faster long-prompt prefill:** a pipelined K8V4 prompt attention kernel. Two groups of score warps take turns on the key tiles, running QK and the online softmax, while PV warps multiply the previous tile and widen the next one's V. Its outputs are bit-identical to the kernel it replaces.
 - **Ready-to-run fafstmobel setup:** a Swift-based Qwen3.8-27B derivative with Huihui's abliteration delta and NVFP4/FP8 text weights. One ~23.7 GB NInfer v3 file bundles text, vision, MTP, and the pretrained DFlash2 draft; no local conversion or separate draft download is needed. The recommended installer uses the engine's existing DFlash2 support, not MTP-10.
 
 ## Run
@@ -44,17 +45,25 @@ The [fafstmobel model card](https://huggingface.co/satellitedown/fafstmobel#meas
 
 ### DFlash2 verification speedup
 
-fafstmobel with DFlash2-15, before (`b4e8ed4`) and after the kernel changes above (`4994a0c`):
+fafstmobel with DFlash2-15, before (`b4e8ed4`) and after the kernel changes above (`2d77e27`):
 
 | Prompt tokens | Round time before → after | Tokens/s before → after |
 |---:|---:|---:|
-| 8,192 | 20.73 → 17.29 ms (−16.6%) | 363.3 → **435.4** (+19.8%) |
-| 32,768 | 22.19 → 17.93 ms (−19.2%) | 412.1 → **528.7** (+28.3%)¹ |
-| 131,072 | 26.34 → 20.38 ms (−22.6%) | 388.8 → **502.3** (+29.2%) |
+| 8,192 | 20.74 → 17.13 ms (−17.4%) | 363.0 → **439.6** (+21.1%) |
+| 32,768 | 22.27 → 17.70 ms (−20.5%) | 410.6 → **535.8** (+30.5%)¹ |
+| 131,072 | 26.34 → 19.22 ms (−27.1%) | 388.8 → **533.0** (+37.1%) |
 
-`ninfer_bench`, greedy, 256 generated tokens, optimized proposal head, K8V4, alternating builds on one RTX 5090 with desktop GPU workloads running. The board ran at its 575 W power limit throughout, which put every build's round time about 8.5% above the [previous record](results/rtx5090-fafstmobel-dflash2-kernels-3.json); compare within one table. At 8K and 131K both builds emitted the same tokens per round, so the tokens/s gain is engine speed alone. ¹ At 32K the optimized build also accepted more drafts (9.14 → 9.48 tokens/round); engine speed alone accounts for about +24%. [Measurements](results/rtx5090-fafstmobel-dflash2-kernels-4.json).
+`ninfer_bench`, greedy, 256 generated tokens, optimized proposal head, K8V4, 1024-token prefill chunks, alternating builds on one RTX 5090 with desktop GPU workloads running and the board at its 575 W power limit; compare within one table. At 8K and 131K both builds emitted the same tokens per round, so the tokens/s gain is engine speed alone. ¹ At 32K the optimized build also accepted more drafts (9.14 → 9.48 tokens/round); engine speed alone accounts for about +26%. [Measurements](results/rtx5090-fafstmobel-dflash2-kernels-5.json).
 
-The second through fourth kernel passes are bit-exact. Against the previous release (`f6a654c`), the second pass (`6b1c3fa`) accepts the same drafts and shortens rounds by 2.8% at 8K, 3.7% at 32K and 3.0% at 131K ([measurements](results/rtx5090-fafstmobel-dflash2-kernels-2.json)). The third pass (`0ddb836`, `b2215c4`) shortens them by a further 2.3% at 8K, 2.2% at 32K and 2.1% at 131K, and the fourth (`3dc5297` through `4994a0c`) by another 1.5%, 1.7% and 2.4%.
+The second through fifth kernel passes are bit-exact. Against the previous release (`f6a654c`), the second pass (`6b1c3fa`) accepts the same drafts and shortens rounds by 2.8% at 8K, 3.7% at 32K and 3.0% at 131K ([measurements](results/rtx5090-fafstmobel-dflash2-kernels-2.json)). The third pass (`0ddb836`, `b2215c4`) shortens them by a further 2.3% at 8K, 2.2% at 32K and 2.1% at 131K, the fourth (`3dc5297` through `4994a0c`) by another 1.5%, 1.7% and 2.4% ([measurements](results/rtx5090-fafstmobel-dflash2-kernels-4.json)), and the fifth (`dd69e4c` through `e165ffb`) by another 1.2%, 1.5% and 4.0%.
+
+The fifth pass also pipelines K8V4 prompt attention (`42e4b36`, `2d77e27`), whose share of prefill grows with prompt length:
+
+| Prompt tokens | Prefill tokens/s, fourth pass → fifth pass |
+|---:|---:|
+| 8,192 | 9,228 → 9,416 (+2.0%) |
+| 32,768 | 7,096 → 7,629 (+7.5%) |
+| 131,072 | 3,827 → **4,575** (+19.5%) |
 
 A serving sweep of the first kernel pass on a synthetic Python coding prompt (512 output tokens, 1K–190K context) measured 10–21% shorter rounds. Its single-sample tokens/s varied more because greedy trajectories, and therefore acceptance, differ between builds. [Measurements](results/rtx5090-fafstmobel-dflash2-kernels.json).
 

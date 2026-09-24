@@ -155,6 +155,7 @@
       "results/rtx5090-fafstmobel-dflash2-kernels-2.json",
       "results/rtx5090-fafstmobel-dflash2-kernels-3.json",
       "results/rtx5090-fafstmobel-dflash2-kernels-4.json",
+      "results/rtx5090-fafstmobel-dflash2-kernels-5.json",
       "results/rtx5090-fafstmobel-dflash2-kernels.json",
       "src/ops/linear/fp8/fp8_a8_quantize.cuh",
       "src/ops/linear/fp8/fp8_rmsnorm_quantize.cu",
