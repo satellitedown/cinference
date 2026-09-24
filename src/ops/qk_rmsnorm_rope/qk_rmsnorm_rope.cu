@@ -48,8 +48,7 @@ __global__ __launch_bounds__(kRowsPerCta * 32) void qk_rmsnorm_rope_kernel(
         const int pair  = lane + step * kWarpSize;
         values[step]    = x[pair];
         weights[step]   = weight[pair];
-        const float2 xf = __bfloat1622float2(values[step]);
-        sum += xf.x * xf.x + xf.y * xf.y;
+        sum             = __fadd_rn(sum, rmsnorm_pair_square_sum(__bfloat1622float2(values[step])));
     }
     sum       = warp_reduce_sum(sum);
     float inv = lane == 0 ? rsqrtf(sum / static_cast<float>(kHeadDim) + eps) : 0.0f;

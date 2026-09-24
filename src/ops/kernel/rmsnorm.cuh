@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: let the wide-row kernel hand pairs to an output policy.
+// Modified by satellitedown for Cinference: wide-row output policy, pinned pair square sum.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -20,6 +20,13 @@ enum class RmsEpilogue {
     Plain,
     Gated,
 };
+
+// One BF16 pair's contribution to a row's sum of squares, with the FMA contraction pinned so
+// every kernel that normalizes such rows agrees bit for bit: the low element's square is fused,
+// the high element's square rounded.
+__device__ __forceinline__ float rmsnorm_pair_square_sum(float2 xf) {
+    return __fmaf_rn(xf.x, xf.x, __fmul_rn(xf.y, xf.y));
+}
 
 template <RmsEpilogue Epilogue>
 __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weight, float z) {
@@ -63,7 +70,7 @@ __launch_bounds__(Block) __global__
                 if constexpr (Epilogue == RmsEpilogue::Gated) { gates[k] = z[row_base + pair]; }
             }
             const float2 xf = __bfloat1622float2(values[k]);
-            sum += xf.x * xf.x + xf.y * xf.y;
+            sum             = __fadd_rn(sum, rmsnorm_pair_square_sum(xf));
         }
     }
 
