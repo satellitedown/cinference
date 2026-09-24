@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: group verify-width gating heads and tiles per CTA.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 #include "core/device.h"
@@ -11,14 +14,24 @@ namespace ninfer::ops::detail {
 namespace {
 // Each head computes both control dots and the complete norm. RMS scaling can be
 // applied after the dots; h is independently rounded from the full normalized input.
-template <int Tile, int Threads>
-__global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
+// A CTA runs HeadGroups x TileGroups independent Threads-wide groups, each owning one head and Tile
+// tokens with the same partition as a one-group CTA. Grouping changes only which loads a CTA
+// shares through L1 (x rows across heads, weight rows across tiles), never the arithmetic.
+template <int Tile, int Threads, int HeadGroups = 1, int TileGroups = 1>
+__global__ __launch_bounds__(Threads * HeadGroups * TileGroups) void gdn_norm_gating_27_simt(
     const __nv_bfloat16* x, const __nv_bfloat16* nw, const __nv_bfloat16* aw,
     const __nv_bfloat16* bw, const float* alog, const float* bias, __nv_bfloat16* h, float* g,
     float* beta, int tokens, float eps) {
-    constexpr int D = 5120, H = 48, Warps = Threads / 32;
-    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, head = blockIdx.x,
-              first = blockIdx.y * Tile;
+    constexpr int D = 5120, H = 48, Warps = Threads / 32, Groups = HeadGroups * TileGroups;
+    const int group = threadIdx.x / Threads, tid = threadIdx.x % Threads, lane = tid & 31,
+              warp = tid >> 5, head = blockIdx.x * HeadGroups + group % HeadGroups,
+              first = (blockIdx.y * TileGroups + group / HeadGroups) * Tile;
+    // The per-head constants are requested first so their latency overlaps the dots.
+    float decay_log = 0.0f, head_bias = 0.0f;
+    if (tid < Tile) {
+        decay_log = alog[head];
+        head_bias = bias[head];
+    }
     float aa[Tile]{}, bb[Tile]{}, ss[Tile]{};
     for (int base = tid * 8; base < D; base += Threads * 8) {
         const int4 av = load_vec<int4>(aw + head * D + base),
@@ -45,16 +58,16 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
             }
         }
     }
-    __shared__ float partial[3][Tile][Warps], inverse[Tile];
+    __shared__ float partial[Groups][3][Tile][Warps], inverse[Groups][Tile];
 #pragma unroll
     for (int t = 0; t < Tile; ++t) {
         aa[t] = warp_reduce_sum(aa[t]);
         bb[t] = warp_reduce_sum(bb[t]);
         ss[t] = warp_reduce_sum(ss[t]);
         if (lane == 0) {
-            partial[0][t][warp] = aa[t];
-            partial[1][t][warp] = bb[t];
-            partial[2][t][warp] = ss[t];
+            partial[group][0][t][warp] = aa[t];
+            partial[group][1][t][warp] = bb[t];
+            partial[group][2][t][warp] = ss[t];
         }
     }
     __syncthreads();
@@ -62,15 +75,15 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
         float a = 0, b = 0, s = 0;
 #pragma unroll
         for (int w = 0; w < Warps; ++w) {
-            a += partial[0][tid][w];
-            b += partial[1][tid][w];
-            s += partial[2][tid][w];
+            a += partial[group][0][tid][w];
+            b += partial[group][1][tid][w];
+            s += partial[group][2][tid][w];
         }
-        const float inv = rsqrtf(s / D + eps);
-        inverse[tid]    = inv;
+        const float inv     = rsqrtf(s / D + eps);
+        inverse[group][tid] = inv;
         if (first + tid < tokens) {
             const auto i = std::int64_t(first + tid) * H + head;
-            g[i]         = -expf(alog[head]) * softplus(a * inv + bias[head]);
+            g[i]         = -expf(decay_log) * softplus(a * inv + head_bias);
             beta[i]      = sigmoid(b * inv);
         }
     }
@@ -86,7 +99,7 @@ __global__ __launch_bounds__(Threads) void gdn_norm_gating_27_simt(
                 const auto i   = std::int64_t(first + t) * (D / 2) + pair;
                 const float2 v = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(x)[i]);
                 reinterpret_cast<__nv_bfloat162*>(h)[i] = __floats2bfloat162_rn(
-                    v.x * inverse[t] * (1 + n.x), v.y * inverse[t] * (1 + n.y));
+                    v.x * inverse[group][t] * (1 + n.x), v.y * inverse[group][t] * (1 + n.y));
             }
     }
 }
@@ -96,9 +109,11 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
                                          const Tensor& alog, const Tensor& bias, Tensor& g,
                                          Tensor& beta, cudaStream_t stream) {
-    const auto launch = [&]<int T, int Threads>() {
-        gdn_norm_gating_27_simt<T, Threads>
-            <<<dim3(48, (x.ne[1] + T - 1) / T), Threads, 0, stream>>>(
+    const auto launch = [&]<int T, int Threads, int HeadGroups = 1, int TileGroups = 1>() {
+        constexpr int kTokensPerCta = T * TileGroups;
+        gdn_norm_gating_27_simt<T, Threads, HeadGroups, TileGroups>
+            <<<dim3(48 / HeadGroups, (x.ne[1] + kTokensPerCta - 1) / kTokensPerCta),
+               Threads * HeadGroups * TileGroups, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(x.data),
                 static_cast<const __nv_bfloat16*>(norm_weight.data),
                 static_cast<const __nv_bfloat16*>(a_weight.qdata),
@@ -113,7 +128,9 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
     else if (tokens <= 14)
         launch.template operator()<2, 512>();
     else if (tokens <= 28)
-        launch.template operator()<2, 256>();
+        // Verify widths: 2 heads x 2 token tiles per CTA share x and weight rows through L1,
+        // 4.90 -> 3.74 us at T=16 (with the constants requested first) in a cold-weight microbench.
+        launch.template operator()<2, 256, 2, 2>();
     else
         launch.template operator()<4, 256>();
     CUDA_CHECK(cudaGetLastError());
