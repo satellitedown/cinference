@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: dispatch verify-width FP8 LinearAdd to the K-split MMA.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "core/weight.h"

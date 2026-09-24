@@ -13,7 +13,10 @@ Modified source snapshot:
 
 Modifications by satellitedown for Cinference extend MTP draft windows to ten,
 use capture-derived CUDA Graph topology classes for MTP profiles, and update
-associated round buffers, validation, tests, and documentation. Publication
+associated round buffers, validation, tests, and documentation. Later
+performance changes speed up DFlash2 verification with small-token projection
+schedules, a K-split FP8 LinearAdd, staged GDN records, a warp-specialized K8V4
+attention kernel, and proposal-head and GDN convolution staging. Publication
 changes add fork branding, provenance and measurement scope, correct stale
 range text, make local-path instructions portable, and omit machine-local
 agent automation and unrelated sponsorship configuration. Modified retained

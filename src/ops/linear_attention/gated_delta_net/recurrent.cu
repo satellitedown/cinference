@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: stage verify-width GDN record inputs once per CTA.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "ops/linear_attention/gated_delta_net/launch.h"
 
 #include "core/device.h"

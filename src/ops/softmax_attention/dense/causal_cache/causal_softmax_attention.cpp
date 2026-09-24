@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: chunk K8V4 verify blocks at sixteen tokens.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 // ninfer::ops - causal cached Softmax Attention validation and finite route dispatch.
 #include "ninfer/ops/softmax_attention.h"
 

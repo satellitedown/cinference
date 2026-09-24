@@ -1,0 +1,133 @@
+{
+  "scope": "Engine-level DFlash2 verification speedup for fafstmobel on one RTX 5090 (32 GB). Round time is the controlled metric; tokens/s also depends on draft acceptance, which differs between builds because kernel numerics change greedy trajectories.",
+  "hardware": "NVIDIA GeForce RTX 5090 32 GB; desktop GPU workloads active during measurement",
+  "model": "fafstmobel NInfer v3 artifact; DFlash2 with 15 draft tokens; optimized proposal head (--lm-head-draft); K8V4 KV cache",
+  "baseline_revision": "b4e8ed40458fce5b1b6374131783aca6123f9a22",
+  "optimized_revision": "the commit that adds this record",
+  "product_benchmark": {
+    "tool": "ninfer_bench --spec dflash2 --draft-tokens 15 --lm-head-draft --kv-dtype k8v4 --warmup 1 -r 2; greedy; 256 generated tokens",
+    "protocol": "baseline and optimized binaries alternate for two runs; median of runs",
+    "points": [
+      {
+        "prompt_tokens": 8192,
+        "baseline_ms_per_round": 19.415,
+        "optimized_ms_per_round": 17.34,
+        "round_time_change_percent": -10.7
+      },
+      {
+        "prompt_tokens": 32768,
+        "baseline_ms_per_round": 20.695,
+        "optimized_ms_per_round": 18.107,
+        "round_time_change_percent": -12.5
+      },
+      {
+        "prompt_tokens": 131072,
+        "baseline_ms_per_round": 24.186,
+        "optimized_ms_per_round": 20.388,
+        "round_time_change_percent": -15.7
+      }
+    ]
+  },
+  "serving_sweep": {
+    "tool": "ninfer-serve OpenAI Chat; greedy; thinking off; 512 output tokens; one sample per point; --max-context/--kv-capacity 196608 (VRAM left by desktop workloads); --vision --no-prefix-reuse --prefill-chunk 1024",
+    "prompt": "Synthetic repetitive Python modules followed by the same LRU-cache coding task, truncated to each target length; not an actual repository",
+    "points": [
+      {
+        "prompt_tokens": 984,
+        "baseline": {
+          "decode_tokens_per_second": 387.4,
+          "ms_per_round": 20.29,
+          "tokens_per_round": 7.88,
+          "ttft_seconds": 0.13
+        },
+        "optimized": {
+          "decode_tokens_per_second": 364.8,
+          "ms_per_round": 17.96,
+          "tokens_per_round": 6.56,
+          "ttft_seconds": 0.12
+        },
+        "round_time_change_percent": -11.5
+      },
+      {
+        "prompt_tokens": 8152,
+        "baseline": {
+          "decode_tokens_per_second": 335.2,
+          "ms_per_round": 20.51,
+          "tokens_per_round": 6.89,
+          "ttft_seconds": 0.89
+        },
+        "optimized": {
+          "decode_tokens_per_second": 372.5,
+          "ms_per_round": 18.42,
+          "tokens_per_round": 6.88,
+          "ttft_seconds": 0.91
+        },
+        "round_time_change_percent": -10.2
+      },
+      {
+        "prompt_tokens": 32728,
+        "baseline": {
+          "decode_tokens_per_second": 335.1,
+          "ms_per_round": 21.85,
+          "tokens_per_round": 7.34,
+          "ttft_seconds": 4.47
+        },
+        "optimized": {
+          "decode_tokens_per_second": 399.7,
+          "ms_per_round": 18.88,
+          "tokens_per_round": 7.56,
+          "ttft_seconds": 4.54
+        },
+        "round_time_change_percent": -13.6
+      },
+      {
+        "prompt_tokens": 65496,
+        "baseline": {
+          "decode_tokens_per_second": 296.1,
+          "ms_per_round": 23.45,
+          "tokens_per_round": 6.96,
+          "ttft_seconds": 11.56
+        },
+        "optimized": {
+          "decode_tokens_per_second": 354.0,
+          "ms_per_round": 19.83,
+          "tokens_per_round": 7.03,
+          "ttft_seconds": 11.71
+        },
+        "round_time_change_percent": -15.4
+      },
+      {
+        "prompt_tokens": 131032,
+        "baseline": {
+          "decode_tokens_per_second": 234.5,
+          "ms_per_round": 26.19,
+          "tokens_per_round": 6.15,
+          "ttft_seconds": 33.77
+        },
+        "optimized": {
+          "decode_tokens_per_second": 314.7,
+          "ms_per_round": 22.14,
+          "tokens_per_round": 6.98,
+          "ttft_seconds": 34.09
+        },
+        "round_time_change_percent": -15.5
+      },
+      {
+        "prompt_tokens": 189960,
+        "baseline": {
+          "decode_tokens_per_second": 202.8,
+          "ms_per_round": 28.25,
+          "tokens_per_round": 5.74,
+          "ttft_seconds": 63.22
+        },
+        "optimized": {
+          "decode_tokens_per_second": 336.7,
+          "ms_per_round": 22.38,
+          "tokens_per_round": 7.55,
+          "ttft_seconds": 62.66
+        },
+        "round_time_change_percent": -20.8
+      }
+    ]
+  }
+}

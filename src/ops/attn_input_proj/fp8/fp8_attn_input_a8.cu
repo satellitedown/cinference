@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: route verify-width tokens to the small-token A8 schedule.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 

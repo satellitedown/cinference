@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: add the residual-add output policy for the K-split MMA.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include <cuda_bf16.h>

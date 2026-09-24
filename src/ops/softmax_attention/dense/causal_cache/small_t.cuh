@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: size wide K8V4 split capacity for one resident wave.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 // ninfer::ops - split-KV causal small-T attention shared scaffolding. The BF16 and

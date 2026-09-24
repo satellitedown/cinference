@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: accept a KV codec argument.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "ninfer/engine.h"
 #include "speculative_page_boundary.h"
 

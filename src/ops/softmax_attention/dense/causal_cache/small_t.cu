@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: size wide K8V4 split capacity for one resident wave.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 // ninfer::ops - split-KV causal small-T launcher and unified route dispatcher. INT8 Q/K
 // preparation, including their paired fixed rotation, remains private to the included kernel.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"

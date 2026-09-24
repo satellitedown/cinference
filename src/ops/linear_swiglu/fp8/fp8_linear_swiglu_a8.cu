@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: route verify-width tokens to the small-token A8 schedule.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 

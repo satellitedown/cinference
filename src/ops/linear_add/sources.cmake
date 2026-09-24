@@ -1,3 +1,6 @@
+# Modified by satellitedown for Cinference: register the FP8 K-split LinearAdd source.
+# See NOTICE and upstream-provenance.json for upstream attribution.
+
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_gemm_mma.cu"

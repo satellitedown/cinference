@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: preload short-width projected inputs before the token loop.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 
 #include "core/device.h"

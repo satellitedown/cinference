@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: add small-token W4A4 LinearAdd schedules.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 

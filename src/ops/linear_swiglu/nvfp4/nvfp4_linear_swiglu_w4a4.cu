@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: add a single-token-tile W4A4 SwiGLU schedule.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 

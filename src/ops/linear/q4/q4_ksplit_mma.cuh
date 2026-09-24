@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: share staged activations across multiple 16-row weight tiles per CTA.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "ops/common/mma.cuh"

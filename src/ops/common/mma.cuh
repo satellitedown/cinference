@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: add FP16-accumulating m16n8k16 MMA helpers.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "ops/common/memory.cuh"

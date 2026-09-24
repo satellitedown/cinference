@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: stage the proposal head in four-tile CTAs.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 

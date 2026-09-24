@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: add the warp-specialized wide kernel and FP16-accumulated PV.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 // Asymmetric K8V4 split-KV causal attention for up to 96 query rows. A CTA owns one KV head and all

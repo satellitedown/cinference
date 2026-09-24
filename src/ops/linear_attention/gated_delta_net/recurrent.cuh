@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: stage verify-width GDN record inputs once per CTA.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "ops/common/bf16_vector.cuh"

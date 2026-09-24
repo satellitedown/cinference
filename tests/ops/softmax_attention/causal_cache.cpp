@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: cover wide K8V4 verify blocks.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/kv_cache_append.h"

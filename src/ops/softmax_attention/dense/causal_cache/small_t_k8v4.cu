@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: dispatch wide verify blocks to the warp-specialized kernel.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 // ninfer::ops::detail - asymmetric FP8-K/NVFP4-V split-KV small-T launch ownership.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 

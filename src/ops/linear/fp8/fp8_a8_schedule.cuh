@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: add the small-token A8 MMA schedule.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 #include "ops/linear/fp8/fp8_a8_mma.cuh"
 

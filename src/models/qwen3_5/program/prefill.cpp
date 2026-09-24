@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: synchronize after the commit fold only when a context append staged host memory.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
