@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: stage the lattice edges before the selector walk.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "ops/candidate_selector/bf16/candidate_selector_path_kernels.h"
 #include "core/device.h"
 #include "ops/common/memory.cuh"
@@ -8,7 +11,7 @@
 
 namespace ninfer::ops::detail {
 namespace {
-constexpr int kCandidates = 16, kRank = 256;
+constexpr int kCandidates = 16, kRank = 256, kMaxSteps = 15;
 
 struct DeviceArgs {
     const std::int32_t* ids;
@@ -127,21 +130,30 @@ __global__ __launch_bounds__(512, 2) void selector_lattice_kernel(DeviceArgs a, 
             shared.edge[threadIdx.x];
 }
 
+// Every step's edge block is staged in shared memory first, so each step's rank-dependent lookup
+// reads shared memory instead of waiting on a dependent global load.
 __global__ __launch_bounds__(32) void selector_lattice_walk_kernel(DeviceArgs a,
                                                                    const float* edges) {
+    __shared__ __align__(16) float staged[kMaxSteps * kCandidates * kCandidates];
     const int lane = threadIdx.x, batch = blockIdx.x;
+    const auto* block =
+        edges + static_cast<std::int64_t>(batch) * a.steps * kCandidates * kCandidates;
+    for (int i = lane; i < a.steps * kCandidates * kCandidates / 4; i += 32) {
+        cp_async<16>(&staged[i * 4], block + i * 4);
+    }
+    cp_commit();
     const auto seed         = a.configs[batch].seed;
     const float temperature = a.configs[batch].temperature;
     const int position      = a.positions[batch];
     int predecessor_rank    = 0;
+    cp_wait<0>();
+    __syncwarp();
 #pragma unroll 1
     for (int step = 0; step < a.steps; ++step) {
         const int column = batch * a.steps + step;
         const float edge =
             lane < kCandidates
-                ? edges[(static_cast<std::int64_t>(column) * kCandidates + predecessor_rank) *
-                            kCandidates +
-                        lane]
+                ? staged[(step * kCandidates + predecessor_rank) * kCandidates + lane]
                 : -CUDART_INF_F;
         int selected =
             draw_rank(edge, temperature, seed, position + step, a.q + column * kCandidates);

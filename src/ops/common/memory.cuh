@@ -1,10 +1,12 @@
-// Modified by satellitedown for Cinference: add evict-first L2 fill policies.
+// Modified by satellitedown for Cinference: L2 fill policies, evict-last stores, line discards.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
 
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
+
+#include <cstdint>
 
 namespace ninfer::ops {
 
@@ -87,6 +89,21 @@ __device__ __forceinline__ void cp_async_cg_policy(void* smem_dst, const void* g
     asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
                  :
                  : "r"(smem_addr(smem_dst)), "l"(gmem_src), "l"(policy));
+}
+
+// Stores a key whose consumer runs after a larger weight stream: the evict-last fill keeps the
+// line in L2 until that consumer reads it.
+__device__ __forceinline__ void store_u64_evict_last(std::uint64_t* dst, std::uint64_t value) {
+    unsigned long long policy;
+    asm("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
+    asm volatile("st.global.L2::cache_hint.b64 [%0], %1, %2;\n" ::"l"(dst), "l"(value), "l"(policy)
+                 : "memory");
+}
+
+// Invalidates the 128-byte L2 line at `line` without writing it back. Only for lines whose data
+// is dead: every later read of the line must follow a new write.
+__device__ __forceinline__ void discard_l2_line(const void* line) {
+    asm volatile("discard.global.L2 [%0], 128;\n" ::"l"(line) : "memory");
 }
 
 __device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }

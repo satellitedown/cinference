@@ -1,10 +1,11 @@
-// Modified by satellitedown for Cinference: stage the proposal head in four-tile CTAs.
+// Modified by satellitedown for Cinference: four-tile proposal-head CTAs, L2-resident partials.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 
 #include "core/device.h"
+#include "ops/common/memory.cuh"
 #include "ops/common/score_id_order.cuh"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 
@@ -31,7 +32,8 @@ struct Q4KSplitTopKOutput {
             if (column >= columns) { return; }
             const std::int64_t offset =
                 (static_cast<std::int64_t>(column) * producer_groups + group) * kLinearTopK + rank;
-            partial_keys[offset] = score_id_order_key(value, row_to_global_ids[row]);
+            store_u64_evict_last(partial_keys + offset,
+                                 score_id_order_key(value, row_to_global_ids[row]));
         };
         put(row0, rank0, column0, values.x);
         put(row0, rank0, column0 + 1, values.y);
