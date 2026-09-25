@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: verify-tree structure for target verification.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 #include "models/qwen3_5/program/internal.h"
 
@@ -100,6 +103,13 @@ public:
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
+
+    // Verify-tree structure of the next target_verify_batch, I32 [width, batch] each: DFS
+    // pre-order parents and ancestor-or-self column masks. Null for chain verification.
+    void set_verify_tree(const Tensor* parents, const Tensor* masks) noexcept {
+        verify_tree_parents_ = parents;
+        verify_tree_masks_   = masks;
+    }
 
     [[nodiscard]] const LinearParameters* proposal_head() const noexcept { return proposal_head_; }
 
@@ -239,6 +249,8 @@ private:
     std::int64_t prefill_split_frontier_      = -1;
     Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
     std::uint32_t mtp_proposal_extent_        = 0;
+    const Tensor* verify_tree_parents_        = nullptr;
+    const Tensor* verify_tree_masks_          = nullptr;
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;

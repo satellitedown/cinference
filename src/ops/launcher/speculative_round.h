@@ -1,9 +1,15 @@
+// Modified by satellitedown for Cinference: speculative verify-tree acceptance.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
+#include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
 
 #include <cuda_runtime.h>
+
+#include <span>
 
 namespace ninfer::ops::detail {
 
@@ -29,6 +35,24 @@ void speculative_accept_sparse_drafts_launch(
     Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
     Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
     bool raw_greedy, DeviceSpan workspace, cudaStream_t stream);
+
+void speculative_accept_tree_drafts_launch(const Tensor& target_tokens, const Tensor& logits,
+                                           const Tensor& drafts, const Tensor& tree_parents,
+                                           const Tensor& current_extents, Tensor& round_lengths,
+                                           Tensor& round_anchors, Tensor& licensed_tokens,
+                                           Tensor& licensed_counts, Tensor& accepted_drafts,
+                                           Tensor& accepted_columns, std::int32_t token_domain,
+                                           const SamplingConfig* configs, bool raw_greedy,
+                                           DeviceSpan workspace, cudaStream_t stream);
+
+void speculative_compact_columns_launch(Tensor& values, const Tensor& rows,
+                                        const Tensor& accepted_columns, const Tensor& accepted,
+                                        cudaStream_t stream);
+
+void speculative_compact_k8v4_launch(std::span<const PagedKVBatchLayerView> layers,
+                                     const Tensor& table_rows, const Tensor& cache_positions,
+                                     const Tensor& accepted_columns, const Tensor& accepted,
+                                     cudaStream_t stream);
 
 void speculative_select_accepted_hidden_launch(const Tensor& hidden, const Tensor& selectors,
                                                Tensor& out, cudaStream_t stream);

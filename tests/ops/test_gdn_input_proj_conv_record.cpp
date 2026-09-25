@@ -1,8 +1,12 @@
+// Modified by satellitedown for Cinference: verify-tree convolution taps against root-path chains.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "core/device.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "ops/input_projection_test_common.h"
+#include "ops/verify_tree_test_common.h"
 
 #include <cuda_runtime.h>
 
@@ -373,8 +377,8 @@ int run_nvfp4() {
                 const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
                 Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
                 ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid_columns,
-                                                initial, record, q, k, v, z, policy, workspace,
-                                                stream);
+                                                initial, Tensor{}, record, q, k, v, z, policy,
+                                                workspace, stream);
             },
             seed);
     };
@@ -408,9 +412,138 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t width, std::int32_t ba
             const Tensor& initial, Tensor& record, Tensor& q, Tensor& k, Tensor& v, Tensor& z,
             WorkspaceArena& workspace, cudaStream_t stream) {
             ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid_columns, initial,
-                                            record, q, k, v, z, policy, workspace, stream);
+                                            Tensor{}, record, q, k, v, z, policy, workspace,
+                                            stream);
         },
         seed);
+}
+
+// Every column of a verify tree must convolve exactly like the last column of the chain over its
+// root path (same projection, same initial history), and record its own projected input.
+int run_fp8_tree_case(DevicePackedWeight& parent, std::int32_t batch,
+                      const std::vector<std::int32_t>& valid, ops::LinearPolicy policy,
+                      std::uint32_t seed) {
+    constexpr std::int32_t kHidden          = 5120;
+    constexpr std::int32_t kWidth           = 16;
+    constexpr std::int32_t kChannels        = 10240;
+    constexpr std::int32_t kZRows           = 6144;
+    constexpr std::int32_t kSlots           = 8;
+    const std::int32_t columns              = kWidth * batch;
+    const std::vector<float> activation     = make_bf16_activation(kHidden, columns, seed);
+    const std::vector<std::uint16_t> x_bits = bf16_bits(activation);
+    const std::vector<std::uint16_t> conv_weight_bits =
+        make_bf16_bits(static_cast<std::size_t>(kChannels) * 4, seed + 1, -0.02F, 0.02F);
+    const std::vector<std::uint16_t> state_bits =
+        make_bf16_bits(static_cast<std::size_t>(kChannels) * 3 * kSlots, seed + 2, -0.05F, 0.05F);
+
+    std::vector<std::int32_t> initial(static_cast<std::size_t>(batch));
+    std::vector<std::int32_t> parents(static_cast<std::size_t>(columns), 0);
+    std::vector<std::vector<std::int32_t>> trees(static_cast<std::size_t>(batch));
+    for (std::int32_t row = 0; row < batch; ++row) {
+        initial[static_cast<std::size_t>(row)] = (row * 3 + 5) % kSlots;
+        trees[static_cast<std::size_t>(row)] =
+            random_verify_tree(valid[static_cast<std::size_t>(row)], seed + 31U * row, 0.4);
+        std::copy(trees[static_cast<std::size_t>(row)].begin(),
+                  trees[static_cast<std::size_t>(row)].end(),
+                  parents.begin() + static_cast<std::ptrdiff_t>(row) * kWidth);
+    }
+
+    const auto launch = [&](const std::vector<std::uint16_t>& x_host, std::int32_t rows,
+                            const std::vector<std::int32_t>& valid_host,
+                            const std::vector<std::int32_t>& initial_host,
+                            const std::vector<std::int32_t>* parents_host,
+                            std::vector<std::uint16_t>& qkv_out,
+                            std::vector<std::uint16_t>& record_out) {
+        const std::int32_t launch_columns = kWidth * rows;
+        DeviceBuffer device_x             = to_device(x_host);
+        DeviceBuffer device_conv          = to_device(conv_weight_bits);
+        DeviceBuffer device_state         = to_device(state_bits);
+        DeviceBuffer device_valid         = to_device(valid_host);
+        DeviceBuffer device_initial       = to_device(initial_host);
+        DeviceBuffer device_parents;
+        if (parents_host != nullptr) { device_parents = to_device(*parents_host); }
+        DeviceBuffer q(static_cast<std::size_t>(kQueryRows) * launch_columns * 2);
+        DeviceBuffer k(static_cast<std::size_t>(kKeyRows) * launch_columns * 2);
+        DeviceBuffer v(static_cast<std::size_t>(6144) * launch_columns * 2);
+        DeviceBuffer z(static_cast<std::size_t>(kZRows) * launch_columns * 2);
+        DeviceBuffer record(static_cast<std::size_t>(kChannels) * launch_columns * 2);
+        const std::size_t workspace_bytes =
+            ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                QType::FP8_E4M3FN_ROW_BF16, 16384, kHidden, policy, rows, kWidth, kWidth);
+        WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+        Tensor x(device_x.p, DType::BF16, {kHidden, kWidth, rows});
+        Tensor conv(device_conv.p, DType::BF16, {kChannels, 4});
+        Tensor state(device_state.p, DType::BF16, {kChannels, 3, kSlots});
+        Tensor valid_tensor(device_valid.p, DType::I32, {rows});
+        Tensor initial_tensor(device_initial.p, DType::I32, {rows});
+        Tensor parents_tensor;
+        if (parents_host != nullptr) {
+            parents_tensor = Tensor(device_parents.p, DType::I32, {kWidth, rows});
+        }
+        Tensor q_view(q.p, DType::BF16, {kQueryRows, kWidth, rows});
+        Tensor k_view(k.p, DType::BF16, {kKeyRows, kWidth, rows});
+        Tensor v_view(v.p, DType::BF16, {6144, kWidth, rows});
+        Tensor z_view(z.p, DType::BF16, {kZRows, kWidth, rows});
+        Tensor record_view(record.p, DType::BF16, {kChannels, kWidth, rows});
+        ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid_tensor, initial_tensor,
+                                        parents_tensor, record_view, q_view, k_view, v_view, z_view,
+                                        policy, workspace, nullptr);
+        cuda_synchronize();
+        const auto q_bits = from_device<std::uint16_t>(q, q.bytes / 2);
+        const auto k_bits = from_device<std::uint16_t>(k, k.bytes / 2);
+        const auto v_bits = from_device<std::uint16_t>(v, v.bytes / 2);
+        qkv_out.clear();
+        for (std::int32_t column = 0; column < launch_columns; ++column) {
+            qkv_out.insert(qkv_out.end(), q_bits.begin() + column * kQueryRows,
+                           q_bits.begin() + (column + 1) * kQueryRows);
+            qkv_out.insert(qkv_out.end(), k_bits.begin() + column * kKeyRows,
+                           k_bits.begin() + (column + 1) * kKeyRows);
+            qkv_out.insert(qkv_out.end(), v_bits.begin() + column * 6144,
+                           v_bits.begin() + (column + 1) * 6144);
+        }
+        record_out = from_device<std::uint16_t>(record, record.bytes / 2);
+    };
+
+    std::vector<std::uint16_t> tree_qkv;
+    std::vector<std::uint16_t> tree_record;
+    launch(x_bits, batch, valid, initial, &parents, tree_qkv, tree_record);
+    const std::string label    = "FP8 tree policy=" + std::to_string(static_cast<int>(policy)) +
+                                 " B=" + std::to_string(batch);
+    constexpr std::size_t kQkv = kChannels;
+    // The chain reference keeps the physical [16,B] block, so the projection arithmetic matches;
+    // only the tested row carries the gathered root path.
+    for (std::int32_t row = 0; row < batch; ++row) {
+        const auto& tree = trees[static_cast<std::size_t>(row)];
+        for (std::int32_t node = 0; node < static_cast<std::int32_t>(tree.size()); ++node) {
+            const std::vector<std::int32_t> path = verify_tree_path(tree, node);
+            std::vector<std::uint16_t> chain_x   = x_bits;
+            for (std::size_t j = 0; j < path.size(); ++j) {
+                std::copy_n(
+                    x_bits.begin() + (static_cast<std::size_t>(row) * kWidth + path[j]) * kHidden,
+                    kHidden,
+                    chain_x.begin() + (static_cast<std::size_t>(row) * kWidth + j) * kHidden);
+            }
+            std::vector<std::int32_t> chain_valid      = valid;
+            chain_valid[static_cast<std::size_t>(row)] = static_cast<std::int32_t>(path.size());
+            std::vector<std::uint16_t> chain_qkv;
+            std::vector<std::uint16_t> chain_record;
+            launch(chain_x, batch, chain_valid, initial, nullptr, chain_qkv, chain_record);
+            const std::size_t chain_column =
+                static_cast<std::size_t>(row) * kWidth + path.size() - 1;
+            const std::size_t tree_column = static_cast<std::size_t>(row) * kWidth + node;
+            if (!std::equal(chain_qkv.begin() + chain_column * kQkv,
+                            chain_qkv.begin() + (chain_column + 1) * kQkv,
+                            tree_qkv.begin() + tree_column * kQkv) ||
+                !std::equal(chain_record.begin() + chain_column * kChannels,
+                            chain_record.begin() + (chain_column + 1) * kChannels,
+                            tree_record.begin() + tree_column * kChannels)) {
+                std::cerr << label << ": node " << node << " of row " << row
+                          << " differs from its root-path chain\n";
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
 int run_fp8() {
@@ -427,6 +560,10 @@ int run_fp8() {
         for (int batch : {2, 3, 4}) {
             failures += run_fp8_case(parent, 4, batch, ragged(4, batch), policy, 1810U + batch);
         }
+    }
+    for (auto policy : {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8}) {
+        failures += run_fp8_tree_case(parent, 1, {16}, policy, 1830U);
+        failures += run_fp8_tree_case(parent, 3, {16, 9, 16}, policy, 1840U);
     }
     failures += parent.verify_preserved("FP8 record parent weight");
     return failures;

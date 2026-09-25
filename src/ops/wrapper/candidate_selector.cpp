@@ -1,5 +1,9 @@
+// Modified by satellitedown for Cinference: lattice verify trees with prompt-lookup chains.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "ninfer/ops/candidate_selector.h"
 
+#include "ops/candidate_selector/bf16/candidate_selector_path_kernels.h"
 #include "ops/candidate_selector/bf16/candidate_selector_path_plan.h"
 
 #include <array>
@@ -123,6 +127,66 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
     detail::candidate_selector_path_dispatch(
         candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
         successor_codebook, base_positions, configs, drafts, proposal_q, workspace, stream);
+}
+
+std::size_t candidate_selector_tree_workspace_capacity_bytes(int min_steps, int max_steps,
+                                                             int min_batch, int max_batch) {
+    if (min_steps < 1 || max_steps > 15 || max_steps < min_steps || min_batch < 1 ||
+        max_batch > 8 || max_batch < min_batch)
+        throw std::invalid_argument("selector tree workspace: invalid K/B interval");
+    WorkspaceLayoutBuilder layout;
+    (void)detail::allocate_selector_workspace(layout, detail::SelectorRoute::Lattice, max_steps,
+                                              max_batch);
+    return layout.peak_bytes();
+}
+
+void candidate_selector_tree(const Tensor& candidate_ids, const Tensor& unary_scores,
+                             const Tensor& projected_hidden, const Tensor& anchors,
+                             const Tensor& predecessor_codebook, const Tensor& successor_codebook,
+                             const Tensor& current_extents, const Tensor& lookup_tokens,
+                             const Tensor& lookup_counts, const Tensor& lookup_log_probability,
+                             Tensor& drafts, Tensor& tree_parents, Tensor& tree_masks,
+                             Tensor& rope_positions, WorkspaceArena& workspace,
+                             cudaStream_t stream) {
+    const std::int32_t batch_size = candidate_ids.ne[2];
+    const std::int32_t kSteps     = candidate_ids.ne[1];
+    if (kSteps < 1 || kSteps > 15)
+        throw std::invalid_argument("candidate_selector_tree: K must be in [1,15]");
+    if (batch_size < 1 || batch_size > 8) {
+        throw std::invalid_argument("candidate_selector_tree: B must be in [1,8]");
+    }
+    require_tensor(candidate_ids, DType::I32, kCandidates, kSteps, batch_size, 1, "candidate_ids");
+    require_tensor(unary_scores, DType::FP32, kCandidates, kSteps, batch_size, 1, "unary_scores");
+    require_tensor(projected_hidden, DType::BF16, kRank, kSteps, batch_size, 1, "projected_hidden");
+    require_tensor(anchors, DType::I32, batch_size, 1, 1, 1, "anchors");
+    require_tensor(predecessor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
+                   "predecessor_codebook");
+    require_tensor(successor_codebook, DType::BF16, kRank, kCodebookRows, 1, 1,
+                   "successor_codebook");
+    require_tensor(current_extents, DType::I32, batch_size, 1, 1, 1, "current_extents");
+    if (lookup_tokens.data != nullptr || lookup_counts.data != nullptr ||
+        lookup_log_probability.data != nullptr) {
+        require_tensor(lookup_tokens, DType::I32, kSteps, batch_size, 1, 1, "lookup_tokens");
+        require_tensor(lookup_counts, DType::I32, batch_size, 1, 1, 1, "lookup_counts");
+        require_tensor(lookup_log_probability, DType::FP32, batch_size, 1, 1, 1,
+                       "lookup_log_probability");
+    }
+    require_tensor(drafts, DType::I32, kSteps, batch_size, 1, 1, "drafts");
+    require_tensor(tree_parents, DType::I32, kSteps + 1, batch_size, 1, 1, "tree_parents");
+    require_tensor(tree_masks, DType::I32, kSteps + 1, batch_size, 1, 1, "tree_masks");
+    if (rope_positions.dtype != DType::I32 || rope_positions.ne[0] != kSteps + 1 ||
+        rope_positions.ne[1] != batch_size || rope_positions.ne[2] != 1 ||
+        rope_positions.ne[3] != 1 || !rope_positions.is_contiguous() ||
+        rope_positions.data == nullptr) {
+        throw std::invalid_argument("candidate_selector_tree: invalid rope_positions");
+    }
+    auto scope         = workspace.scope();
+    const auto scratch = detail::allocate_selector_workspace(
+        workspace, detail::SelectorRoute::Lattice, kSteps, batch_size);
+    detail::candidate_selector_tree_launch(
+        candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
+        successor_codebook, current_extents, lookup_tokens, lookup_counts, lookup_log_probability,
+        drafts, tree_parents, tree_masks, rope_positions, scratch.edges, stream);
 }
 
 } // namespace ninfer::ops

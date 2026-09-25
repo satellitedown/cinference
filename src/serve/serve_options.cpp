@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: parse --verify-tree.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "serve/serve_options.h"
 #include "product/speculative_options.h"
 
@@ -81,7 +84,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
-           "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+           "[--chat-template FILE] [--lm-head-draft] [--verify-tree] [--no-thinking] "
+           "[--preserve-thinking] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -287,6 +291,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.allow_prefix_reuse = false;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+        } else if (arg == "--verify-tree") {
+            options.speculative.verify_tree = true;
         } else if (arg == "--chat-template") {
             options.chat_template_path = require_value("--chat-template");
         } else if (arg == "--no-thinking") {

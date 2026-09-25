@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: route verify-tree parents to the FP8 record.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ninfer/ops/gdn_input_proj.h"
 
@@ -404,7 +407,8 @@ void compose_record(const Tensor& x, const Tensor& conv_weight, const Tensor& co
     Tensor z_flat      = flatten_columns(z, z.ne[0], geometry);
     project(x_flat, record_flat, z_flat);
     detail::gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states, valid_columns,
-                                             initial_state_slots, query, key, value, stream);
+                                             initial_state_slots, Tensor{}, query, key, value,
+                                             stream);
 }
 
 void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
@@ -555,11 +559,15 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
 
 void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                                    const Tensor& conv_states, const Tensor& valid_columns,
-                                   const Tensor& initial_state_slots, Tensor& conv_record,
-                                   Tensor& query, Tensor& key, Tensor& value, Tensor& z,
-                                   LinearPolicy policy, WorkspaceArena& workspace,
+                                   const Tensor& initial_state_slots, const Tensor& tree_parents,
+                                   Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                   Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
                                    cudaStream_t stream) {
     validate_policy(policy);
+    if (tree_parents.data != nullptr && weight.qtype != QType::FP8_E4M3FN_ROW_BF16) {
+        throw std::invalid_argument(
+            "gdn_input_proj_conv_record: verify trees require the FP8 projection");
+    }
 
     if (weight.qtype == QType::NVFP4) {
         constexpr std::int32_t kHidden     = 5120;
@@ -646,9 +654,15 @@ void dispatch_single_parent_record(const Tensor& x, const Weight& weight, const 
             &x,           &conv_weight, &conv_states, &valid_columns, &initial_state_slots,
             &conv_record, &query,       &key,         &value,         &z};
         require_parent_nonoverlap(weight, tensors, workspace, "fp8 gdn_input_proj_conv_record");
+        if (tree_parents.data != nullptr &&
+            (tree_parents.dtype != DType::I32 || !tree_parents.is_contiguous() ||
+             tree_parents.ne[0] != geometry.width || tree_parents.ne[1] != geometry.batch ||
+             tree_parents.ne[2] != 1 || tree_parents.ne[3] != 1)) {
+            throw std::invalid_argument("gdn_input_proj_conv_record: invalid tree parents");
+        }
         detail::fp8_gdn_record_dispatch(x, weight, conv_weight, conv_states, valid_columns,
-                                        initial_state_slots, conv_record, query, key, value, z,
-                                        policy, workspace, stream);
+                                        initial_state_slots, tree_parents, conv_record, query, key,
+                                        value, z, policy, workspace, stream);
         return;
     }
 
@@ -1005,12 +1019,12 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
                                 const Tensor& conv_weight, const Tensor& conv_states,
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
-                                Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
-                                cudaStream_t stream) {
+                                const Tensor& tree_parents, Tensor& conv_record, Tensor& query,
+                                Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
+                                WorkspaceArena& workspace, cudaStream_t stream) {
     dispatch_single_parent_record(x, query_key_value_z_weight, conv_weight, conv_states,
-                                  valid_columns, initial_state_slots, conv_record, query, key,
-                                  value, z, policy, workspace, stream);
+                                  valid_columns, initial_state_slots, tree_parents, conv_record,
+                                  query, key, value, z, policy, workspace, stream);
 }
 
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
@@ -1019,8 +1033,8 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
     dispatch_single_parent_record(x, query_key_value_z_weight, conv_weight, conv_states,
-                                  valid_columns, initial_state_slots, conv_record, query, key,
-                                  value, z, LinearPolicy::A16Only, workspace, stream);
+                                  valid_columns, initial_state_slots, Tensor{}, conv_record, query,
+                                  key, value, z, LinearPolicy::A16Only, workspace, stream);
 }
 
 } // namespace ninfer::ops

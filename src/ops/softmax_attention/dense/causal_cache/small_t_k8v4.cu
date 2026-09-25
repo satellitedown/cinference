@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: prepare wide verify queries once for the wide kernel.
+// Modified by satellitedown for Cinference: prepared wide verify queries; verify-tree masks.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 // ninfer::ops::detail - asymmetric FP8-K/NVFP4-V split-KV small-T launch ownership.
@@ -11,11 +11,13 @@
 #include <cstdint>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 namespace {
 
-template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool Tree,
+          typename CacheInput>
 void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positions, float scale,
                          PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                          std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
@@ -34,6 +36,9 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
     const auto valid_ptr  = invocation.valid_columns == nullptr
                                 ? nullptr
                                 : static_cast<const std::int32_t*>(invocation.valid_columns->data);
+    const auto masks_ptr     = invocation.tree_masks == nullptr
+                                   ? nullptr
+                                   : static_cast<const std::int32_t*>(invocation.tree_masks->data);
     const auto rows_ptr   = invocation.table_rows == nullptr
                                 ? nullptr
                                 : static_cast<const std::int32_t*>(invocation.table_rows->data);
@@ -50,9 +55,9 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
             [&](const auto&... query_args) {
                 kernel<<<grid, threads, dynamic_bytes, stream>>>(
                     query_args..., input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr,
-                    v_scale_ptr, tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0],
-                    invocation.full_width, invocation.column_begin, logical_capacity, scale,
-                    partial_acc_ptr, partial_m_ptr, partial_l_ptr);
+                    v_scale_ptr, tables_ptr, valid_ptr, masks_ptr, rows_ptr,
+                    cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
+                    logical_capacity, scale, partial_acc_ptr, partial_m_ptr, partial_l_ptr);
             },
             query);
         CUDA_CHECK(cudaGetLastError());
@@ -71,7 +76,7 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
                 codes_ptr, scales_ptr);
         CUDA_CHECK(cudaGetLastError());
         launch(causal_attention_small_t_k8v4_wide_kernel<Geometry, TokenTile, MultiBatch, Masked,
-                                                         CacheInput>,
+                                                         Tree, CacheInput>,
                Schedule::Threads, static_cast<std::size_t>(Schedule::DynamicBytes),
                std::make_tuple(static_cast<const std::uint8_t*>(codes_ptr),
                                static_cast<const float*>(scales_ptr)));
@@ -82,7 +87,7 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
         constexpr std::size_t DynamicBytes =
             3u * KeyBlock * kCausalHeadDim / 2u + 2u * KeyBlock * kCausalHeadDim;
         launch(causal_attention_small_t_k8v4_tiled_kernel<Geometry, TokenTile, Warps, MinBlocks,
-                                                          KeyBlock, true, MultiBatch, Masked,
+                                                          KeyBlock, true, MultiBatch, Masked, Tree,
                                                           CacheInput>,
                Warps * 32, DynamicBytes, std::make_tuple(q_ptr));
     }
@@ -127,12 +132,29 @@ void causal_attention_small_t_k8v4_launch_for(
         Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
 
     const auto launch_partial = [&]<int Tokens, bool MultiBatch, bool Masked>() {
-        launch_k8v4_partial<Geometry, Tokens, MultiBatch, Masked>(
+        launch_k8v4_partial<Geometry, Tokens, MultiBatch, Masked, false>(
             q, input, positions, scale, cache, invocation, logical_capacity, splits, partial_acc,
             partial_m, partial_l, query_codes, query_scales, stream);
     };
     const auto dispatch_metadata = [&]<int Tokens>() {
         const bool masked = invocation.valid_columns != nullptr;
+        if (invocation.tree_masks != nullptr) {
+            // Verify trees: the DFlash2 round's masked [16,B] block of the D256 H24/KV4 geometry.
+            if constexpr (Tokens == 16 && Geometry::QHeads == 24 &&
+                          std::is_same_v<CacheInput, CausalAppendInput>) {
+                if (invocation.batch_size == 1) {
+                    launch_k8v4_partial<Geometry, Tokens, false, true, true>(
+                        q, input, positions, scale, cache, invocation, logical_capacity, splits,
+                        partial_acc, partial_m, partial_l, query_codes, query_scales, stream);
+                } else {
+                    launch_k8v4_partial<Geometry, Tokens, true, true, true>(
+                        q, input, positions, scale, cache, invocation, logical_capacity, splits,
+                        partial_acc, partial_m, partial_l, query_codes, query_scales, stream);
+                }
+                return;
+            }
+            throw std::invalid_argument("K8V4 verify trees require a masked 16-column block");
+        }
         if (invocation.batch_size == 1) {
             if (masked) {
                 launch_partial.template operator()<Tokens, false, true>();
@@ -246,16 +268,20 @@ bool causal_attention_small_t_k8v4_prepares_query(std::int32_t q_heads, std::int
     return (width * group + 15) / 16 > 3;
 }
 
-void causal_attention_small_t_k8v4_launch(
-    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-    const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-    CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& query_codes,
-    Tensor& query_scales, Tensor& out, cudaStream_t stream) {
+void causal_attention_small_t_k8v4_launch(const Tensor& q, const Tensor& k, const Tensor& v,
+                                          const Tensor& positions, const Tensor& valid_columns,
+                                          const Tensor& tree_masks, const Tensor& table_rows,
+                                          float scale, PagedKVBatchLayerView cache,
+                                          CausalAttentionExecutionEnvelope envelope,
+                                          std::int32_t column_begin, std::int32_t width,
+                                          Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
+                                          Tensor& query_codes, Tensor& query_scales, Tensor& out,
+                                          cudaStream_t stream) {
     const CausalAppendInput input{static_cast<const __nv_bfloat16*>(k.data),
                                   static_cast<const __nv_bfloat16*>(v.data)};
     const CausalSmallTInvocation invocation{
         .valid_columns = valid_columns.data == nullptr ? nullptr : &valid_columns,
+        .tree_masks    = tree_masks.data == nullptr ? nullptr : &tree_masks,
         .table_rows    = &table_rows,
         .full_width    = q.ne[2],
         .column_begin  = column_begin,

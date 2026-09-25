@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: accept MTP draft windows through K=10.
+// Modified by satellitedown for Cinference: MTP draft windows through K=10; validate --verify-tree.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -33,6 +33,10 @@ namespace ninfer::product {
 }
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+    if (options.verify_tree &&
+        (options.backend != SpeculativeBackend::DFlash2 || options.draft_tokens != 15)) {
+        throw std::invalid_argument("--verify-tree requires --spec dflash2 --draft-tokens 15");
+    }
     switch (options.backend) {
     case SpeculativeBackend::None:
         if (options.draft_tokens != 0 || options.proposal_head != ProposalHead::Full) {

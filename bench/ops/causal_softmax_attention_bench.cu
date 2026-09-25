@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: pass no verify-tree masks.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 // Public-Op benchmark for causal cache Softmax Attention.
 //
 // The two benchmark entries map directly to the public append-and-attend and cached-only
@@ -522,9 +525,9 @@ public:
         if (entry == Entry::Append) {
             const Tensor validity = masked_ ? valid_columns_tensor_ : Tensor{};
             ops::causal_softmax_attention(
-                q_tensor_, k_tensor_, v_tensor_, positions_tensor_, validity, table_rows_tensor_,
-                {kHeadDim, q_tensor_.ne[1], k_tensor_.ne[1]}, kScale, batch_cache_view_, envelope_,
-                workspace_, output_tensor_, stream);
+                q_tensor_, k_tensor_, v_tensor_, positions_tensor_, validity, Tensor{},
+                table_rows_tensor_, {kHeadDim, q_tensor_.ne[1], k_tensor_.ne[1]}, kScale,
+                batch_cache_view_, envelope_, workspace_, output_tensor_, stream);
         } else {
             ops::causal_softmax_attention_cached(
                 q_tensor_, positions_tensor_, {kHeadDim, q_tensor_.ne[1], cache_view_.num_kv_heads},

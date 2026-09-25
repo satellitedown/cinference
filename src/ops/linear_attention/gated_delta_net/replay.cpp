@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: validate and forward the next-layer state hint.
+// Modified by satellitedown for Cinference: next-layer state hint, verify trees, path folds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "ninfer/ops/gated_delta_net.h"
@@ -299,7 +299,8 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   const Tensor& next_states, cudaStream_t stream) {
+                                   const Tensor& next_states, const Tensor& tree_parents,
+                                   cudaStream_t stream) {
     validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
                            key_record, value_record, gate_record, out);
     if (next_states.data != nullptr) {
@@ -307,9 +308,13 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                        {kStateDim, kStateDim, ssm_states.ne[2], ssm_states.ne[3]}, 16,
                        "gated_delta_net_replay_record", "next states");
     }
+    if (tree_parents.data != nullptr) {
+        require_tensor(tree_parents, DType::I32, {q.ne[2], q.ne[3]}, 4,
+                       "gated_delta_net_replay_record", "tree parents");
+    }
     detail::gated_delta_net::launch_recurrent_record(
         q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
-        value_record, gate_record, out, next_states, stream);
+        value_record, gate_record, out, next_states, tree_parents, stream);
 }
 
 GdnReplayFoldPlan::GdnReplayFoldPlan(const GdnReplayRecords& records,
@@ -320,11 +325,18 @@ GdnReplayFoldPlan::GdnReplayFoldPlan(const GdnReplayRecords& records,
     require_records_disjoint_from_states(records_, states_);
 }
 
-void GdnReplayFoldPlan::execute(std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) const {
+void GdnReplayFoldPlan::execute(std::span<const GdnReplayFoldRow> rows,
+                                const Tensor& record_columns, cudaStream_t stream) const {
     const detail::gated_delta_net::GdnReplayFoldKernelRows packed =
         validate_fold_rows(records_, states_, rows);
-    detail::gated_delta_net::launch_replay_fold(records_, states_, packed,
-                                                static_cast<std::int32_t>(rows.size()), stream);
+    if (record_columns.data != nullptr) {
+        require_tensor(record_columns, DType::I32,
+                       {records_.spec.width, records_.spec.record_capacity}, 4, "gdn_replay_fold",
+                       "record columns");
+    }
+    detail::gated_delta_net::launch_replay_fold(
+        records_, states_, packed, static_cast<std::int32_t>(rows.size()),
+        static_cast<const std::int32_t*>(record_columns.data), stream);
 }
 
 } // namespace ninfer::ops

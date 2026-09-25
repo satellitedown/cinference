@@ -1,10 +1,11 @@
-// Modified by satellitedown for Cinference: exercise the next-layer state hint.
+// Modified by satellitedown for Cinference: exercise the next-layer state hint and verify trees.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "ninfer/ops/gated_delta_net.h"
 #include "core/device.h"
 
 #include "ops/op_tester.h"
+#include "ops/verify_tree_test_common.h"
 
 #include <algorithm>
 #include <bit>
@@ -155,7 +156,7 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
         ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, record_states,
                                            valid, initial, key_record_tensor, value_record_tensor,
                                            gate_record_tensor, record_output, reference_states,
-                                           stream);
+                                           Tensor{}, stream);
     };
     launch_reference();
     launch_record();
@@ -270,6 +271,198 @@ int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
     return failures;
 }
 
+// Every node of a verify tree must produce exactly the output of the chain record over its root
+// path, and every column must still record its own raw inputs.
+int run_tree_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
+                  const std::vector<std::int32_t>& valid_columns, std::uint32_t seed,
+                  double chain_bias) {
+    constexpr std::int32_t kQkHeads   = 16;
+    constexpr std::int32_t kChainRows = 8;
+    const std::int32_t columns        = width * batch;
+    const std::int32_t slots          = 8;
+    const std::size_t qk_column       = static_cast<std::size_t>(kStateDim) * kQkHeads;
+    const std::size_t value_column    = static_cast<std::size_t>(kStateDim) * value_heads;
+    const std::size_t qk_elements     = qk_column * columns;
+    const std::size_t value_elements  = value_column * columns;
+    const std::size_t gate_elements   = static_cast<std::size_t>(value_heads) * columns;
+    const std::size_t state_elements =
+        static_cast<std::size_t>(kStateDim) * kStateDim * value_heads * slots;
+
+    const std::vector<std::uint16_t> q_bits = make_bf16(qk_elements, seed);
+    const std::vector<std::uint16_t> k_bits = make_bf16(qk_elements, seed + 1);
+    const std::vector<std::uint16_t> v_bits = make_bf16(value_elements, seed + 2);
+    std::vector<float> g(gate_elements);
+    std::vector<float> beta(gate_elements);
+    fill_uniform(g, seed + 3, -1.2F, -0.02F);
+    fill_uniform(beta, seed + 4, 0.02F, 0.98F);
+    std::vector<float> state(state_elements);
+    fill_uniform(state, seed + 5, -0.03F, 0.03F);
+
+    std::vector<std::int32_t> initial_slots(static_cast<std::size_t>(batch));
+    std::vector<std::int32_t> parents(static_cast<std::size_t>(columns), 0);
+    std::vector<std::vector<std::int32_t>> trees(static_cast<std::size_t>(batch));
+    for (std::int32_t row = 0; row < batch; ++row) {
+        initial_slots[static_cast<std::size_t>(row)] = (row * 5 + 3) % slots;
+        trees[static_cast<std::size_t>(row)]         = random_verify_tree(
+            valid_columns[static_cast<std::size_t>(row)], seed + 97U * row, chain_bias);
+        std::copy(trees[static_cast<std::size_t>(row)].begin(),
+                  trees[static_cast<std::size_t>(row)].end(),
+                  parents.begin() + static_cast<std::ptrdiff_t>(row) * width);
+    }
+
+    DeviceBuffer device_q       = to_device(q_bits);
+    DeviceBuffer device_k       = to_device(k_bits);
+    DeviceBuffer device_v       = to_device(v_bits);
+    DeviceBuffer device_g       = to_device(g);
+    DeviceBuffer device_beta    = to_device(beta);
+    DeviceBuffer device_state   = to_device(state);
+    DeviceBuffer device_initial = to_device(initial_slots);
+    DeviceBuffer device_valid   = to_device(valid_columns);
+    DeviceBuffer device_parents = to_device(parents);
+    DeviceBuffer tree_out(value_elements * sizeof(std::uint16_t));
+    DeviceBuffer key_record(qk_elements * sizeof(std::uint16_t));
+    DeviceBuffer value_record(value_elements * sizeof(std::uint16_t));
+    DeviceBuffer gate_record(gate_elements * 2 * sizeof(std::uint32_t));
+    tree_out.fill(0xff);
+    key_record.fill(0xff);
+    value_record.fill(0xff);
+    gate_record.fill(0xff);
+
+    constexpr float kScale = 1.0F / std::sqrt(128.0F);
+    Tensor states(device_state.p, DType::FP32, {kStateDim, kStateDim, value_heads, slots});
+    {
+        Tensor q(device_q.p, DType::BF16, {kStateDim, kQkHeads, width, batch});
+        Tensor k(device_k.p, DType::BF16, {kStateDim, kQkHeads, width, batch});
+        Tensor v(device_v.p, DType::BF16, {kStateDim, value_heads, width, batch});
+        Tensor g_tensor(device_g.p, DType::FP32, {value_heads, width, batch});
+        Tensor beta_tensor(device_beta.p, DType::FP32, {value_heads, width, batch});
+        Tensor valid(device_valid.p, DType::I32, {batch});
+        Tensor initial(device_initial.p, DType::I32, {batch});
+        Tensor tree_parents(device_parents.p, DType::I32, {width, batch});
+        Tensor out(tree_out.p, DType::BF16, {kStateDim, value_heads, width, batch});
+        Tensor keys(key_record.p, DType::BF16, {kStateDim, kQkHeads, width, batch});
+        Tensor values(value_record.p, DType::BF16, {kStateDim, value_heads, width, batch});
+        Tensor gates(gate_record.p, DType::FP32, {2, value_heads, width, batch});
+        ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, states, valid,
+                                           initial, keys, values, gates, out, Tensor{},
+                                           tree_parents, nullptr);
+        cuda_synchronize();
+    }
+    const std::vector<std::uint16_t> tree_bits =
+        from_device<std::uint16_t>(tree_out, value_elements);
+
+    int failures             = 0;
+    const std::string suffix = " tree Hv=" + std::to_string(value_heads) +
+                               " T=" + std::to_string(width) + " B=" + std::to_string(batch);
+    const std::vector<std::uint16_t> key_after =
+        from_device<std::uint16_t>(key_record, qk_elements);
+    const std::vector<std::uint16_t> value_after =
+        from_device<std::uint16_t>(value_record, value_elements);
+    for (std::int32_t row = 0; row < batch; ++row) {
+        for (std::int32_t token = 0; token < valid_columns[static_cast<std::size_t>(row)];
+             ++token) {
+            const std::size_t column = static_cast<std::size_t>(row) * width + token;
+            if (!std::equal(k_bits.begin() + column * qk_column,
+                            k_bits.begin() + (column + 1) * qk_column,
+                            key_after.begin() + column * qk_column) ||
+                !std::equal(v_bits.begin() + column * value_column,
+                            v_bits.begin() + (column + 1) * value_column,
+                            value_after.begin() + column * value_column)) {
+                std::cerr << "tree record inputs differ" << suffix << "\n";
+                return failures + 1;
+            }
+        }
+    }
+
+    // Chain references: node r of the tree becomes chain row r over its gathered root path.
+    const std::int32_t chain_columns = width * kChainRows;
+    DeviceBuffer chain_q(qk_column * chain_columns * sizeof(std::uint16_t));
+    DeviceBuffer chain_k(qk_column * chain_columns * sizeof(std::uint16_t));
+    DeviceBuffer chain_v(value_column * chain_columns * sizeof(std::uint16_t));
+    DeviceBuffer chain_g(static_cast<std::size_t>(value_heads) * chain_columns * sizeof(float));
+    DeviceBuffer chain_beta(static_cast<std::size_t>(value_heads) * chain_columns * sizeof(float));
+    DeviceBuffer chain_out(value_column * chain_columns * sizeof(std::uint16_t));
+    DeviceBuffer chain_keys(qk_column * chain_columns * sizeof(std::uint16_t));
+    DeviceBuffer chain_values(value_column * chain_columns * sizeof(std::uint16_t));
+    DeviceBuffer chain_gates(static_cast<std::size_t>(value_heads) * chain_columns * 2 *
+                             sizeof(std::uint32_t));
+    DeviceBuffer chain_valid(kChainRows * sizeof(std::int32_t));
+    DeviceBuffer chain_initial(kChainRows * sizeof(std::int32_t));
+    for (std::int32_t row = 0; row < batch; ++row) {
+        const auto& tree      = trees[static_cast<std::size_t>(row)];
+        const auto node_count = static_cast<std::int32_t>(tree.size());
+        for (std::int32_t first = 0; first < node_count; first += kChainRows) {
+            const std::int32_t count = std::min(kChainRows, node_count - first);
+            std::vector<std::uint16_t> gq(qk_column * chain_columns, 0);
+            std::vector<std::uint16_t> gk(qk_column * chain_columns, 0);
+            std::vector<std::uint16_t> gv(value_column * chain_columns, 0);
+            std::vector<float> gg(static_cast<std::size_t>(value_heads) * chain_columns, -0.5F);
+            std::vector<float> gb(static_cast<std::size_t>(value_heads) * chain_columns, 0.5F);
+            std::vector<std::int32_t> lengths(kChainRows, 1);
+            std::vector<std::int32_t> chain_slots(kChainRows,
+                                                  initial_slots[static_cast<std::size_t>(row)]);
+            for (std::int32_t r = 0; r < count; ++r) {
+                const std::vector<std::int32_t> path = verify_tree_path(tree, first + r);
+                lengths[static_cast<std::size_t>(r)] = static_cast<std::int32_t>(path.size());
+                for (std::size_t j = 0; j < path.size(); ++j) {
+                    const std::size_t source = static_cast<std::size_t>(row) * width + path[j];
+                    const std::size_t target = static_cast<std::size_t>(r) * width + j;
+                    std::copy_n(q_bits.begin() + source * qk_column, qk_column,
+                                gq.begin() + target * qk_column);
+                    std::copy_n(k_bits.begin() + source * qk_column, qk_column,
+                                gk.begin() + target * qk_column);
+                    std::copy_n(v_bits.begin() + source * value_column, value_column,
+                                gv.begin() + target * value_column);
+                    std::copy_n(g.begin() + source * value_heads, value_heads,
+                                gg.begin() + target * value_heads);
+                    std::copy_n(beta.begin() + source * value_heads, value_heads,
+                                gb.begin() + target * value_heads);
+                }
+            }
+            CUDA_CHECK(cudaMemcpy(chain_q.p, gq.data(), chain_q.bytes, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(chain_k.p, gk.data(), chain_k.bytes, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(chain_v.p, gv.data(), chain_v.bytes, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(chain_g.p, gg.data(), chain_g.bytes, cudaMemcpyHostToDevice));
+            CUDA_CHECK(
+                cudaMemcpy(chain_beta.p, gb.data(), chain_beta.bytes, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(chain_valid.p, lengths.data(), chain_valid.bytes,
+                                  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(chain_initial.p, chain_slots.data(), chain_initial.bytes,
+                                  cudaMemcpyHostToDevice));
+            Tensor q(chain_q.p, DType::BF16, {kStateDim, kQkHeads, width, kChainRows});
+            Tensor k(chain_k.p, DType::BF16, {kStateDim, kQkHeads, width, kChainRows});
+            Tensor v(chain_v.p, DType::BF16, {kStateDim, value_heads, width, kChainRows});
+            Tensor g_tensor(chain_g.p, DType::FP32, {value_heads, width, kChainRows});
+            Tensor beta_tensor(chain_beta.p, DType::FP32, {value_heads, width, kChainRows});
+            Tensor valid(chain_valid.p, DType::I32, {kChainRows});
+            Tensor initial(chain_initial.p, DType::I32, {kChainRows});
+            Tensor out(chain_out.p, DType::BF16, {kStateDim, value_heads, width, kChainRows});
+            Tensor keys(chain_keys.p, DType::BF16, {kStateDim, kQkHeads, width, kChainRows});
+            Tensor values(chain_values.p, DType::BF16, {kStateDim, value_heads, width, kChainRows});
+            Tensor gates(chain_gates.p, DType::FP32, {2, value_heads, width, kChainRows});
+            ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, states,
+                                               valid, initial, keys, values, gates, out, Tensor{},
+                                               Tensor{}, nullptr);
+            cuda_synchronize();
+            const std::vector<std::uint16_t> chain_bits =
+                from_device<std::uint16_t>(chain_out, value_column * chain_columns);
+            for (std::int32_t r = 0; r < count; ++r) {
+                const std::size_t chain_column =
+                    static_cast<std::size_t>(r) * width + lengths[static_cast<std::size_t>(r)] - 1;
+                const std::size_t tree_column = static_cast<std::size_t>(row) * width + first + r;
+                if (!std::equal(chain_bits.begin() + chain_column * value_column,
+                                chain_bits.begin() + (chain_column + 1) * value_column,
+                                tree_bits.begin() + tree_column * value_column)) {
+                    std::cerr << "tree output differs from its root-path chain at row " << row
+                              << " node " << first + r << suffix << "\n";
+                    return failures + 1;
+                }
+            }
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -289,6 +482,12 @@ int main() {
         failures += run_case(48, width, 8, valid, 1760U + width);
     }
     failures += run_case(48, 5, 3, {5, 3, 1}, 1791U);
+    for (int width = 2; width <= 16; ++width) {
+        failures += run_tree_case(48, width, 1, {width}, 1800U + width, 0.3);
+    }
+    failures += run_tree_case(48, 16, 8, {16, 16, 16, 16, 9, 12, 3, 16}, 1830U, 0.5);
+    failures += run_tree_case(48, 16, 4, {16, 16, 16, 16}, 1840U, 0.0);
+    failures += run_tree_case(32, 16, 3, {16, 11, 16}, 1850U, 0.8);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";
     return failures == 0 ? 0 : 1;
 }

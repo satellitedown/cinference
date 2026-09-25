@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: verify-tree and prompt-lookup round buffers.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/load_options.h"
 #include <algorithm>
@@ -201,6 +204,14 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                 add_tensor(builder, DType::I32, {16, columns - 1, batch}, "DFlash2 candidate ids");
             decode.proposal_q = add_tensor(builder, DType::FP32, {16, columns - 1, batch},
                                            "DFlash2 sampled proposal q");
+            if (layout.spec.verify_tree) {
+                decode.tree_parents = add_tensor(builder, DType::I32, {columns, batch},
+                                                 "DFlash2 verify-tree parents");
+                decode.tree_masks =
+                    add_tensor(builder, DType::I32, {columns, batch}, "DFlash2 verify-tree masks");
+                decode.accepted_columns = add_tensor(builder, DType::I32, {columns, batch},
+                                                     "DFlash2 accepted tree columns");
+            }
         }
         decode.append_positions =
             add_tensor(builder, DType::I32, {columns, batch}, "DFlash append positions");
@@ -342,6 +353,11 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
     verify_positions = layout.verify_positions.bind(backing);
     if (layout.candidate_ids) { candidate_ids = layout.candidate_ids->bind(backing); }
     if (layout.proposal_q) { proposal_q = layout.proposal_q->bind(backing); }
+    if (layout.tree_parents) {
+        tree_parents     = layout.tree_parents->bind(backing);
+        tree_masks       = layout.tree_masks->bind(backing);
+        accepted_columns = layout.accepted_columns->bind(backing);
+    }
     target_rope_positions = ingress_tensor(offsetof(DFlashDecodeIngress, target_rope_positions),
                                            DType::I32, {width, batch});
     text_kv_table_rows =
@@ -355,6 +371,12 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         ingress_tensor(offsetof(DFlashDecodeIngress, state_destination_slots), DType::I32, {batch});
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(DFlashDecodeIngress, sampling));
+    lookup_tokens =
+        ingress_tensor(offsetof(DFlashDecodeIngress, lookup_tokens), DType::I32, {drafts, batch});
+    lookup_counts =
+        ingress_tensor(offsetof(DFlashDecodeIngress, lookup_counts), DType::I32, {batch});
+    lookup_log_probability =
+        ingress_tensor(offsetof(DFlashDecodeIngress, lookup_log_probability), DType::FP32, {batch});
     licensed_tokens =
         egress_tensor(offsetof(DFlashDecodeEgress, licensed_tokens), DType::I32, {width, batch});
     licensed_counts =

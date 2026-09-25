@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: prompt-lookup chains for DFlash2 verify trees.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
@@ -681,6 +684,15 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->state_source_slots[row] = selectors.source;
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
+            if (io.dflash_decode->tree_parents.data != nullptr) {
+                const std::uint32_t lookup = sequence.prompt_lookup.propose(
+                    sequence.ledger,
+                    std::span<TokenId>(
+                        dflash_host_ingress->lookup_tokens.data() + row * draft_window, extent));
+                dflash_host_ingress->lookup_counts[row] = static_cast<std::int32_t>(lookup);
+                dflash_host_ingress->lookup_log_probability[row] =
+                    sequence.prompt_lookup.log_probability();
+            }
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
                                       backend_kv_cache() ? frontier : 0U);
         }
@@ -729,6 +741,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            sequence.prompt_lookup.observe(row_tokens);
             if (extent == 0) {
                 request.speculative_stats.fallback_steps += 1;
             } else {

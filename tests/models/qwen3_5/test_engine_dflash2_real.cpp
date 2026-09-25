@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: accept a KV codec argument.
+// Modified by satellitedown for Cinference: accept KV codec and verify-tree arguments.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "ninfer/engine.h"
@@ -61,9 +61,9 @@ ninfer::PromptInput media_prompt(ninfer::MediaKind kind) {
 }
 } // namespace
 
-// Optional K, Graph, optimized-head, B and KV codec arguments select representative integration
-// routes without multiplying test binaries. The artifact supplies the actual weight
-// representations.
+// Optional K, Graph, optimized-head, B, KV codec, vision, device-slot and verify-tree arguments
+// select representative integration routes without multiplying test binaries. The artifact
+// supplies the actual weight representations.
 int main(int argc, char** argv) {
     const char* artifact = std::getenv("NINFER_TEST_ARTIFACT");
     if (!artifact || !*artifact) {
@@ -95,6 +95,7 @@ int main(int argc, char** argv) {
         options.speculative.draft_tokens             = k;
         options.speculative.proposal_head =
             optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
+        options.speculative.verify_tree = argc > 8 && std::stoi(argv[8]) != 0;
         ninfer::Engine engine(options);
         const auto prompt = engine.tokenize_text("Count from one to twenty: one, two, three,");
         ninfer::test::speculative_page_boundary(engine);
@@ -224,9 +225,9 @@ int main(int argc, char** argv) {
                     "full proposal window escaped the target context capacity tail");
         }
         std::cout << "ok K=" << k << " B=" << batch << " graph=" << graph
-                  << " optimized=" << optimized << " accepted=" << first.speculative.accepted_tokens
-                  << "/" << first.speculative.drafted_tokens
-                  << " state_d2h=" << stats.state_d2h_count
+                  << " optimized=" << optimized << " tree=" << options.speculative.verify_tree
+                  << " accepted=" << first.speculative.accepted_tokens << "/"
+                  << first.speculative.drafted_tokens << " state_d2h=" << stats.state_d2h_count
                   << " state_h2d=" << stats.state_h2d_count << '\n';
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

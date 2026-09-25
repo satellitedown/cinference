@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: pass no verify-tree parents.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 // Public Qwen3-family GDN projection/convolution Snapshot and ReplaySSM Record benchmark.
 //
 // The timed body is exactly one selected gdn_input_proj_conv_*() public Op call.
@@ -490,8 +493,8 @@ public:
         Tensor convolution_weight = conv_weight();
         if (form == Form::Record) {
             ops::gdn_input_proj_conv_record(x, parent_.weight, convolution_weight, conv_states,
-                                            valid_columns, initial, conv_record, query, key, value,
-                                            z, policy_, workspace, stream);
+                                            valid_columns, initial, Tensor{}, conv_record, query,
+                                            key, value, z, policy_, workspace, stream);
         } else {
             ops::gdn_input_proj_conv_snapshot(x, parent_.weight, convolution_weight, conv_states,
                                               valid_columns, initial, snapshot_base, query, key,
@@ -551,8 +554,8 @@ public:
         Tensor convolution_weight = conv_weight();
         if (form == Form::Record) {
             ops::gdn_input_proj_conv_record(x, parent_.weight, convolution_weight, conv_states,
-                                            valid_columns, initial, conv_record, query, key, value,
-                                            z, policy_, workspace, stream);
+                                            valid_columns, initial, Tensor{}, conv_record, query,
+                                            key, value, z, policy_, workspace, stream);
         } else {
             ops::gdn_input_proj_conv_snapshot(x, parent_.weight, convolution_weight, conv_states,
                                               valid_columns, initial, snapshot_base, query, key,

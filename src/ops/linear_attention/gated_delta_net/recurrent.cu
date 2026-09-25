@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: staged GDN record inputs and next-state prefetch.
+// Modified by satellitedown for Cinference: staged GDN records, next-state prefetch, verify trees.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "ops/linear_attention/gated_delta_net/launch.h"
@@ -75,7 +75,8 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   const Tensor& next_states, cudaStream_t stream) {
+                                   const Tensor& next_states, const Tensor& tree_parents,
+                                   cudaStream_t stream) {
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
                     static_cast<unsigned>(kStateDim / kBlockDv));
@@ -100,11 +101,17 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         state_slot_stride,
         scale,
         static_cast<const float*>(next_states.data),
+        static_cast<const std::int32_t*>(tree_parents.data),
     };
-    if (q.ne[2] <= kStagedRecordMaxWidth) {
-        recurrent_record_staged_kernel<Masked><<<grid, block, 0, stream>>>(access);
+    if (tree_parents.data != nullptr) {
+        if (q.ne[2] > kStagedRecordMaxWidth) {
+            throw std::invalid_argument("GDN tree records support at most 16 columns");
+        }
+        recurrent_record_staged_kernel<Masked, true><<<grid, block, 0, stream>>>(access);
+    } else if (q.ne[2] <= kStagedRecordMaxWidth) {
+        recurrent_record_staged_kernel<Masked, false><<<grid, block, 0, stream>>>(access);
     } else {
-    recurrent_record_kernel<Masked><<<grid, block, 0, stream>>>(access);
+        recurrent_record_kernel<Masked><<<grid, block, 0, stream>>>(access);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -113,7 +120,7 @@ template <class Geometry>
 void launch_replay_fold_fixed(const GdnReplayRecords& records,
                               LinearAttentionStateAllLayersView states,
                               const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
-                              cudaStream_t stream) {
+                              const std::int32_t* record_columns, cudaStream_t stream) {
     const FoldAccess<Geometry> access{
         static_cast<const __nv_bfloat16*>(records.key.data),
         static_cast<const __nv_bfloat16*>(records.value.data),
@@ -126,6 +133,7 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
         records.spec.record_capacity,
         records.spec.width,
         rows,
+        record_columns,
     };
     const dim3 grid(static_cast<unsigned>(Geometry::kValueHeads),
                     static_cast<unsigned>(active_rows),
@@ -183,33 +191,36 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& beta, float scale, const Tensor& ssm_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                             Tensor& out, const Tensor& next_states, cudaStream_t stream) {
+                             Tensor& out, const Tensor& next_states, const Tensor& tree_parents,
+                             cudaStream_t stream) {
     if (valid_columns.data == nullptr) {
         launch_recurrent_record_fixed<false>(q, k, v, g, beta, scale, ssm_states, valid_columns,
                                              initial_state_slots, key_record, value_record,
-                                             gate_record, out, next_states, stream);
+                                             gate_record, out, next_states, tree_parents, stream);
     } else {
         launch_recurrent_record_fixed<true>(q, k, v, g, beta, scale, ssm_states, valid_columns,
                                             initial_state_slots, key_record, value_record,
-                                            gate_record, out, next_states, stream);
+                                            gate_record, out, next_states, tree_parents, stream);
     }
 }
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
-                        cudaStream_t stream) {
+                        const std::int32_t* record_columns, cudaStream_t stream) {
     if (records.spec.layers == FoldGeometry48x48::kLayers &&
         records.spec.qk_heads == FoldGeometry48x48::kQkHeads &&
         records.spec.value_heads == FoldGeometry48x48::kValueHeads &&
         records.spec.conv_channels == FoldGeometry48x48::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry48x48>(records, states, rows, active_rows, stream);
+        launch_replay_fold_fixed<FoldGeometry48x48>(records, states, rows, active_rows,
+                                                    record_columns, stream);
         return;
     }
     if (records.spec.layers == FoldGeometry30x32::kLayers &&
         records.spec.qk_heads == FoldGeometry30x32::kQkHeads &&
         records.spec.value_heads == FoldGeometry30x32::kValueHeads &&
         records.spec.conv_channels == FoldGeometry30x32::kConvChannels) {
-        launch_replay_fold_fixed<FoldGeometry30x32>(records, states, rows, active_rows, stream);
+        launch_replay_fold_fixed<FoldGeometry30x32>(records, states, rows, active_rows,
+                                                    record_columns, stream);
         return;
     }
     throw std::invalid_argument("GDN replay fold launcher received an unregistered geometry");

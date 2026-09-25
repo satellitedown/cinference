@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: MTP-10 planning, diagnostics; fused FFN, input norm.
+// Modified by satellitedown for Cinference: MTP-10, diagnostics, fused FFN/input norm, trees.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/execution/attention.h"
@@ -243,7 +243,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
                                          .backend        = plan.speculative_backend,
-                                         .causal_scoring = plan.causal_scoring});
+                                         .causal_scoring = plan.causal_scoring,
+                                         .verify_tree    = plan.verify_tree});
     out.prefill_hidden =
         add_tensor(builder, DType::BF16, {dimension(config.hidden_size), effective_prefill_chunk},
                    "step prefill hidden");
@@ -323,12 +324,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     scratch(layout, execution::attention_norm_projection_workspace_bytes(
                                         *attention, first, last));
                     (void)workspace::text_attention_results(layout, config, last);
-                    scratch(layout,
-                            ops::causal_softmax_attention_workspace_capacity_bytes(
-                                {dimension(config.attention->head_dim),
-                                 dimension(config.attention->num_attention_heads),
-                                 dimension(config.attention->num_key_value_heads)},
-                                plan.kv_storage, envelope, batch_size, min_width, max_width));
+                    const bool tree = plan.verify_tree && path == GdnWorkspacePath::ReplayRecord;
+                    scratch(
+                        layout,
+                        std::max(ops::causal_softmax_attention_workspace_capacity_bytes(
+                                     {dimension(config.attention->head_dim),
+                                      dimension(config.attention->num_attention_heads),
+                                      dimension(config.attention->num_key_value_heads)},
+                                     plan.kv_storage, envelope, batch_size, min_width, max_width),
+                                 tree ? ops::causal_softmax_attention_tree_workspace_capacity_bytes(
+                                            envelope, batch_size)
+                                      : 0));
                     add_scratch(layout, attention->output, first, last);
                 } else {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
@@ -648,8 +654,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                            mask_columns);
                     linear_scratch(layout, parameters.draft->selector->hidden_projection,
                                    mask_columns, mask_columns);
-                    scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(
-                                        drafts, drafts, batch, batch));
+                    scratch(layout, plan.verify_tree
+                                        ? ops::candidate_selector_tree_workspace_capacity_bytes(
+                                              drafts, drafts, batch, batch)
+                                        : ops::candidate_selector_path_workspace_capacity_bytes(
+                                              drafts, drafts, batch, batch));
                     return finish(layout);
                 }
                 {
@@ -811,6 +820,17 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         break;
     }
+    if (options.speculative.verify_tree) {
+        const auto& attention = parameters.model.config().text.attention;
+        if (options.speculative.backend != SpeculativeBackend::DFlash2 ||
+            options.speculative.draft_tokens != 15 ||
+            options.kv_cache != KvCacheStorage::Fp8KeyNvfp4Value || !attention ||
+            attention->head_dim != 256 || attention->num_attention_heads != 24 ||
+            attention->num_key_value_heads != 4) {
+            throw std::invalid_argument(
+                "verify trees require DFlash2 with K=15, the k8v4 KV cache and 24x256 attention");
+        }
+    }
     if (device.compute_capability() != 120) {
         throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
     }
@@ -833,6 +853,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->draft_window        = inputs.draft_window;
     impl->speculative_backend = inputs.speculative_backend;
     impl->proposal_head       = inputs.proposal_head;
+    impl->verify_tree         = inputs.verify_tree;
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
@@ -908,6 +929,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .speculative_backend = options.speculative.backend,
         .kv_storage          = options.kv_cache,
         .proposal_head       = options.speculative.proposal_head,
+        .verify_tree         = options.speculative.verify_tree,
         .features            = models::load_options(options),
         .use_cuda_graph      = options.use_cuda_graph,
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,

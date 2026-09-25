@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: K8V4 verify chunks and their prepared-query workspace.
+// Modified by satellitedown for Cinference: K8V4 verify chunks, prepared queries, verify trees.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 // ninfer::ops - causal cached Softmax Attention validation and finite route dispatch.
@@ -464,10 +464,27 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     return maximum;
 }
 
+std::size_t
+causal_softmax_attention_tree_workspace_capacity_bytes(CausalAttentionExecutionEnvelope envelope,
+                                                       std::int32_t batch_size) {
+    if (batch_size <= 0 || batch_size > kMaximumBatchSize || envelope.min_visible_keys == 0 ||
+        envelope.min_visible_keys > envelope.max_visible_keys ||
+        envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys) {
+        throw std::invalid_argument("causal_softmax_attention tree workspace: invalid profile");
+    }
+    const std::int32_t splits = detail::causal_attention_split_capacity(
+        24, kMaximumVerifyTokens, KvCacheStorage::Fp8KeyNvfp4Value, envelope, batch_size);
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_small_t_workspace(layout, KvCacheStorage::Fp8KeyNvfp4Value, 24,
+                                     kMaximumVerifyTokens, splits, batch_size);
+    return layout.peak_bytes(1);
+}
+
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
-                              const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
-                              float scale, PagedKVBatchLayerView cache,
+                              const Tensor& tree_masks, const Tensor& kv_table_rows,
+                              AttentionHeadGeometry geometry, float scale,
+                              PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "causal_softmax_attention";
@@ -485,6 +502,28 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     require_contiguous_nonnull(v, op, "v");
 
     auto scope = workspace.scope();
+    if (tree_masks.data != nullptr) {
+        // Verify trees run the K8V4 small-T kernel over the whole block, whatever the context.
+        if (cache.storage != KvCacheStorage::Fp8KeyNvfp4Value || q.ne[1] != 24 ||
+            width != kMaximumVerifyTokens || valid_columns.data == nullptr) {
+            throw std::invalid_argument(
+                "causal_softmax_attention: verify trees need a masked K8V4 16-column H24 block");
+        }
+        require_shape(tree_masks, width, batch, 1, 1, op, "tree masks");
+        require_contiguous_nonnull(tree_masks, op, "tree masks");
+        if (tree_masks.dtype != DType::I32) {
+            throw std::invalid_argument("causal_softmax_attention: tree masks must be I32");
+        }
+        const std::int32_t splits =
+            detail::causal_attention_split_capacity(q.ne[1], width, cache.storage, envelope, batch);
+        SmallTWorkspace partial =
+            allocate_small_t_workspace(workspace, cache.storage, q.ne[1], width, splits, batch);
+        detail::causal_attention_small_t_k8v4_launch(
+            q, k, v, positions, valid_columns, tree_masks, kv_table_rows, scale, cache, envelope, 0,
+            width, partial.acc, partial.m, partial.l, partial.query_codes, partial.query_scales,
+            out, stream);
+        return;
+    }
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {

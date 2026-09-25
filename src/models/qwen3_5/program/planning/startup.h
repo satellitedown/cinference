@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: plan DFlash2 verify trees.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 #include "models/qwen3_5/program/internal.h"
 
@@ -78,6 +81,7 @@ struct SequencePlanningInputs {
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
+    bool verify_tree                        = false;
     models::LoadOptions features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;
@@ -100,6 +104,7 @@ struct SequencePlanImpl {
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
+    bool verify_tree                        = false;
     models::LoadOptions features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;

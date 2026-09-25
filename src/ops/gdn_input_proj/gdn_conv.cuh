@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: split the convolution into load and per-token steps.
+// Modified by satellitedown for Cinference: split the convolution steps; verify-tree taps.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -56,6 +56,54 @@ struct GdnConvChannel {
     float w3;
     std::int32_t valid;
 };
+
+// A verify tree of at most 16 DFS pre-order columns packed at four bits per column: column c's
+// parent is bits [4c, 4c+4) for c >= 1 (column 0 is the root). Packed once, every tap lookup is a
+// register shift instead of a dependent load.
+__device__ __forceinline__ std::uint64_t gdn_pack_tree_parents(const std::int32_t* parents,
+                                                               int width) {
+    std::uint64_t packed = 0;
+#pragma unroll
+    for (int column = 1; column < 16; ++column) {
+        if (column < width) {
+            packed |= static_cast<std::uint64_t>(parents[column] & 15) << (4 * column);
+        }
+    }
+    return packed;
+}
+
+__device__ __forceinline__ int gdn_tree_parent(std::uint64_t packed, int column) {
+    return column > 0 ? static_cast<int>((packed >> (4 * column)) & 15U) : -1;
+}
+
+// Taps of column `token` of a DFS pre-order verify tree (packed parents): the three projected
+// inputs preceding it on its root path, oldest first, with the history (h0 oldest .. h2 newest)
+// before the root. `input(column)` returns a column's projected input; column 0 is the root.
+template <class Input>
+__device__ __forceinline__ void gdn_tree_conv_taps(std::uint64_t parents, int token, float h0,
+                                                   float h1, float h2, Input input, float& s0,
+                                                   float& s1, float& s2) {
+    const int a1 = gdn_tree_parent(parents, token);
+    const int a2 = a1 > 0 ? gdn_tree_parent(parents, a1) : -1;
+    const int a3 = a2 > 0 ? gdn_tree_parent(parents, a2) : -1;
+    if (a1 < 0) {
+        s0 = h0;
+        s1 = h1;
+        s2 = h2;
+    } else if (a2 < 0) {
+        s0 = h1;
+        s1 = h2;
+        s2 = input(a1);
+    } else if (a3 < 0) {
+        s0 = h2;
+        s1 = input(a2);
+        s2 = input(a1);
+    } else {
+        s0 = input(a3);
+        s1 = input(a2);
+        s2 = input(a1);
+    }
+}
 
 // Device-side implementation detail shared by exact packed projection kernels. Projection
 // accumulators stay in the route's existing private precision; Publish changes only the side

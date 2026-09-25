@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: verify-tree parents for the record projection.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "models/qwen3_5/execution/parameters.h"
@@ -26,10 +29,13 @@ void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& paramete
                              const Tensor& destination_slots, Tensor& query, Tensor& key,
                              Tensor& value, Tensor& z, WorkspaceArena& workspace,
                              cudaStream_t stream);
+// tree_parents is empty for chains or I32 [T,B] DFS pre-order verify trees; trees require the
+// single-parent FP8 projection.
 void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters,
                            const GdnConfig& config, const Tensor& conv_states,
                            const Tensor& valid_columns, const Tensor& initial_slots,
-                           Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                           Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
+                           const Tensor& tree_parents, Tensor& conv_record, Tensor& query,
+                           Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace,
+                           cudaStream_t stream);
 
 } // namespace ninfer::models::qwen3_5::execution

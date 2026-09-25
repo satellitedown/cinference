@@ -31,7 +31,11 @@ the next layer's state in L2, a fused RMSNorm E4M3 producer for the FP8
 attention input and FFN projections, wide K8V4 verify blocks whose
 otherwise idle compute warps accumulate part of the other rows' PV products,
 and a K8V4 prompt kernel that pipelines alternating score warp groups and PV
-warps across key tiles.
+warps across key tiles. Opt-in DFlash2 verify trees check a best-first tree
+of lattice proposals merged with a prompt-lookup continuation in the same
+verify columns, using ancestor-masked K8V4 attention, tree GDN records and
+convolution taps, tree acceptance, and post-accept compaction of the accepted
+path.
 Publication changes add fork branding, provenance and measurement scope,
 correct stale range text, make local-path instructions portable, and omit
 machine-local agent automation and unrelated sponsorship configuration.

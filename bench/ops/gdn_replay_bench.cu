@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: pass no next-layer state hint.
+// Modified by satellitedown for Cinference: no state hint; verify-tree records, path folds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 // ReplaySSM recurrent-Record and all-layer Fold benchmark.
@@ -83,6 +83,7 @@ struct Options {
     int warmup                   = 10;
     int repeat                   = 50;
     std::size_t flush_bytes      = kDefaultFlush;
+    bool tree                    = false;
 };
 
 struct Measurement {
@@ -141,6 +142,7 @@ void print_help(const char* program) {
                 "  --commits one|dense|mixed|all\n"
                 "                              Commit policy (default all).\n"
                 "  --valid dense|mixed|all     Recurrent valid-prefix policy (default all).\n"
+                "  --tree                      Record a branching verify tree (DFS pre-order).\n"
                 "  --warmup N                  Warmups per point (default 10).\n"
                 "  --repeat N                  Samples per point (default 50).\n"
                 "  --flush-mib N               Cold-L2 eviction storage (default 256 MiB).\n"
@@ -168,6 +170,8 @@ Options parse_options(int argc, char** argv) {
             options.commits = parse_commits(next("commit policy"));
         } else if (argument == "--valid") {
             options.valid = parse_valid(next("valid policy"));
+        } else if (argument == "--tree") {
+            options.tree = true;
         } else if (argument == "--warmup") {
             options.warmup = parse_i32(next("warmup"), "warmup", 0, INT32_MAX);
         } else if (argument == "--repeat") {
@@ -366,8 +370,9 @@ DeviceBuffer make_f32(std::size_t elements, float value) {
 class RecurrentResources {
 public:
     RecurrentResources(const Profile& profile, std::int32_t width, std::int32_t batch,
-                       ValidSelection valid)
+                       ValidSelection valid, bool tree)
         : profile_(profile), width_(width), batch_(batch), valid_policy_(valid),
+          tree_(tree ? make_i32(tree_parents()) : DeviceBuffer{}),
           q_(bench::make_bf16(qk_elements())), k_(bench::make_bf16(qk_elements())),
           v_(bench::make_bf16(value_elements())), g_(make_f32(gate_elements(), -0.7F)),
           beta_(make_f32(gate_elements(), 0.5F)),
@@ -399,9 +404,11 @@ public:
                             {kStateDim, profile_.value_heads, width_, batch_});
         Tensor gate_record(gate_record_.p, DType::FP32, {2, profile_.value_heads, width_, batch_});
         Tensor out(record_out_.p, DType::BF16, {kStateDim, profile_.value_heads, width_, batch_});
+        const Tensor parents =
+            tree_.p != nullptr ? Tensor(tree_.p, DType::I32, {width_, batch_}) : Tensor{};
         ops::gated_delta_net_replay_record(q, k, v, g, beta, scale(), states, valid, initial,
                                            key_record, value_record, gate_record, out, Tensor{},
-                                           stream);
+                                           parents, stream);
     }
 
 private:
@@ -442,6 +449,18 @@ private:
         return make_i32(extents);
     }
 
+    // Four branch nodes whose first children are leaves: the shape a best-first lattice tree
+    // takes around one dominant path.
+    [[nodiscard]] std::vector<std::int32_t> tree_parents() const {
+        static constexpr std::int32_t kParents[16] = {-1, 0, 0, 2,  3,  3,  5,  6,
+                                                      6,  8, 9, 10, 10, 12, 13, 14};
+        std::vector<std::int32_t> parents(static_cast<std::size_t>(width_) * batch_);
+        for (std::int32_t row = 0; row < batch_; ++row)
+            for (std::int32_t column = 0; column < width_; ++column)
+                parents[row * width_ + column] = kParents[column];
+        return parents;
+    }
+
     [[nodiscard]] Tensor valid_tensor() const {
         if (valid_.p == nullptr) return {};
         return Tensor(valid_.p, DType::I32, {batch_});
@@ -451,6 +470,7 @@ private:
     std::int32_t width_;
     std::int32_t batch_;
     ValidSelection valid_policy_;
+    DeviceBuffer tree_;
     DeviceBuffer q_;
     DeviceBuffer k_;
     DeviceBuffer v_;
@@ -466,11 +486,23 @@ private:
 };
 
 Measurement measure_fold(const FoldResources& resources,
-                         const std::vector<ops::GdnReplayFoldRow>& rows, DeviceBuffer& flush,
-                         int warmup, int repeat) {
+                         const std::vector<ops::GdnReplayFoldRow>& rows, std::int32_t width,
+                         bool tree, DeviceBuffer& flush, int warmup, int repeat) {
     cudaStream_t stream = nullptr;
-    const auto launch   = [&](cudaStream_t launch_stream) {
-        resources.fold_plan().execute(rows, launch_stream);
+    // A tree commits the accepted path 0, 2, 3, 5, ... (every third column skipped).
+    std::vector<std::int32_t> path(static_cast<std::size_t>(width) * kRecordCapacity);
+    for (std::int32_t row = 0; row < kRecordCapacity; ++row) {
+        std::int32_t column = 0;
+        for (std::int32_t j = 0; j < width; ++j) {
+            path[row * width + j] = std::min(column, width - 1);
+            column += std::getenv("FOLD_IDENTITY") ? 1 : (j % 2 == 0 ? 2 : 1);
+        }
+    }
+    const DeviceBuffer columns = tree ? make_i32(path) : DeviceBuffer{};
+    const Tensor record_columns =
+        tree ? Tensor(columns.p, DType::I32, {width, kRecordCapacity}) : Tensor{};
+    const auto launch = [&](cudaStream_t launch_stream) {
+        resources.fold_plan().execute(rows, record_columns, launch_stream);
     };
     Measurement result;
     result.warm           = bench::measure_launch(launch, stream, warmup, repeat);
@@ -500,7 +532,7 @@ void print_recurrent_result(const Profile& profile, std::int32_t width, std::int
 
 void run_recurrent_point(const Profile& profile, std::int32_t width, std::int32_t batch,
                          ValidSelection valid, DeviceBuffer& flush, const Options& options) {
-    RecurrentResources resources(profile, width, batch, valid);
+    RecurrentResources resources(profile, width, batch, valid, options.tree);
     const Measurement record =
         measure_component([&](cudaStream_t stream) { resources.launch_record(stream); }, flush,
                           options.warmup, options.repeat);
@@ -547,7 +579,8 @@ int run(const Options& options) {
                         const std::vector<ops::GdnReplayFoldRow> rows =
                             make_rows(batch, width, commits);
                         const Measurement measurement =
-                            measure_fold(resources, rows, flush, options.warmup, options.repeat);
+                            measure_fold(resources, rows, width, options.tree, flush,
+                                         options.warmup, options.repeat);
                         print_result(profile, width, batch, commits, rows, measurement);
                     }
                 }

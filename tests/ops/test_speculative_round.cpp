@@ -1,5 +1,9 @@
+// Modified by satellitedown for Cinference: cover verify-tree acceptance and compaction.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "ninfer/ops/speculative_round.h"
 #include "ops/op_tester.h"
+#include "ops/verify_tree_test_common.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include <string_view>
@@ -153,13 +157,21 @@ struct SparseAcceptSuite {
                                                   int column, const ops::SamplingConfig& config,
                                                   const std::vector<std::int32_t>& token_counts,
                                                   const std::vector<std::int32_t>& drafts) {
+        const auto first = drafts.begin() + static_cast<std::ptrdiff_t>(row) * kSparseDrafts;
+        return target_distribution(logits, row, column, config, token_counts,
+                                   std::vector<std::int32_t>(first, first + column));
+    }
+
+    // The target distribution of one verify column whose penalty overlay is `overlay`.
+    TargetDistribution target_distribution(const std::vector<std::uint16_t>& logits, int row,
+                                           int column, const ops::SamplingConfig& config,
+                                           const std::vector<std::int32_t>& token_counts,
+                                           const std::vector<std::int32_t>& overlay) {
         const auto adjusted = [&](int token) {
             double value = bf16_to_f32(logits[sparse_logit_index(row, column, token)]);
             int count    = token_counts[static_cast<std::size_t>(row) * kSparseTokenDomain + token];
-            for (int previous = 0; previous < column; ++previous) {
-                if (drafts[static_cast<std::size_t>(row) * kSparseDrafts + previous] == token) {
-                    ++count;
-                }
+            for (const std::int32_t previous : overlay) {
+                if (previous == token) { ++count; }
             }
             if (count > 0) value -= config.presence_penalty;
             value -= config.frequency_penalty * static_cast<double>(count);
@@ -810,6 +822,175 @@ struct SparseAcceptSuite {
             proposal_q, extents, lengths, anchors, configs, token_counts,
             ops::SpeculativeAcceptExecutionEnvelope{.all_rows_greedy_without_penalties = false});
     }
+
+    // Verify trees: the walk descends into the child carrying the target's token for the node's
+    // column; greedy rows take the argmax, sampling rows draw with the bonus purpose at the old
+    // length + depth + 1. A column's penalty overlay is its root path's drafted tokens.
+    int tree_accept_case(bool general, int pattern) {
+        const int columns = kSparseColumns;
+        std::vector<std::int32_t> targets(columns * kSparseBatch),
+            drafts(kSparseDrafts * kSparseBatch), parents(columns * kSparseBatch),
+            extents(kSparseBatch), lengths(kSparseBatch), anchors(kSparseBatch, -1);
+        std::vector<std::uint16_t> logits(static_cast<std::size_t>(kSparsePhysicalRows) * columns *
+                                              kSparseBatch,
+                                          f32_to_bf16(-20.0f));
+        std::vector<ops::SamplingConfig> configs(kSparseBatch);
+        std::vector<std::int32_t> history(
+            static_cast<std::size_t>(kSparseTokenDomain) * kSparseBatch, 0);
+        std::vector<std::vector<std::int32_t>> trees(kSparseBatch);
+        for (int row = 0; row < kSparseBatch; ++row) {
+            const int kind = (row + pattern) % 5;
+            extents[row]   = kind == 1   ? 0
+                             : kind == 2 ? std::max(1, kSparseDrafts / 2)
+                                         : kSparseDrafts;
+            lengths[row]   = 7000 + 29 * row;
+            trees[row]     = test::random_verify_tree(extents[row] + 1, 4000U + 97U * row + pattern,
+                                                      row % 2 == 0 ? 0.4 : 0.1);
+            for (int c = 0; c < columns; ++c)
+                parents[row * columns + c] = c <= extents[row] ? trees[row][c] : c - 1;
+            // Siblings get distinct tokens (their index among the parent's children); depths
+            // three apart reuse tokens, so root paths repeat tokens and exercise penalty overlays.
+            std::vector<int> depth(columns, 0), children(columns, 0);
+            for (int c = 1; c < columns; ++c) {
+                const int parent = parents[row * columns + c];
+                depth[c]         = depth[parent] + 1;
+                drafts[row * kSparseDrafts + c - 1] =
+                    20000 + row * 64 + (depth[c] % 3) * 16 + children[parent]++;
+            }
+            auto& cfg       = configs[row];
+            cfg.temperature = 0.0f;
+            if (general) {
+                cfg.temperature       = kind == 3 ? 0.0f : 0.8f;
+                cfg.top_k             = 20;
+                cfg.top_p             = kind == 4 ? 0.9f : 1.0f;
+                cfg.presence_penalty  = kind == 0 || kind == 3 ? 0.75f : 0.0f;
+                cfg.frequency_penalty = kind == 0 ? 0.25f : 0.0f;
+                cfg.seed              = 555 + 13 * row + pattern;
+            }
+            for (int c = 0; c < columns; ++c) {
+                for (int v = kSparseTokenDomain; v < kSparsePhysicalRows; ++v)
+                    logits[sparse_logit_index(row, c, v)] = f32_to_bf16(100.0f);
+                // Each column's children compete with one off-tree token; greedy rows see a
+                // strict order, sampling rows a spread over all of them.
+                int child_rank = 0;
+                for (int child = c + 1; child <= extents[row]; ++child) {
+                    if (parents[row * columns + child] != c) continue;
+                    const int token = drafts[row * kSparseDrafts + child - 1];
+                    logits[sparse_logit_index(row, c, token)] =
+                        f32_to_bf16(8.0f - 1.5f * static_cast<float>((child_rank + row + c) % 4));
+                    ++child_rank;
+                }
+                const int off_tree = 150000 + row * 64 + c;
+                logits[sparse_logit_index(row, c, off_tree)] =
+                    f32_to_bf16((row + c + pattern) % 3 == 0 ? 9.0f : 5.0f);
+                int best = 0;
+                for (int v = 0; v < kSparseTokenDomain; ++v)
+                    if (bf16_to_f32(logits[sparse_logit_index(row, c, v)]) >
+                        bf16_to_f32(logits[sparse_logit_index(row, c, best)]))
+                        best = v;
+                targets[row * columns + c] = best;
+            }
+        }
+        // Oracle.
+        std::vector<std::int32_t> want_tokens(columns * kSparseBatch, 0), want_counts(kSparseBatch),
+            want_accepted(kSparseBatch), want_lengths = lengths, want_anchors(kSparseBatch),
+                                         want_columns(columns * kSparseBatch);
+        for (int row = 0; row < kSparseBatch; ++row) {
+            std::vector<std::int32_t> path{0};
+            int terminal = 0;
+            for (;;) {
+                const int node = path.back();
+                std::vector<std::int32_t> overlay;
+                for (std::size_t i = 1; i < path.size(); ++i)
+                    overlay.push_back(drafts[row * kSparseDrafts + path[i] - 1]);
+                const TargetDistribution target =
+                    target_distribution(logits, row, node, configs[row], history, overlay);
+                int token = target.ids.front();
+                if (configs[row].temperature > 0.0f)
+                    token = sample_target_distribution(
+                        target, oracle_uniform(configs[row].seed,
+                                               lengths[row] + static_cast<int>(path.size()),
+                                               ops::kSamplePurposeSpeculativeBonus));
+                int next = -1;
+                for (int child = 1; child <= extents[row]; ++child)
+                    if (parents[row * columns + child] == node &&
+                        drafts[row * kSparseDrafts + child - 1] == token)
+                        next = child;
+                if (next < 0) {
+                    terminal = token;
+                    break;
+                }
+                path.push_back(next);
+            }
+            const int accepted = static_cast<int>(path.size()) - 1;
+            for (int j = 0; j < accepted; ++j)
+                want_tokens[row * columns + j] = drafts[row * kSparseDrafts + path[j + 1] - 1];
+            want_tokens[row * columns + accepted] = terminal;
+            for (int j = 0; j < columns; ++j)
+                want_columns[row * columns + j] = j <= accepted ? path[j] : j;
+            want_counts[row]   = accepted + 1;
+            want_accepted[row] = accepted;
+            want_lengths[row] += accepted + 1;
+            want_anchors[row] = terminal;
+        }
+
+        DeviceBuffer d_targets = to_device(targets), d_logits = to_device(logits),
+                     d_drafts = to_device(drafts), d_parents = to_device(parents),
+                     d_extents = to_device(extents), d_history = to_device(history);
+        auto device_configs = configs;
+        for (int row = 0; row < kSparseBatch; ++row)
+            device_configs[row].token_counts = static_cast<std::int32_t*>(d_history.p) +
+                                               static_cast<std::size_t>(row) * kSparseTokenDomain;
+        DeviceBuffer d_configs = to_device(device_configs);
+        GuardedDeviceBuffer d_lengths(kSparseBatch * 4), d_anchors(kSparseBatch * 4),
+            d_licensed(columns * kSparseBatch * 4), d_counts(kSparseBatch * 4),
+            d_accepted(kSparseBatch * 4), d_columns(columns * kSparseBatch * 4);
+        initialize(d_lengths, lengths);
+        initialize(d_anchors, anchors);
+        d_licensed.fill(0xcd);
+        d_columns.fill(0xcd);
+        const ops::SpeculativeAcceptExecutionEnvelope envelope{.all_rows_greedy_without_penalties =
+                                                                   !general};
+        const std::size_t bytes = ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
+            kSparseTokenDomain, envelope, kSparseDrafts, kSparseDrafts, kSparseBatch, kSparseBatch);
+        GuardedDeviceBuffer scratch(std::max<std::size_t>(bytes, 1));
+        WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+        Tensor t_targets(d_targets.p, DType::I32, {columns, kSparseBatch});
+        Tensor t_logits(d_logits.p, DType::BF16, {kSparsePhysicalRows, columns, kSparseBatch});
+        Tensor t_drafts(d_drafts.p, DType::I32, {kSparseDrafts, kSparseBatch});
+        Tensor t_parents(d_parents.p, DType::I32, {columns, kSparseBatch});
+        Tensor t_extents(d_extents.p, DType::I32, {kSparseBatch});
+        Tensor t_lengths(d_lengths.data(), DType::I32, {kSparseBatch});
+        Tensor t_anchors(d_anchors.data(), DType::I32, {kSparseBatch});
+        Tensor t_licensed(d_licensed.data(), DType::I32, {columns, kSparseBatch});
+        Tensor t_counts(d_counts.data(), DType::I32, {kSparseBatch});
+        Tensor t_accepted(d_accepted.data(), DType::I32, {kSparseBatch});
+        Tensor t_columns(d_columns.data(), DType::I32, {columns, kSparseBatch});
+        ops::speculative_accept_tree_drafts(
+            t_targets, t_logits, t_drafts, t_parents, t_extents, t_lengths, t_anchors, t_licensed,
+            t_counts, t_accepted, t_columns, kSparseTokenDomain,
+            static_cast<const ops::SamplingConfig*>(d_configs.p), envelope, workspace, nullptr);
+        cuda_synchronize();
+        const std::string label = std::string("tree accept ") + (general ? "general" : "greedy") +
+                                  " K=" + std::to_string(kSparseDrafts) +
+                                  " B=" + std::to_string(kSparseBatch);
+        int failures =
+            verify_exact((label + " licensed").c_str(),
+                         read<std::int32_t>(d_licensed, want_tokens.size()), want_tokens);
+        failures += verify_exact((label + " counts").c_str(),
+                                 read<std::int32_t>(d_counts, kSparseBatch), want_counts);
+        failures += verify_exact((label + " accepted").c_str(),
+                                 read<std::int32_t>(d_accepted, kSparseBatch), want_accepted);
+        failures += verify_exact((label + " lengths").c_str(),
+                                 read<std::int32_t>(d_lengths, kSparseBatch), want_lengths);
+        failures += verify_exact((label + " anchors").c_str(),
+                                 read<std::int32_t>(d_anchors, kSparseBatch), want_anchors);
+        failures += verify_exact((label + " accepted columns").c_str(),
+                                 read<std::int32_t>(d_columns, want_columns.size()), want_columns);
+        failures += scratch.verify_guards(label) + d_licensed.verify_guards(label) +
+                    d_columns.verify_guards(label);
+        return failures;
+    }
 };
 
 AcceptExpected accept_state_oracle(const std::vector<std::int32_t>& drafts, std::int32_t accepted,
@@ -1074,6 +1255,141 @@ int batched_sampling_workspace_stride_case() {
     return failures;
 }
 
+// Accepted verify-tree paths: strictly increasing columns from 0, identity beyond the path.
+std::vector<std::int32_t> make_paths(int width, const std::vector<std::int32_t>& accepted,
+                                     std::uint32_t seed) {
+    std::vector<std::int32_t> paths(static_cast<std::size_t>(width) * accepted.size());
+    for (std::size_t row = 0; row < accepted.size(); ++row) {
+        std::uint32_t state = seed + 7919U * static_cast<std::uint32_t>(row);
+        int column          = 0;
+        for (int j = 0; j < width; ++j) paths[row * width + j] = j;
+        for (int j = 1; j <= accepted[row]; ++j) {
+            const int room = width - 2 - column - (accepted[row] - j);
+            state          = state * 1664525U + 1013904223U;
+            column += 1 + static_cast<int>((state >> 16) % static_cast<std::uint32_t>(room + 1));
+            paths[row * width + j] = column;
+        }
+    }
+    return paths;
+}
+
+int compact_columns_case(int elements, int width, bool mapped_rows) {
+    const std::vector<std::int32_t> accepted{3, 0, 7, width - 1};
+    const int batch = static_cast<int>(accepted.size());
+    const std::vector<std::int32_t> rows =
+        mapped_rows ? std::vector<std::int32_t>{5, 2, 0, 3} : std::vector<std::int32_t>{0, 1, 2, 3};
+    const int physical_rows = mapped_rows ? 6 : batch;
+    const auto paths        = make_paths(width, accepted, 91U + elements);
+    std::vector<std::uint16_t> values(static_cast<std::size_t>(elements) * width * physical_rows);
+    for (std::size_t i = 0; i < values.size(); ++i)
+        values[i] = static_cast<std::uint16_t>((i * 2654435761U) >> 7);
+    auto expected = values;
+    for (int b = 0; b < batch; ++b)
+        for (int j = 1; j <= accepted[b]; ++j)
+            for (int e = 0; e < elements; ++e)
+                expected[(static_cast<std::size_t>(rows[b]) * width + j) * elements + e] =
+                    values[(static_cast<std::size_t>(rows[b]) * width + paths[b * width + j]) *
+                               elements +
+                           e];
+    DeviceBuffer d_values = to_device(values), d_rows = to_device(rows), d_paths = to_device(paths),
+                 d_accepted = to_device(accepted);
+    Tensor t_values(d_values.p, DType::BF16, {elements, width, physical_rows});
+    Tensor t_rows = mapped_rows ? Tensor(d_rows.p, DType::I32, {batch}) : Tensor{};
+    Tensor t_paths(d_paths.p, DType::I32, {width, batch});
+    Tensor t_accepted(d_accepted.p, DType::I32, {batch});
+    ops::speculative_compact_columns(t_values, t_rows, t_paths, t_accepted, nullptr);
+    cuda_synchronize();
+    return verify_exact(
+        ("compact columns D=" + std::to_string(elements) + (mapped_rows ? " mapped" : "")).c_str(),
+        from_device<std::uint16_t>(d_values, values.size()), expected);
+}
+
+int compact_k8v4_case(int kv_heads, int layers) {
+    constexpr int kPage = 64, kWidth = 16;
+    const std::vector<std::int32_t> accepted{15, 4, 0, 9};
+    const std::vector<std::int32_t> bases{61, 0, 200, 127};
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(kWidth) * bases.size());
+    for (std::size_t b = 0; b < bases.size(); ++b)
+        for (int c = 0; c < kWidth; ++c) positions[b * kWidth + c] = bases[b] + c;
+    const std::vector<std::int32_t> table_rows{2, 0, 3, 1};
+    const int batch  = static_cast<int>(accepted.size());
+    const auto paths = make_paths(kWidth, accepted, 17U * kv_heads);
+    // Four table rows of four logical pages over 16 shuffled physical pages.
+    const int logical = 4, physical = 16;
+    std::vector<std::int32_t> tables(static_cast<std::size_t>(logical) * 4);
+    for (int i = 0; i < logical * 4; ++i) tables[i] = (i * 7 + 3) % physical;
+    const std::size_t k_bytes = static_cast<std::size_t>(physical) * kv_heads * kPage * 256;
+    const std::size_t v_bytes = k_bytes / 2, vs_bytes = k_bytes / 16, ks_count = k_bytes / 256;
+    std::vector<DeviceBuffer> buffers;
+    std::vector<std::vector<std::uint8_t>> host;
+    std::vector<PagedKVBatchLayerView> views;
+    DeviceBuffer d_tables = to_device(tables);
+    for (int layer = 0; layer < layers; ++layer) {
+        std::vector<std::vector<std::uint8_t>> planes{
+            std::vector<std::uint8_t>(k_bytes), std::vector<std::uint8_t>(v_bytes),
+            std::vector<std::uint8_t>(ks_count * 2), std::vector<std::uint8_t>(vs_bytes)};
+        for (int plane = 0; plane < 4; ++plane)
+            for (std::size_t i = 0; i < planes[plane].size(); ++i)
+                planes[plane][i] =
+                    static_cast<std::uint8_t>((i * 131 + plane * 29 + layer * 7) >> 3);
+        PagedKVBatchLayerView view{};
+        for (int plane = 0; plane < 4; ++plane) {
+            buffers.push_back(to_device(planes[plane]));
+            host.push_back(planes[plane]);
+        }
+        const std::size_t first = buffers.size() - 4;
+        view.k_pages = Tensor(buffers[first].p, DType::U8, {static_cast<std::int32_t>(k_bytes)});
+        view.v_pages =
+            Tensor(buffers[first + 1].p, DType::U8, {static_cast<std::int32_t>(v_bytes)});
+        view.k_scale_pages =
+            Tensor(buffers[first + 2].p, DType::U8, {static_cast<std::int32_t>(ks_count * 2)});
+        view.v_scale_pages =
+            Tensor(buffers[first + 3].p, DType::U8, {static_cast<std::int32_t>(vs_bytes)});
+        view.block_tables = Tensor(d_tables.p, DType::I32, {logical, 4});
+        view.head_dim     = 256;
+        view.num_kv_heads = kv_heads;
+        view.storage      = KvCacheStorage::Fp8KeyNvfp4Value;
+        views.push_back(view);
+    }
+    // Host reference, in increasing j order.
+    const auto row_offset = [&](int leading, int page, int head, int offset) {
+        return static_cast<std::size_t>(leading) * kPage * (head + kv_heads * page) +
+               static_cast<std::size_t>(leading) * offset;
+    };
+    const int leading[4] = {256, 128, 2, 16};
+    auto expected        = host;
+    for (int layer = 0; layer < layers; ++layer)
+        for (int b = 0; b < batch; ++b)
+            for (int j = 1; j <= accepted[b]; ++j) {
+                const int source = bases[b] + paths[b * kWidth + j], target = bases[b] + j;
+                if (source == target) continue;
+                const int* table = tables.data() + table_rows[b] * logical;
+                for (int plane = 0; plane < 4; ++plane)
+                    for (int head = 0; head < kv_heads; ++head) {
+                        auto& bytes = expected[layer * 4 + plane];
+                        const auto src =
+                            row_offset(leading[plane], table[source / kPage], head, source % kPage);
+                        const auto dst =
+                            row_offset(leading[plane], table[target / kPage], head, target % kPage);
+                        std::copy_n(bytes.begin() + src, leading[plane], bytes.begin() + dst);
+                    }
+            }
+    DeviceBuffer d_rows = to_device(table_rows), d_positions = to_device(positions),
+                 d_paths = to_device(paths), d_accepted = to_device(accepted);
+    ops::speculative_compact_k8v4_kv(views, Tensor(d_rows.p, DType::I32, {batch}),
+                                     Tensor(d_positions.p, DType::I32, {kWidth, batch}),
+                                     Tensor(d_paths.p, DType::I32, {kWidth, batch}),
+                                     Tensor(d_accepted.p, DType::I32, {batch}), nullptr);
+    cuda_synchronize();
+    int failures = 0;
+    for (std::size_t i = 0; i < buffers.size(); ++i)
+        failures += verify_exact(
+            ("compact k8v4 Hkv=" + std::to_string(kv_heads) + " plane " + std::to_string(i))
+                .c_str(),
+            from_device<std::uint8_t>(buffers[i], expected[i].size()), expected[i]);
+    return failures;
+}
+
 int select_hidden_case(int rows, int columns, int accepted_value) {
     std::vector<std::uint16_t> hidden(static_cast<std::size_t>(rows) * columns);
     for (int col = 0; col < columns; ++col) {
@@ -1225,6 +1541,10 @@ int main(int argc, char** argv) {
         std::cerr << "speculative accept workspace accepted an invalid draft interval\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
+    failures += compact_columns_case(5120, 16, false);
+    failures += compact_columns_case(777, 16, true);
+    failures += compact_k8v4_case(4, 3);
+    failures += compact_k8v4_case(2, 17);
     failures += greedy_accept_case(1, 0);
     failures += greedy_accept_case(5, 2);
     failures += greedy_accept_case(5, 5);
@@ -1239,6 +1559,12 @@ int main(int argc, char** argv) {
             SparseAcceptSuite suite(k, batch);
             failures += suite.sparse_greedy_direct_case();
             failures += suite.generated_general_case();
+            if (k == 15 || k == 5) {
+                for (int pattern = 0; pattern < 3; ++pattern) {
+                    failures += suite.tree_accept_case(false, pattern);
+                    failures += suite.tree_accept_case(true, pattern);
+                }
+            }
             sparse_peak = std::max(sparse_peak, suite.observed_workspace);
             if (batch == 1)
                 for (int pattern = 1; pattern < 7; ++pattern)

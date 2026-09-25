@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: small-token A8 schedule; record-route convolution.
+// Modified by satellitedown for Cinference: small-token A8; record convolution with verify trees.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -69,9 +69,9 @@ void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
 
 void fp8_gdn_record_conv_a8_launch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                                    const Tensor& conv_states, const Tensor& valid_columns,
-                                   const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
-                                   Tensor& key, Tensor& value, Tensor& z, Fp8A8Workspace workspace,
-                                   cudaStream_t stream) {
+                                   const Tensor& initial_slot, const Tensor& tree_parents,
+                                   Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                   Tensor& z, Fp8A8Workspace workspace, cudaStream_t stream) {
     using Schedule = Fp8A8SmallTokenSchedule;
     using Output   = Fp8GdnRecordConvOutput<Schedule::kBlockRows, Schedule::kThreads>;
     static_assert(Schedule::kBlockTokens == Output::kWidth);
@@ -99,6 +99,7 @@ void fp8_gdn_record_conv_a8_launch(const Tensor& x, const Weight& weight, const 
             0,
             NoHistoryPublish{},
         },
+        static_cast<const std::int32_t*>(tree_parents.data),
     };
     launch_mma<Schedule, true>(weight, output, workspace, x.ne[1], stream);
 }

@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: DFlash2 verify trees and post-accept compaction.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/execution/linear.h"
 #include <cmath>
@@ -32,12 +35,15 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <stdexcept>
 #include <utility>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
+
+inline constexpr std::size_t kVerifyTreeMaxAttentionLayers = 16;
 
 using detail::DFlashPersistentState;
 
@@ -373,13 +379,27 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
         Tensor projected =
             work.alloc(DType::BF16, {dimension(config.dflash2->selector_rank), mask_columns});
         project(hidden, weights.selector->hidden_projection, projected, work, stream);
-        Tensor drafts     = frame.draft_tokens.slice(1, 0, batch);
-        Tensor proposal_q = frame.proposal_q.slice(2, 0, batch);
-        ops::candidate_selector_path(
-            candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
-            projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
-            weights.selector->predecessor_codebook, weights.selector->successor_codebook, frontiers,
-            frame.sampling, drafts, proposal_q, work, stream);
+        Tensor drafts = frame.draft_tokens.slice(1, 0, batch);
+        if (frame.tree_parents.data != nullptr) {
+            Tensor parents = frame.tree_parents.slice(1, 0, batch);
+            Tensor masks   = frame.tree_masks.slice(1, 0, batch);
+            Tensor rope    = frame.target_rope_positions.slice(1, 0, batch);
+            ops::candidate_selector_tree(
+                candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
+                projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
+                weights.selector->predecessor_codebook, weights.selector->successor_codebook,
+                frame.proposal_extents.slice(0, 0, batch), frame.lookup_tokens.slice(1, 0, batch),
+                frame.lookup_counts.slice(0, 0, batch),
+                frame.lookup_log_probability.slice(0, 0, batch), drafts, parents, masks, rope, work,
+                stream);
+        } else {
+            Tensor proposal_q = frame.proposal_q.slice(2, 0, batch);
+            ops::candidate_selector_path(
+                candidates, scores.view({dimension(config.dflash2->selector_top_k), k, batch}),
+                projected.view({dimension(config.dflash2->selector_rank), k, batch}), anchors,
+                weights.selector->predecessor_codebook, weights.selector->successor_codebook,
+                frontiers, frame.sampling, drafts, proposal_q, work, stream);
+        }
         work.reset();
     }
 }
@@ -599,6 +619,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor licensed_tokens    = frame.licensed_tokens.slice(1, 0, batch_size);
         Tensor licensed_counts    = frame.licensed_counts.slice(0, 0, batch_size);
         Tensor accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
+        const bool tree           = frame.tree_parents.data != nullptr;
+        Tensor accepted_columns = tree ? frame.accepted_columns.slice(1, 0, batch_size) : Tensor{};
 
         state.execution.work.reset();
         Tensor compact_features = state.execution.work.alloc(
@@ -643,17 +665,39 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                                    : Tensor{},
                     .proposal_q =
                         frame.proposal_q.data ? frame.proposal_q.slice(2, 0, batch_size) : Tensor{},
-                    .frontiers       = frontiers,
-                    .anchors         = anchors,
-                    .licensed_tokens = licensed_tokens,
-                    .licensed_counts = licensed_counts,
-                    .accepted_drafts = accepted,
-                    .selected_hidden = selected_hidden,
-                    .replay_records  = state.execution.replay_records,
-                    .sampling        = frame.sampling,
-                    .feature_sink    = &sink,
+                    .tree_parents = tree ? frame.tree_parents.slice(1, 0, batch_size) : Tensor{},
+                    .tree_masks   = tree ? frame.tree_masks.slice(1, 0, batch_size) : Tensor{},
+                    .accepted_columns = accepted_columns,
+                    .frontiers        = frontiers,
+                    .anchors          = anchors,
+                    .licensed_tokens  = licensed_tokens,
+                    .licensed_counts  = licensed_counts,
+                    .accepted_drafts  = accepted,
+                    .selected_hidden  = selected_hidden,
+                    .replay_records   = state.execution.replay_records,
+                    .sampling         = frame.sampling,
+                    .feature_sink     = &sink,
                 },
                 target_envelope);
+        }
+        if (tree) {
+            // Move the accepted path's cache rows and draft features onto the chain positions the
+            // commit keeps; the replay fold reads accepted_columns for the linear state.
+            std::array<PagedKVBatchLayerView, kVerifyTreeMaxAttentionLayers> layers{};
+            const std::uint32_t layer_count = state.text_cache.layers();
+            if (layer_count > layers.size()) {
+                throw std::logic_error(
+                    "verify-tree compaction supports at most 16 attention layers");
+            }
+            for (std::uint32_t layer = 0; layer < layer_count; ++layer) {
+                layers[layer] = state.text_cache.batch_layer_view(layer);
+            }
+            ops::speculative_compact_k8v4_kv(
+                std::span<const PagedKVBatchLayerView>(layers.data(), layer_count), text_rows,
+                target_positions, accepted_columns, accepted, state.execution.device.stream);
+            ops::speculative_compact_columns(dflash_state(state).pending_features, active_lanes,
+                                             accepted_columns, accepted,
+                                             state.execution.device.stream);
         }
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_5::DFlashDecodeEgress), cudaMemcpyDeviceToHost,

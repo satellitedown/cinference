@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: verify-tree acceptance.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/context.h"
 #include "ninfer/ops/scatter.h"
@@ -12,6 +15,8 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
         throw std::logic_error("speculative target verify has no ReplaySSM record storage");
     }
     card.set_gdn_state_action(GdnStateAction::RecordForReplay, frame.replay_records);
+    const bool tree = frame.tree_parents.data != nullptr;
+    card.set_verify_tree(tree ? &frame.tree_parents : nullptr, tree ? &frame.tree_masks : nullptr);
     if (frame.feature_sink != nullptr) {
         card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
@@ -23,7 +28,19 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  envelope, frame.target_hidden, frame.target_logits,
                                  frame.target_tokens);
     }
-    if (frame.proposal_q.data != nullptr) {
+    card.set_verify_tree(nullptr, nullptr);
+    if (tree) {
+        ops::speculative_accept_tree_drafts(
+            frame.target_tokens, frame.target_logits, frame.drafts, frame.tree_parents,
+            frame.current_extents, frame.frontiers, frame.anchors, frame.licensed_tokens,
+            frame.licensed_counts, frame.accepted_drafts, frame.accepted_columns,
+            dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
+            {false}, execution.work, execution.device.stream);
+        // Later readers (the continuation hidden below, a partial commit's correction) index the
+        // accepted path by its chain position.
+        ops::speculative_compact_columns(frame.target_hidden, Tensor{}, frame.accepted_columns,
+                                         frame.accepted_drafts, execution.device.stream);
+    } else if (frame.proposal_q.data != nullptr) {
         ops::speculative_accept_sparse_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
             frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,

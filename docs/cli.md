@@ -1,6 +1,6 @@
 # NInfer CLI
 
-> Modified by satellitedown for Cinference: MTP draft windows now support 1..10.
+> Modified by satellitedown for Cinference: MTP draft windows now support 1..10; DFlash2 `--verify-tree`.
 
 `build/apps/ninfer` runs one request against one v3 `.ninfer` artifact. Build NInfer and
 download an artifact using the [project README](../README.md) before following this guide.
@@ -192,6 +192,9 @@ For DFlash:
 For Qwen3.8-27B artifacts containing the DFlash2 companion weights, select
 `--spec dflash2 --draft-tokens 7`, optionally with `--lm-head-draft` and `--vision`.
 DFlash2 accepts every draft count from 1 through 15; seven is the checkpoint recommendation.
+With `--draft-tokens 15` and `--kv-dtype k8v4`, `--verify-tree` verifies a best-first tree of
+fifteen proposals, merged with a prompt-lookup continuation of the context, instead of one path;
+the output distribution is unchanged and more tokens are accepted per round.
 Both `groupwise-int` and `nvfp4` artifacts use the same Engine route, including CUDA Graph,
 concurrent requests, sampling penalties, and prefix reuse. An artifact without the companion
 weights reports a missing DFlash2 component when selected. Vision, MTP and DFlash follow the same
@@ -217,6 +220,7 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..10`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--verify-tree` | DFlash2 verify trees; needs `--draft-tokens 15` and `--kv-dtype k8v4` | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--chat-template FILE` | use a local Jinja template | artifact template |

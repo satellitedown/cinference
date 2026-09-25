@@ -1,6 +1,10 @@
+// Modified by satellitedown for Cinference: fold a verify tree's accepted record path.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "core/gdn_replay_records.h"
+#include "core/tensor.h"
 #include "core/linear_attention_state.h"
 
 #include <cuda_runtime.h>
@@ -44,12 +48,18 @@ struct GdnReplayFoldRow {
  * The Op admits the two registered all-layer geometries only, owns no workspace or device
  * allocation, and does not read query or generate token output. The four record planes are
  * read-only, disjoint, and do not overlap either state region.
+ *
+ * record_columns is empty or device I32 [T,record_capacity]. When present, committed token j of
+ * row b reads record column record_columns[j,b] instead of column j (a verify tree's accepted
+ * path); for every active row the first commit_columns entries are strictly increasing columns
+ * in [0,T), and the convolution history takes the same mapped columns.
  */
 class GdnReplayFoldPlan {
 public:
     GdnReplayFoldPlan(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states);
 
-    void execute(std::span<const GdnReplayFoldRow> rows, cudaStream_t stream) const;
+    void execute(std::span<const GdnReplayFoldRow> rows, const Tensor& record_columns,
+                 cudaStream_t stream) const;
 
 private:
     GdnReplayRecords records_;

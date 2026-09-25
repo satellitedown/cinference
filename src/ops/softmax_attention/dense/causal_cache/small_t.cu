@@ -387,9 +387,9 @@ void causal_attention_small_t_launch(
     Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& query_codes,
     Tensor& query_scales, Tensor& out, cudaStream_t stream) {
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
-        causal_attention_small_t_k8v4_launch(q, k, v, pos, valid_columns, table_rows, scale, cache,
-                                             envelope, column_begin, width, partial_acc, partial_m,
-                                             partial_l, query_codes, query_scales, out, stream);
+        causal_attention_small_t_k8v4_launch(
+            q, k, v, pos, valid_columns, Tensor{}, table_rows, scale, cache, envelope, column_begin,
+            width, partial_acc, partial_m, partial_l, query_codes, query_scales, out, stream);
         return;
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {

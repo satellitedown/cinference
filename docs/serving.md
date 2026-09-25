@@ -1,6 +1,6 @@
 # HTTP serving
 
-> Modified by satellitedown for Cinference: MTP draft windows now support 1..10.
+> Modified by satellitedown for Cinference: MTP draft windows now support 1..10; DFlash2 `--verify-tree`.
 
 `build/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
 Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
@@ -34,7 +34,8 @@ pinned Host KV retain inactive continuations under Device pressure. Active reque
 Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
 selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
 artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`, with
-`--lm-head-draft` optional. DFlash2 accepts draft counts 1..15 and supports the same sampling,
+`--lm-head-draft` optional; with `--draft-tokens 15` and `--kv-dtype k8v4`, `--verify-tree` verifies
+proposal trees with prompt lookup. DFlash2 accepts draft counts 1..15 and supports the same sampling,
 concurrency, prefix reuse, and image/video request surfaces. It may remain combined with
 `--vision`.
 
@@ -778,6 +779,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..10`; DFlash/DFlash2 `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
+| `--verify-tree` | DFlash2 verify trees; needs `--draft-tokens 15` and `--kv-dtype k8v4` | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |

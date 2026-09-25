@@ -1,5 +1,7 @@
 # DFlash and DFlash2
 
+> Modified by satellitedown for Cinference: DFlash2 verify trees with prompt-lookup chains.
+
 DFlash backends propose several tokens with one masked-block forward, conditioned on committed
 target hidden features. The target verifies the proposal causally and remains the output authority.
 NInfer implements DFlash and DFlash2 as optional components of the
@@ -269,6 +271,37 @@ F while target state advances to F+N. Before the next proposal, or before retain
 fork or Host replica, those features are materialized and context catches up. N=0 cancellation
 commits no new state and releases the sequence; it does not undo earlier adopted commits.
 
+## DFlash2 verify trees
+
+`--verify-tree` (DFlash2 with K=15, the K8V4 cache and 24x256 target attention) replaces the
+candidate path with a tree of K proposal nodes that shares the same 16 verify columns.
+
+Construction. A lattice node is candidate c at step i reached from its parent node, with
+conditional probability `softmax_c(E_i[parent,c] / 1.5)` and a score summing log-probabilities
+along its root path. Best-first selection of the P highest-scoring nodes (P = proposal extent)
+yields the union of the P most likely root paths. A prompt-lookup chain joins the same selection:
+the Host proposes the tokens that followed the latest earlier occurrence of the context's 8-, 4- or
+2-token suffix, and each chain node at depth d scores `d * log(pi)`, where pi is that window
+length's decayed rate of proposed tokens later committed. A lattice candidate that equals the
+chain token under a chain parent takes the better score; other chain tokens become chain-only
+nodes. Columns are the DFS pre-order of the tree with every node's children by increasing subtree
+size, so each node's largest subtree comes last. The selector writes each column's token, parent,
+ancestor-or-self column mask and RoPE position (root position plus depth).
+
+Verification. Every column attends the committed cache plus the columns of its mask. The GDN
+recurrence walks the columns in order; a branch node's state is pushed to a register stack after
+its transition and a later child restores the top (live branch states nest, so the top is always
+its parent, and at most log2(16) are live). Convolution taps come from the column's ancestors. A
+column's outputs therefore equal the chain computation along its root path.
+
+Acceptance walks from the root: greedy rows take the target argmax at the current node, sampling
+rows sample the target distribution of the current node (penalty history = the root path's
+drafts; RNG position = frontier + depth + 1), and the walk moves into the child carrying that
+token. The first node without one ends the round with its token as the correction or bonus. For
+a deterministic tree this is exactly target sampling. The accepted path's K8V4 cache rows, target
+hidden columns and pending draft features are then moved onto chain positions, and the ReplaySSM
+Fold replays the path's record columns, so the commit rules above apply unchanged.
+
 ## Backend storage and lifecycle
 
 Local draft layers store K/V in cyclic rings; full draft layers use paged KV. A full pool exists
@@ -299,7 +332,7 @@ target state and continuation metadata. Their coverage must agree. These rules a
 flowchart TD
     A["Committed target state + unprocessed anchor"] --> B["Materialize pending target features"]
     B --> C["One masked draft block"]
-    C --> D["Proposal head; DFlash2 conditional selector"]
+    C --> D["Proposal head; DFlash2 conditional selector or verify tree"]
     D --> E["Causal target verify; retain GDN records and target features"]
     E --> F["Target acceptance and correction"]
     F --> G["Frontend preview chooses N outputs"]

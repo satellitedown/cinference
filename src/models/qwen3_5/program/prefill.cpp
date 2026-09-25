@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: synchronize after the commit fold only when a context append staged host memory.
+// Modified by satellitedown for Cinference: fold sync only for staged appends; verify-tree folds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/program/program_impl.h"
@@ -803,8 +803,13 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     const auto tail_started = Clock::now();
     try {
         timing.resume_submit();
+        // Verify-tree rounds commit their accepted path's record columns.
+        const Tensor record_columns =
+            is_masked_draft_backend(speculative_backend) && io.dflash_decode
+                ? io.dflash_decode->accepted_columns
+                : Tensor{};
         replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
-                             device.stream);
+                             record_columns, device.stream);
 
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
         if (speculative_backend == SpeculativeBackend::DFlash2) {

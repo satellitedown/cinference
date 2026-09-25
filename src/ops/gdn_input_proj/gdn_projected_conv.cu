@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: preload short-width projected inputs before the token loop.
+// Modified by satellitedown for Cinference: preload short-width inputs; verify-tree taps.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
@@ -13,17 +13,22 @@
 
 namespace ninfer::ops::detail {
 namespace {
-
 // MaxWidth > 0 bounds the width at compile time: every projected input of the row is loaded up
 // front, so the per-token loads overlap instead of serializing one global-load latency per token.
-template <int Channels, int QueryRows, int KeyRows, int ValueRows, int MaxWidth, class Publish>
+// Tree: tree_parents (I32 [width, B]) holds DFS pre-order verify trees; a token's taps are the
+// inputs before it on its root path, staged per thread in shared memory.
+template <int Channels, int QueryRows, int KeyRows, int ValueRows, int MaxWidth, int Threads,
+          bool Tree, class Publish>
 __global__ void gdn_projected_conv_kernel(
     const __nv_bfloat16* __restrict__ projected, const __nv_bfloat16* __restrict__ conv_weight,
     const __nv_bfloat16* __restrict__ state_read, const std::int32_t* __restrict__ valid_columns,
-    const std::int32_t* __restrict__ initial_state_slots, __nv_bfloat16* __restrict__ query,
+    const std::int32_t* __restrict__ initial_state_slots,
+    const std::int32_t* __restrict__ tree_parents, __nv_bfloat16* __restrict__ query,
     __nv_bfloat16* __restrict__ key, __nv_bfloat16* __restrict__ value, std::int32_t width,
     Publish publish) {
     static_assert(Channels == QueryRows + KeyRows + ValueRows);
+    static_assert(!Tree || MaxWidth > 0);
+    __shared__ float staged[Tree ? MaxWidth : 1][Threads];
     const std::int32_t row = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
     if (row >= Channels) { return; }
     const std::int32_t batch = static_cast<std::int32_t>(blockIdx.y);
@@ -82,10 +87,31 @@ __global__ void gdn_projected_conv_kernel(
         for (std::int32_t token = 0; token < MaxWidth; ++token) {
             inputs[token] = token < valid ? input(token) : 0.0F;
         }
+        if constexpr (Tree) {
+            const std::uint64_t parents = gdn_pack_tree_parents(
+                tree_parents + static_cast<std::int64_t>(batch) * width, width);
 #pragma unroll
-        for (std::int32_t token = 0; token < MaxWidth; ++token) {
-            if (token >= width) { break; }
-            step(token, inputs[token]);
+            for (std::int32_t token = 0; token < MaxWidth; ++token) {
+                staged[token][threadIdx.x] = inputs[token];
+            }
+            const float h0 = s0;
+            const float h1 = s1;
+            const float h2 = s2;
+            const auto tap = [&](int column) { return staged[column][threadIdx.x]; };
+#pragma unroll
+            for (std::int32_t token = 0; token < MaxWidth; ++token) {
+                if (token >= width) { break; }
+                if (token < valid) {
+                    gdn_tree_conv_taps(parents, token, h0, h1, h2, tap, s0, s1, s2);
+                }
+                step(token, inputs[token]);
+            }
+        } else {
+#pragma unroll
+            for (std::int32_t token = 0; token < MaxWidth; ++token) {
+                if (token >= width) { break; }
+                step(token, inputs[token]);
+            }
         }
     } else {
         for (std::int32_t token = 0; token < width; ++token) {
@@ -96,13 +122,14 @@ __global__ void gdn_projected_conv_kernel(
 
 template <int Channels, int QueryRows, int KeyRows, int ValueRows, class Publish>
 void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& state_read,
-            const Tensor& valid_columns, const Tensor& initial_state_slots, Tensor& query,
-            Tensor& key, Tensor& value, Publish publish, cudaStream_t stream) {
+            const Tensor& valid_columns, const Tensor& initial_state_slots,
+            const Tensor& tree_parents, Tensor& query, Tensor& key, Tensor& value, Publish publish,
+            cudaStream_t stream) {
     const std::int32_t width = projected.ne[1];
     const std::int32_t batch = projected.ne[2];
-    const auto run           = [&]<int MaxWidth, int Threads>() {
+    const auto run           = [&]<int MaxWidth, int Threads, bool Tree>() {
         const dim3 grid((Channels + Threads - 1) / Threads, static_cast<unsigned>(batch));
-        gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, MaxWidth>
+        gdn_projected_conv_kernel<Channels, QueryRows, KeyRows, ValueRows, MaxWidth, Threads, Tree>
             <<<grid, Threads, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(projected.data),
                 static_cast<const __nv_bfloat16*>(conv_weight.data),
@@ -111,34 +138,41 @@ void launch(const Tensor& projected, const Tensor& conv_weight, const Tensor& st
                     ? nullptr
                     : static_cast<const std::int32_t*>(valid_columns.data),
                 static_cast<const std::int32_t*>(initial_state_slots.data),
+                static_cast<const std::int32_t*>(tree_parents.data),
                 static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
                 static_cast<__nv_bfloat16*>(value.data), width, publish);
     };
     // Short speculative widths use narrow CTAs so a single row of work spreads over the SMs.
-    if (width <= 4) {
-        run.template operator()<4, 64>();
+    if (tree_parents.data != nullptr) {
+        if (width > 16) { throw std::invalid_argument("GDN tree convolution supports T <= 16"); }
+        run.template operator()<16, 64, true>();
+    } else if (width <= 4) {
+        run.template operator()<4, 64, false>();
     } else if (width <= 16) {
-        run.template operator()<16, 64>();
+        run.template operator()<16, 64, false>();
     } else {
-        run.template operator()<0, 256>();
+        run.template operator()<0, 256, false>();
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <class Publish>
 void dispatch(const Tensor& projected, const Tensor& conv_weight, const Tensor& state_read,
-              const Tensor& valid_columns, const Tensor& initial_state_slots, Tensor& query,
-              Tensor& key, Tensor& value, Publish publish, cudaStream_t stream) {
+              const Tensor& valid_columns, const Tensor& initial_state_slots,
+              const Tensor& tree_parents, Tensor& query, Tensor& key, Tensor& value,
+              Publish publish, cudaStream_t stream) {
     if (projected.ne[0] == 10240 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
         value.ne[0] == 6144) {
         launch<10240, 2048, 2048, 6144>(projected, conv_weight, state_read, valid_columns,
-                                        initial_state_slots, query, key, value, publish, stream);
+                                        initial_state_slots, tree_parents, query, key, value,
+                                        publish, stream);
         return;
     }
     if (projected.ne[0] == 8192 && query.ne[0] == 2048 && key.ne[0] == 2048 &&
         value.ne[0] == 4096) {
         launch<8192, 2048, 2048, 4096>(projected, conv_weight, state_read, valid_columns,
-                                       initial_state_slots, query, key, value, publish, stream);
+                                       initial_state_slots, tree_parents, query, key, value,
+                                       publish, stream);
         return;
     }
     throw std::invalid_argument("GDN projected-conv received an unregistered geometry");
@@ -151,8 +185,8 @@ void gdn_projected_conv_snapshot_launch(const Tensor& projected, const Tensor& c
                                         const Tensor& initial_state_slots,
                                         const Tensor& snapshot_base_slots, Tensor& query,
                                         Tensor& key, Tensor& value, cudaStream_t stream) {
-    dispatch(projected, conv_weight, conv_states, valid_columns, initial_state_slots, query, key,
-             value,
+    dispatch(projected, conv_weight, conv_states, valid_columns, initial_state_slots, Tensor{},
+             query, key, value,
              SnapshotHistoryPublish{static_cast<__nv_bfloat16*>(conv_states.data),
                                     static_cast<const std::int32_t*>(snapshot_base_slots.data),
                                     projected.ne[0]},
@@ -161,10 +195,11 @@ void gdn_projected_conv_snapshot_launch(const Tensor& projected, const Tensor& c
 
 void gdn_projected_conv_record_launch(const Tensor& conv_record, const Tensor& conv_weight,
                                       const Tensor& conv_states, const Tensor& valid_columns,
-                                      const Tensor& initial_state_slots, Tensor& query, Tensor& key,
-                                      Tensor& value, cudaStream_t stream) {
-    dispatch(conv_record, conv_weight, conv_states, valid_columns, initial_state_slots, query, key,
-             value, NoHistoryPublish{}, stream);
+                                      const Tensor& initial_state_slots, const Tensor& tree_parents,
+                                      Tensor& query, Tensor& key, Tensor& value,
+                                      cudaStream_t stream) {
+    dispatch(conv_record, conv_weight, conv_states, valid_columns, initial_state_slots,
+             tree_parents, query, key, value, NoHistoryPublish{}, stream);
 }
 
 } // namespace ninfer::ops::detail

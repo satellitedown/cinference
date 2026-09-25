@@ -1,11 +1,16 @@
+// Modified by satellitedown for Cinference: speculative verify-tree acceptance.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
+#include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <span>
 
 namespace ninfer::ops {
 
@@ -159,6 +164,72 @@ void speculative_accept_sparse_drafts(
     Tensor& round_lengths, Tensor& round_anchors, Tensor& licensed_tokens, Tensor& licensed_counts,
     Tensor& accepted_drafts, std::int32_t token_domain, const SamplingConfig* configs,
     SpeculativeAcceptExecutionEnvelope envelope, WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Op: speculative_accept_tree_drafts
+ *
+ * Algorithm:
+ *   Verify-tree form of speculative acceptance. For row b let P=clamp(current_extents[b],0,K);
+ *   columns 0..P are live. Column 0 is the root (the round anchor) and live column c>=1 is a
+ *   drafted node whose token is drafts[c-1,b] and whose parent is column tree_parents[c,b] < c;
+ *   children of one node carry distinct tokens. Starting at the root, the walk takes the target's
+ *   token for the current node's column and moves into the child carrying it; the first node
+ *   without such a child ends the walk and its target token is the correction/bonus terminal.
+ *   Greedy rows use the penalty-adjusted target argmax. Positive-temperature rows sample every
+ *   visited node's token from its sampling.h distribution (RNG purpose speculative bonus, logical
+ *   position old length + node depth + 1), which keeps the output distribution exactly the
+ *   target's for a deterministic tree. Column c's penalty overlay is the drafted tokens on c's
+ *   root path (c included).
+ *
+ * Logical shapes and registered profile:
+ *   As speculative_accept_sparse_drafts, without candidate_ids/proposal_q, plus tree_parents I32
+ *   [K+1,B] and accepted_columns I32 [K+1,B].
+ *
+ * Effects:
+ *   Let A be the accepted path length and L=A+1. licensed_tokens[0:A,b] receives the path's
+ *   drafts, licensed_tokens[A,b] the terminal, and the physical tail is zero. accepted_columns
+ *   [j,b] is the column of the path's j-th node (the root at j=0) for j<=A and j beyond it.
+ *   licensed_counts, accepted_drafts, round_anchors and round_lengths are as in the sparse form.
+ *
+ * Workspace:
+ *   speculative_accept_sparse_drafts_workspace_capacity_bytes() of the same profile.
+ */
+void speculative_accept_tree_drafts(const Tensor& target_tokens, const Tensor& logits,
+                                    const Tensor& drafts, const Tensor& tree_parents,
+                                    const Tensor& current_extents, Tensor& round_lengths,
+                                    Tensor& round_anchors, Tensor& licensed_tokens,
+                                    Tensor& licensed_counts, Tensor& accepted_drafts,
+                                    Tensor& accepted_columns, std::int32_t token_domain,
+                                    const SamplingConfig* configs,
+                                    SpeculativeAcceptExecutionEnvelope envelope,
+                                    WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Op: speculative_compact_columns
+ *
+ * Moves each row's accepted verify-tree path onto the chain columns in place: for batch row b
+ * with A = accepted[b] and r = rows[b] (b when rows is empty), values[:, j, r] receives the
+ * pre-call values[:, accepted_columns[j,b], r] for 1 <= j <= A. values is contiguous BF16 [D,W,R];
+ * accepted_columns is I32 [W,B] with the path layout of speculative_accept_tree_drafts; accepted
+ * and rows are I32 [B]. Other columns and rows are unchanged.
+ */
+void speculative_compact_columns(Tensor& values, const Tensor& rows, const Tensor& accepted_columns,
+                                 const Tensor& accepted, cudaStream_t stream);
+
+/**
+ * Op: speculative_compact_k8v4_kv
+ *
+ * The K8V4 paged-cache counterpart for every given attention layer: for 1 <= j <= accepted[b],
+ * row b's cache row at cache_positions[accepted_columns[j,b],b] moves to cache_positions[j,b]
+ * (FP8 K codes and scale, NVFP4 V codes and scales, all KV heads), through table row
+ * kv_table_rows[b]. cache_positions and accepted_columns are I32 [W,B], the verify columns' cache
+ * positions and the path layout of speculative_accept_tree_drafts. The layers share one block
+ * table. Other cache rows are unchanged.
+ */
+void speculative_compact_k8v4_kv(std::span<const PagedKVBatchLayerView> layers,
+                                 const Tensor& kv_table_rows, const Tensor& cache_positions,
+                                 const Tensor& accepted_columns, const Tensor& accepted,
+                                 cudaStream_t stream);
 
 /**
  * Op: speculative_select_accepted_hidden

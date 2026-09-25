@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: pass no next-layer state hint.
+// Modified by satellitedown for Cinference: no next-layer state hint; accepted-path folds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -82,9 +82,31 @@ std::vector<std::int32_t> selected_slots(std::int32_t rows) {
     return slots;
 }
 
+// path: each row commits a strictly increasing record-column path starting at column 0 (a
+// verify tree's accepted path) instead of its record prefix.
 int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
              const std::vector<std::int32_t>& commits, std::uint32_t seed,
-             bool distinct_destination = false) {
+             bool distinct_destination = false, bool path = false) {
+    std::vector<std::int32_t> record_columns(static_cast<std::size_t>(width) * kRecordCapacity);
+    for (std::int32_t row = 0; row < kRecordCapacity; ++row) {
+        for (std::int32_t j = 0; j < width; ++j) record_columns[row * width + j] = j;
+        const std::int32_t commit = row < rows ? commits[static_cast<std::size_t>(row)] : 0;
+        if (!path || commit <= 1) continue;
+        // Choose commit - 1 increasing columns from [1, width).
+        std::vector<std::int32_t> chosen;
+        std::uint32_t state = seed * 747796405U + row * 2891336453U;
+        for (std::int32_t column = 1; column < width; ++column) {
+            state                        = state * 1664525U + 1013904223U;
+            const std::int32_t remaining = width - column;
+            const std::int32_t needed    = commit - 1 - static_cast<std::int32_t>(chosen.size());
+            if (needed > 0 && (needed == remaining || (state >> 24) % 2 == 0))
+                chosen.push_back(column);
+        }
+        for (std::int32_t j = 1; j < commit; ++j) record_columns[row * width + j] = chosen[j - 1];
+    }
+    const auto record_column = [&](std::int32_t row, std::int32_t token) {
+        return record_columns[static_cast<std::size_t>(row) * width + token];
+    };
     const std::vector<std::int32_t> source_slots = selected_slots(rows);
     std::vector<std::int32_t> destination_slots  = source_slots;
     if (distinct_destination) { destination_slots[0] = rows == 1 ? 1 : 3; }
@@ -227,7 +249,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
                     const auto record_value = [&](std::int32_t token) {
                         return conv_records[static_cast<std::size_t>(
-                                                (record_outer * width + token) *
+                                                (record_outer * width + record_column(row, token)) *
                                                 profile.conv_channels) +
                                             channel];
                     };
@@ -318,9 +340,11 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             }
             g_row.copy_from_host(g_host.data(), g_row.bytes);
             beta_row.copy_from_host(beta_host.data(), beta_row.bytes);
-            // Snapshot each transition of the same full W record block. Saving N must not
-            // change the input width or regenerate any projection at N.
-            for (int token = 0; token < width; ++token) {
+            // Snapshot each transition of the same full W record block (the committed path's
+            // columns in order). Saving N must not change the input width or regenerate any
+            // projection at N.
+            for (int step = 0; step < (path ? commit : width); ++step) {
+                const int token = path ? record_column(row, step) : step;
                 Tensor query = q_tensor.slice(2, token, 1).view({kStateDim, kQkHeads, 1});
                 Tensor key   = layer_records.key.slice(3, row, 1)
                                  .slice(2, token, 1)
@@ -337,7 +361,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                 ops::gated_delta_net(query, key, value, g_tensor, beta_tensor, kScale, true,
                                      reference_workspace, local_state_tensor, output_token,
                                      nullptr);
-                if (token + 1 == commit)
+                if (step + 1 == commit)
                     cuda_check(cudaMemcpyAsync(expected, local_state.p, recurrent_slot_bytes,
                                                cudaMemcpyDeviceToDevice, nullptr),
                                "save Nth snapshot");
@@ -355,6 +379,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             commits[static_cast<std::size_t>(row)]};
     }
     const ops::GdnReplayFoldPlan fold_plan(records, state_pool.all_layers_view());
+    DeviceBuffer record_column_buffer = to_device(record_columns);
+    const Tensor record_column_tensor =
+        path ? Tensor(record_column_buffer.p, DType::I32, {width, kRecordCapacity}) : Tensor{};
     if (width == 16 && rows == 8) {
         cuda_synchronize();
         DeviceBuffer original(state_bytes);
@@ -363,7 +390,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         DeviceContext context;
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;
-        definition.capture(context.stream, [&] { fold_plan.execute(fold_rows, context.stream); });
+        definition.capture(context.stream, [&] {
+            fold_plan.execute(fold_rows, record_column_tensor, context.stream);
+        });
         graph.instantiate(definition);
         // Host row descriptors are captured by value. Restore GPU state between replays.
         for (int replay = 0; replay < 2; ++replay) {
@@ -374,7 +403,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             context.synchronize();
         }
     } else {
-        fold_plan.execute(fold_rows, nullptr);
+        fold_plan.execute(fold_rows, record_column_tensor, nullptr);
         cuda_synchronize();
     }
 
@@ -696,7 +725,7 @@ int run_record_fold_rounds() {
             ops::gated_delta_net_replay_record(
                 record_q_view, record_k_view, record_v_view, g, beta, kScale, recurrent_states,
                 valid, initial_selector, layer_records.key, layer_records.value, layer_records.gate,
-                record_output, Tensor{}, nullptr);
+                record_output, Tensor{}, Tensor{}, nullptr);
             cuda_synchronize();
 
             const std::string label = "record-fold pair round=" + std::to_string(round) +
@@ -725,7 +754,7 @@ int run_record_fold_rounds() {
         }
 
         const std::array fold_rows{ops::GdnReplayFoldRow{kInitialSlot, kInitialSlot, commit}};
-        fold_plan.execute(fold_rows, nullptr);
+        fold_plan.execute(fold_rows, Tensor{}, nullptr);
         cuda_synchronize();
         for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
             const Tensor folded_recurrent =
@@ -775,6 +804,8 @@ int main() {
     failures += run_case({30, 32, 8192}, 6, 1, {6}, 1841U);
     failures += run_case({30, 32, 8192}, 6, 2, {2, 5}, 1851U);
     failures += run_case({30, 32, 8192}, 16, 8, {0, 1, 2, 3, 16, 7, 12, 5}, 1861U);
+    failures += run_case({48, 48, 10240}, 16, 8, {1, 2, 3, 4, 7, 13, 5, 9}, 1871U, true, true);
+    failures += run_case({48, 48, 10240}, 16, 1, {12}, 1873U, false, true);
     failures += run_record_fold_rounds();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;

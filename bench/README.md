@@ -1,6 +1,7 @@
 # Benchmarks
 
-> Modified by satellitedown for Cinference: product-benchmark MTP range updated to 1..10.
+> Modified by satellitedown for Cinference: product-benchmark MTP range updated to 1..10;
+> DFlash2 `--verify-tree`.
 > Retained measurements are upstream NInfer results, not new Cinference or Huihui benchmarks.
 
 `ninfer_bench` measures the complete public `ninfer::Engine` route against a `.ninfer` artifact.
@@ -60,7 +61,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>]
-          [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
+          [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft] [--verify-tree]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
 ```
@@ -76,8 +77,8 @@ Example:
 ```
 
 Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (MTP K=1..10, DFlash/DFlash2
-K=1..15); `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
-enabled by default.
+K=1..15); `--lm-head-draft` selects the optimized proposal head and `--verify-tree` DFlash2 verify
+trees (K=15, `--kv-dtype k8v4`). CUDA Graph decode is enabled by default.
 
 The separate `ninfer_qwen3_5_mtp_round_bench` and `ninfer_sampling_select_bench` microbenchmarks
 retain their own 1..5 MTP input limits. Those limits do not describe the product Engine's 1..10 range.

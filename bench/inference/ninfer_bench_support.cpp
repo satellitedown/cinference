@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: correct the advertised MTP draft window to 1..10.
+// Modified by satellitedown for Cinference: advertise MTP windows 1..10; parse --verify-tree.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "ninfer_bench_support.h"
@@ -306,6 +306,8 @@ std::string usage_text(std::string_view program) {
         << "  --draft-tokens <n>         MTP 1..10; DFlash/DFlash2 1..15\n"
         << "  --lm-head-draft             use the optimized proposal head; requires a speculative "
            "backend\n"
+        << "  --verify-tree               verify a draft tree; requires --spec dflash2 "
+           "--draft-tokens 15\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
@@ -362,6 +364,8 @@ BenchOptions parse_args(int argc, char** argv) {
             options.speculative.draft_tokens = parse_u32(value("--draft-tokens"), "draft-tokens");
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
+        } else if (arg == "--verify-tree") {
+            options.speculative.verify_tree = true;
         } else if (arg == "--device") {
             options.device = parse_nonnegative(value("--device"), "device");
         } else if (arg == "--no-cuda-graph") {

@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: let replay records warm the next layer's state.
+// Modified by satellitedown for Cinference: next-layer state warming and verify-tree records.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -100,12 +100,20 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
  * next_states is empty or shaped like ssm_states (typically the next layer's pool). Its tiles at
  * initial_state_slots are only requested into L2, for a following record that reads them; it is
  * never read into registers and does not affect any result.
+ *
+ * tree_parents is empty for chains or device I32 [T,B] describing one verify tree per row: with
+ * V the row's valid extent, tree_parents[0,b] is the root (ignored) and 0 <= tree_parents[c,b] < c
+ * for 1 <= c < V. Columns are in DFS pre-order (a node's first child is the next column) with
+ * every node's largest subtree last, so at most four branch states are live at once. Column c's
+ * transition then starts from its parent's state instead of column c-1's: every valid output is
+ * bit-identical to the chain execution of c's root path, and records stay per column.
  */
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   const Tensor& next_states, cudaStream_t stream);
+                                   const Tensor& next_states, const Tensor& tree_parents,
+                                   cudaStream_t stream);
 
 } // namespace ninfer::ops

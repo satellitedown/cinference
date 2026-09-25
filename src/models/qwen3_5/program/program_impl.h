@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: per-sequence prompt-lookup state.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 #include "models/qwen3_5/program/internal.h"
 
@@ -15,6 +18,7 @@
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
+#include "models/qwen3_5/program/speculative/prompt_lookup.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -362,6 +366,8 @@ struct SequenceState {
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
+    // Verify-tree rounds: the ledger's prompt-lookup index and proposal statistics.
+    qwen3_5::PromptLookup prompt_lookup;
     bool tail_hidden_valid        = false;
     bool endpoint_valid           = false;
     RewriteCheckpoint rewrite_checkpoint;

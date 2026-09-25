@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: verify-tree taps in the FP8 record-producing form.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 // ninfer::ops - fused GDN Q/K/V/Z input projections.
@@ -224,13 +227,19 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
  * uses A16 under A16Only/AllowA8 and may use A4 under AllowA4. FP8 may use A8 under
  * AllowA8/AllowA4. Record and snapshot share arithmetic route selection. Every tensor operand, the
  * complete FP8 parent, and live workspace must be mutually non-overlapping.
+ *
+ * tree_parents is empty or, for the FP8 parent only, device I32 [T,B] holding one verify tree per
+ * row in DFS pre-order (0 <= tree_parents[c,b] < c for 1 <= c < valid; column 0 is the root).
+ * A column's taps are then the three inputs before it on its root path, with the initial history
+ * before the root, so each valid output equals the chain execution of its root path bit for bit.
+ * Records still hold every column's own projected input.
  */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
                                 const Tensor& conv_weight, const Tensor& conv_states,
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
-                                Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                                Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
-                                cudaStream_t stream);
+                                const Tensor& tree_parents, Tensor& conv_record, Tensor& query,
+                                Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
+                                WorkspaceArena& workspace, cudaStream_t stream);
 
 /** Applies the A16-only single-parent record-producing form. */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,

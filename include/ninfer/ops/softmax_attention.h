@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: speculative verify-tree masks for K8V4 attention.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "ninfer/ops/attention_geometry.h"
@@ -132,11 +135,19 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * Inputs, output, every cache plane/table, and live workspace suballocations are pairwise
  * non-overlapping. The Op overwrites every addressed cache row but owns no cache allocation,
  * frontier, request identity, or commit authority.
+ *
+ * tree_masks is empty for causal chains, or device I32 [16,B] for one speculative verify tree per
+ * row (masked K8V4 cache, [256,24,4] geometry, W=16). Row b's live columns then hold consecutive
+ * positions positions[j,b] = positions[0,b] + j and tree_masks[j,b] is column j's ancestor-or-self
+ * column set (bit i = column i, bit j set, ancestors precede descendants). Column j attends cache
+ * rows [0, positions[0,b]) plus the rows positions[0,b] + i of its mask; the K/V rows of all live
+ * columns are appended as before.
  */
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
-                              const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
-                              float scale, PagedKVBatchLayerView cache,
+                              const Tensor& tree_masks, const Tensor& kv_table_rows,
+                              AttentionHeadGeometry geometry, float scale,
+                              PagedKVBatchLayerView cache,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, cudaStream_t stream);
 
@@ -163,6 +174,14 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     AttentionHeadGeometry geometry, KvCacheStorage cache_storage,
     CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size, std::int32_t min_tokens,
     std::int32_t max_tokens);
+
+/**
+ * Transient capacity of a verify-tree call (K8V4, [256,24,4], W=16) at one exact batch size. Tree
+ * calls always run the small-T kernel, so the chain capacity above may not cover them.
+ */
+[[nodiscard]] std::size_t
+causal_softmax_attention_tree_workspace_capacity_bytes(CausalAttentionExecutionEnvelope envelope,
+                                                       std::int32_t batch_size);
 
 /**
  * Non-causal grouped-query attention over persistent context plus one live query block.

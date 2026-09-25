@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: fused FFN, input-norm and norm-RoPE; GDN prefetch.
+// Modified by satellitedown for Cinference: fused FFN/input-norm/norm-RoPE; GDN prefetch; trees.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/program/internal.h"
@@ -381,7 +381,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
                                         active_sequence_batch_});
         Tensor position_batch = positions.view({width, active_sequence_batch_});
         ops::causal_softmax_attention(
-            q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
+            q_batch, k_batch, v_batch, position_batch, *active_valid_columns_, Tensor{},
             *active_backend_kv_table_rows_,
             {dimension(config_.attention->head_dim),
              dimension(config_.attention->num_attention_heads),
@@ -390,7 +390,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
             batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
     } else {
         ops::causal_softmax_attention(
-            qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
+            qn, kn, v, positions, Tensor{}, Tensor{}, io_.backend_kv_table_row,
             {dimension(config_.attention->head_dim),
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
@@ -904,7 +904,8 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         ops::causal_softmax_attention(
-            q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
+            q_batch, k_batch, v_batch, position_batch, valid,
+            verify_tree_masks_ != nullptr ? *verify_tree_masks_ : Tensor{}, kv_table_rows,
             {dimension(config_.attention->head_dim),
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
@@ -913,7 +914,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             a_batch, s);
     } else {
         ops::causal_softmax_attention(
-            qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
+            qn, kn, v, cache_positions, Tensor{}, Tensor{}, kv_table_rows,
             {dimension(config_.attention->head_dim),
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
@@ -974,9 +975,11 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
-            gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
-                                  *active_linear_state_source_slots_, records.conv, query_output,
-                                  key_output, value_output, gate_output, work_, s);
+            gdn_projection_record(
+                projection_input, p, *config_.gdn, conv_states, valid,
+                *active_linear_state_source_slots_,
+                verify_tree_parents_ != nullptr ? *verify_tree_parents_ : Tensor{}, records.conv,
+                query_output, key_output, value_output, gate_output, work_, s);
         } else {
             gdn_projection_snapshot(projection_input, p, *config_.gdn, conv_states, valid,
                                     *active_linear_state_source_slots_,
@@ -1037,7 +1040,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 static_cast<float>(
                     1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
                 recurrent_states, valid, *active_linear_state_source_slots_, records.key,
-                records.value, records.gate, out_batch, next_states, s);
+                records.value, records.gate, out_batch, next_states,
+                verify_tree_parents_ != nullptr ? *verify_tree_parents_ : Tensor{}, s);
         } else {
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,

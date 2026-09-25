@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: wide kernel, split PV tails, prepared query, discards.
+// Modified by satellitedown for Cinference: wide kernel, split PV tails, verify-tree masks.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -473,6 +473,13 @@ __device__ __forceinline__ void k8v4_pv_pair(float (&acc)[4], const unsigned (&p
     acc[3] += bottom.y;
 }
 
+// Key visibility of one query row: every key before `base`, then the keys at or before the query
+// position qabs whose offset from base is set in the row's ancestor-or-self column mask. A causal
+// chain passes base = qabs + 1, which leaves exactly the keys at or before qabs.
+__device__ __forceinline__ bool k8v4_key_visible(int key, int qabs, int base, unsigned mask) {
+    return key < base || (key <= qabs && ((mask >> (key - base)) & 1U) != 0U);
+}
+
 // Scores one 16-row x Bc-key tile: scales, causal/split masking and the online-softmax update of
 // the row statistics. Leaves P (unnormalized, <= 1) in `score` and the row rescale factors.
 //
@@ -482,7 +489,8 @@ __device__ __forceinline__ void k8v4_pv_pair(float (&acc)[4], const unsigned (&p
 template <typename Geometry, int QKNt>
 __device__ __forceinline__ void
 k8v4_softmax_tile(float (&score)[QKNt][4], const __half* k_scale, float q_scale_r0,
-                  float q_scale_r1, bool row0_valid, bool row1_valid, int qabs0, int qabs1, int k0,
+                  float q_scale_r1, bool row0_valid, bool row1_valid, int qabs0, int qabs1,
+                  int base0, int base1, unsigned mask0, unsigned mask1, int k0,
                   const K8V4SplitRange& range, float attention_scale, int lid, float& m0, float& m1,
                   float& l0, float& l1, float& alpha0, float& alpha1) {
     constexpr float Log2E       = 1.4426950408889634074F;
@@ -501,7 +509,7 @@ k8v4_softmax_tile(float (&score)[QKNt][4], const __half* k_scale, float q_scale_
     const int last_key  = k0 + QKNt * 8 - 1;
     const bool unmasked = __all_sync(
         FullMask, row0_valid && row1_valid && k0 >= range.split_start &&
-                      last_key < range.split_end && last_key <= qabs0 && last_key <= qabs1);
+                      last_key < range.split_end && last_key < base0 && last_key < base1);
     float bm0 = -CUDART_INF_F;
     float bm1 = -CUDART_INF_F;
     if (unmasked) {
@@ -519,14 +527,18 @@ k8v4_softmax_tile(float (&score)[QKNt][4], const __half* k_scale, float q_scale_
             const int key1 = key0 + 1;
             const bool in0 = key0 >= range.split_start && key0 < range.split_end;
             const bool in1 = key1 >= range.split_start && key1 < range.split_end;
-            score[nt][0] =
-                row0_valid && in0 && key0 <= qabs0 ? score[nt][0] * attention_scale : -CUDART_INF_F;
-            score[nt][1] =
-                row0_valid && in1 && key1 <= qabs0 ? score[nt][1] * attention_scale : -CUDART_INF_F;
-            score[nt][2] =
-                row1_valid && in0 && key0 <= qabs1 ? score[nt][2] * attention_scale : -CUDART_INF_F;
-            score[nt][3] =
-                row1_valid && in1 && key1 <= qabs1 ? score[nt][3] * attention_scale : -CUDART_INF_F;
+            score[nt][0]   = row0_valid && in0 && k8v4_key_visible(key0, qabs0, base0, mask0)
+                                 ? score[nt][0] * attention_scale
+                                 : -CUDART_INF_F;
+            score[nt][1]   = row0_valid && in1 && k8v4_key_visible(key1, qabs0, base0, mask0)
+                                 ? score[nt][1] * attention_scale
+                                 : -CUDART_INF_F;
+            score[nt][2]   = row1_valid && in0 && k8v4_key_visible(key0, qabs1, base1, mask1)
+                                 ? score[nt][2] * attention_scale
+                                 : -CUDART_INF_F;
+            score[nt][3]   = row1_valid && in1 && k8v4_key_visible(key1, qabs1, base1, mask1)
+                                 ? score[nt][3] * attention_scale
+                                 : -CUDART_INF_F;
             bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
             bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
         }
@@ -584,17 +596,20 @@ __device__ __forceinline__ unsigned k8v4_half2_bits(float lo, float hi) {
 // ----------------------------------------------------------------------------------------------
 // Narrow blocks: producer warps score, all warps multiply P by V.
 
+// Tree: tree_masks (I32 [full_width, B], laid out like positions) gives every query column its
+// ancestor-or-self columns of a verify tree whose columns occupy consecutive cache positions from
+// the row's column 0; such a column sees the keys before column 0 and its ancestors' keys only.
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
-          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput>
+          bool DynamicArena, bool MultiBatch, bool Masked, bool Tree, typename CacheInput>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void causal_attention_small_t_k8v4_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
         std::uint8_t* cache_k, std::uint8_t* cache_v, __half* cache_k_scale,
         std::uint8_t* cache_v_scale, const std::int32_t* block_tables,
-        const std::int32_t* valid_columns, const std::int32_t* table_rows,
-        std::int32_t table_stride, std::int32_t full_width, std::int32_t column_begin,
-        std::int32_t logical_capacity, float attention_scale, float* partial_acc, float* partial_m,
-        float* partial_l) {
+        const std::int32_t* valid_columns, const std::int32_t* tree_masks,
+        const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
+        std::int32_t column_begin, std::int32_t logical_capacity, float attention_scale,
+        float* partial_acc, float* partial_m, float* partial_l) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -654,6 +669,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
     q += static_cast<std::int64_t>(D) * Geometry::QHeads * column_base;
     positions += column_base;
+    if constexpr (Tree) { tree_masks += column_base; }
     if constexpr (CacheInput::writes_cache) {
         input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
         input.v += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
@@ -727,6 +743,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     float q_scale_r1 = 0.0F;
     int qabs0        = -1;
     int qabs1        = -1;
+    int base0        = 0;
+    int base1        = 0;
+    unsigned mask0   = 0U;
+    unsigned mask1   = 0U;
     if (warp < RowTiles) {
         const int row0 = warp * 16 + gid;
         const int row1 = row0 + 8;
@@ -737,6 +757,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head, token1);
         qabs0 = row0 < RowCount ? positions[token0] : -1;
         qabs1 = row1 < RowCount ? positions[token1] : -1;
+        base0 = qabs0 + 1;
+        base1 = qabs1 + 1;
+        if constexpr (Tree) {
+            base0 = row0 < RowCount ? positions[0] : 0;
+            base1 = row1 < RowCount ? positions[0] : 0;
+            mask0 = row0 < RowCount ? static_cast<unsigned>(tree_masks[token0]) : 0U;
+            mask1 = row1 < RowCount ? static_cast<unsigned>(tree_masks[token1]) : 0U;
+        }
     }
 
     float acc[PVNtPerWarp][4];
@@ -789,9 +817,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int row0 = row_base + gid;
             float alpha0   = 0.0F;
             float alpha1   = 0.0F;
-            k8v4_softmax_tile<Geometry, QKNt>(
-                score, k_scale_s, q_scale_r0, q_scale_r1, row0 < RowCount, row0 + 8 < RowCount,
-                qabs0, qabs1, k0, range, attention_scale, lid, m0, m1, l0, l1, alpha0, alpha1);
+            k8v4_softmax_tile<Geometry, QKNt>(score, k_scale_s, q_scale_r0, q_scale_r1,
+                                              row0 < RowCount, row0 + 8 < RowCount, qabs0, qabs1,
+                                              base0, base1, mask0, mask1, k0, range,
+                                              attention_scale, lid, m0, m1, l0, l1, alpha0, alpha1);
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int col0 = nt * 8 + 2 * lid;
@@ -975,16 +1004,17 @@ __device__ __forceinline__ void k8v4_bar_arrive(int id, int threads) {
     asm volatile("bar.arrive %0, %1;" ::"r"(id), "r"(threads) : "memory");
 }
 
-template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, bool Tree,
+          typename CacheInput>
 __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
     void causal_attention_small_t_k8v4_wide_kernel(
         const std::uint8_t* query_codes, const float* query_scales, CacheInput input,
         const std::int32_t* positions, std::uint8_t* cache_k, std::uint8_t* cache_v,
         __half* cache_k_scale, std::uint8_t* cache_v_scale, const std::int32_t* block_tables,
-        const std::int32_t* valid_columns, const std::int32_t* table_rows,
-        std::int32_t table_stride, std::int32_t full_width, std::int32_t column_begin,
-        std::int32_t logical_capacity, float attention_scale, float* partial_acc, float* partial_m,
-        float* partial_l) {
+        const std::int32_t* valid_columns, const std::int32_t* tree_masks,
+        const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
+        std::int32_t column_begin, std::int32_t logical_capacity, float attention_scale,
+        float* partial_acc, float* partial_m, float* partial_l) {
     using Schedule         = K8V4WideSchedule<Geometry, TokenTile>;
     namespace barrier      = k8v4_wide_barrier;
     constexpr int RowCount = Schedule::RowCount;
@@ -1056,6 +1086,7 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
     std::int64_t column_base = column_begin;
     if constexpr (MultiBatch) { column_base += static_cast<std::int64_t>(batch) * full_width; }
     positions += column_base;
+    if constexpr (Tree) { tree_masks += column_base; }
     if constexpr (CacheInput::writes_cache) {
         input.k += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
         input.v += static_cast<std::int64_t>(D) * Geometry::KVHeads * column_base;
@@ -1302,12 +1333,24 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
     const float q_scale_r1 = q_scale_s[row1];
     int qabs0              = -1;
     int qabs1              = -1;
+    int base0              = 0;
+    int base1              = 0;
+    unsigned mask0         = 0U;
+    unsigned mask1         = 0U;
     {
         int q_head = 0, token0 = 0, token1 = 0;
         causal_small_t_tc_row_to_qt<Geometry>(row0, TokenTile, kv_head, q_head, token0);
         causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head, token1);
         if (row0 < RowCount) qabs0 = positions[token0];
         if (row1 < RowCount) qabs1 = positions[token1];
+        base0 = qabs0 + 1;
+        base1 = qabs1 + 1;
+        if constexpr (Tree) {
+            base0 = row0 < RowCount ? positions[0] : 0;
+            base1 = row1 < RowCount ? positions[0] : 0;
+            mask0 = row0 < RowCount ? static_cast<unsigned>(tree_masks[token0]) : 0U;
+            mask1 = row1 < RowCount ? static_cast<unsigned>(tree_masks[token1]) : 0U;
+        }
     }
     k8v4_bar_arrive(barrier::kQueryReleased, Threads);
 
@@ -1345,8 +1388,9 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
             }
         }
         k8v4_softmax_tile<Geometry, QKNt>(score, packed_k_scale(stage), q_scale_r0, q_scale_r1,
-                                          row0 < RowCount, row1 < RowCount, qabs0, qabs1, k0, range,
-                                          attention_scale, lid, m0, m1, l0, l1, alpha0, alpha1);
+                                          row0 < RowCount, row1 < RowCount, qabs0, qabs1, base0,
+                                          base1, mask0, mask1, k0, range, attention_scale, lid, m0,
+                                          m1, l0, l1, alpha0, alpha1);
 #pragma unroll
         for (int k = 0; k < Bc / 16; ++k) {
             pf[k][0] = k8v4_half2_bits(score[2 * k][0], score[2 * k][1]);

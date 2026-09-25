@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: pass the next-layer state hint to records.
+// Modified by satellitedown for Cinference: next-layer state hint, verify trees, path folds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -45,11 +45,12 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& beta, float scale, const Tensor& ssm_states,
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                             Tensor& out, const Tensor& next_states, cudaStream_t stream);
+                             Tensor& out, const Tensor& next_states, const Tensor& tree_parents,
+                             cudaStream_t stream);
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
-                        cudaStream_t stream);
+                        const std::int32_t* record_columns, cudaStream_t stream);
 
 std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t tokens);
 

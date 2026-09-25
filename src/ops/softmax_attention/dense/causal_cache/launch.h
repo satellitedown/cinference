@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: pass the K8V4 prepared-query workspace.
+// Modified by satellitedown for Cinference: K8V4 prepared-query workspace; verify-tree masks.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -19,6 +19,8 @@ enum class CausalAttentionRoute { SmallT, ChunkedSmallT, Prompt };
 
 struct CausalSmallTInvocation {
     const Tensor* valid_columns = nullptr;
+    // I32 [W,B] ancestor-or-self column masks of per-row verify trees; K8V4 only.
+    const Tensor* tree_masks    = nullptr;
     const Tensor* table_rows    = nullptr;
     std::int32_t full_width     = 0;
     std::int32_t column_begin   = 0;
@@ -85,10 +87,10 @@ bool causal_attention_small_t_k8v4_prepares_query(std::int32_t q_heads, std::int
 
 void causal_attention_small_t_k8v4_launch(
     const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-    const Tensor& valid_columns, const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
-    CausalAttentionExecutionEnvelope envelope, std::int32_t column_begin, std::int32_t width,
-    Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l, Tensor& query_codes,
-    Tensor& query_scales, Tensor& out, cudaStream_t stream);
+    const Tensor& valid_columns, const Tensor& tree_masks, const Tensor& table_rows, float scale,
+    PagedKVBatchLayerView cache, CausalAttentionExecutionEnvelope envelope,
+    std::int32_t column_begin, std::int32_t width, Tensor& partial_acc, Tensor& partial_m,
+    Tensor& partial_l, Tensor& query_codes, Tensor& query_scales, Tensor& out, cudaStream_t stream);
 
 void causal_attention_cached_small_t_k8v4_launch(
     const Tensor& q, const Tensor& positions, float scale, const PagedKVLayerView& cache,

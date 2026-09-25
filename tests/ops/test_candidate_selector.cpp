@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: cover lattice verify trees and lookup chains.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "ninfer/ops/candidate_selector.h"
 
 #include "ops/op_tester.h"
@@ -607,6 +610,203 @@ int run(bool ties = false, bool dependent = false) {
     return failures;
 }
 
+struct TreeResult {
+    std::vector<int> drafts, parents, masks, rope;
+};
+
+// Verify trees: each row must be a valid DFS pre-order tree (largest subtree last) whose nodes
+// are the extent best root paths of the FP64 lattice: every chosen node scores at least every
+// unchosen child of the root or of a chosen node within the depth limit.
+// lookup: 0 no chain; 1 a chain worth nothing (the lattice tree itself); 2 a certain chain, which
+// must then be a root path of min(chain, extent) nodes.
+int run_tree(int lookup = 0, TreeResult* result = nullptr) {
+    constexpr double kTreeTemperature             = 1.5;
+    const std::vector<std::int32_t> candidate_ids = make_candidate_ids();
+    const std::vector<float> unary_scores         = make_unary_scores(3);
+    const std::vector<std::uint16_t> projected    = make_projected_hidden();
+    const std::vector<std::int32_t> anchors       = make_anchors();
+    const std::vector<double> lattice =
+        build_lattice(candidate_ids, unary_scores, projected, anchors);
+    std::vector<std::int32_t> extents(kMaxBatch);
+    for (int b = 0; b < kMaxBatch; ++b) extents[b] = b == 3 ? 0 : b == 5 ? 1 : kSteps - (b % 3);
+    for (auto& extent : extents) extent = std::max(0, std::min(extent, kSteps));
+    const int width = kSteps + 1;
+    std::vector<std::int32_t> rope(static_cast<std::size_t>(kMaxBatch) * width);
+    for (int b = 0; b < kMaxBatch; ++b)
+        for (int c = 0; c < width; ++c) rope[b * width + c] = 5000 + 131 * b + 7 * c;
+
+    DeviceBuffer candidate_device = to_device(candidate_ids);
+    DeviceBuffer unary_device     = to_device(unary_scores);
+    DeviceBuffer hidden_device    = to_device(projected);
+    DeviceBuffer anchor_device    = to_device(anchors);
+    DeviceBuffer extent_device    = to_device(extents);
+    DeviceBuffer rope_device      = to_device(rope);
+    DeviceBuffer predecessor_device(static_cast<std::size_t>(kRank) * kCodebookRows * 2);
+    DeviceBuffer successor_device(static_cast<std::size_t>(kRank) * kCodebookRows * 2);
+    predecessor_device.fill();
+    successor_device.fill();
+    const std::vector<std::int32_t> tokens = accessed_tokens(candidate_ids, anchors);
+    populate_codebook(predecessor_device, tokens, true);
+    populate_codebook(successor_device, tokens, false);
+    Tensor predecessor(predecessor_device.p, DType::BF16, {kRank, kCodebookRows});
+    Tensor successor(successor_device.p, DType::BF16, {kRank, kCodebookRows});
+    GuardedDeviceBuffer draft_device(static_cast<std::size_t>(kMaxBatch) * kSteps * 4);
+    GuardedDeviceBuffer parent_device(static_cast<std::size_t>(kMaxBatch) * width * 4);
+    GuardedDeviceBuffer mask_device(static_cast<std::size_t>(kMaxBatch) * width * 4);
+    draft_device.fill(0xff);
+    Tensor ids(candidate_device.p, DType::I32, {kCandidates, kSteps, kMaxBatch});
+    Tensor unary(unary_device.p, DType::FP32, {kCandidates, kSteps, kMaxBatch});
+    Tensor hidden(hidden_device.p, DType::BF16, {kRank, kSteps, kMaxBatch});
+    Tensor anchor(anchor_device.p, DType::I32, {kMaxBatch});
+    Tensor extent(extent_device.p, DType::I32, {kMaxBatch});
+    Tensor drafts(draft_device.data(), DType::I32, {kSteps, kMaxBatch});
+    Tensor parents(parent_device.data(), DType::I32, {width, kMaxBatch});
+    Tensor masks(mask_device.data(), DType::I32, {width, kMaxBatch});
+    Tensor rope_positions(rope_device.p, DType::I32, {width, kMaxBatch});
+    // Chain tokens alternate between lattice candidates and tokens the drafter never proposed.
+    std::vector<std::int32_t> chain(static_cast<std::size_t>(kSteps) * kMaxBatch),
+        chain_counts(kMaxBatch);
+    std::vector<float> chain_log_probability(kMaxBatch, lookup == 1 ? -1.0e30F : 0.0F);
+    for (int b = 0; b < kMaxBatch; ++b) {
+        chain_counts[b] = b == 2 ? 0 : std::max(1, kSteps - b);
+        for (int j = 0; j < kSteps; ++j)
+            chain[b * kSteps + j] = (j + b) % 3 == 1
+                                        ? 200000 + 31 * b + j
+                                        : candidate_ids[candidate_offset(b, j, (5 * j + b) % 16)];
+    }
+    DeviceBuffer chain_device = to_device(chain), chain_count_device = to_device(chain_counts),
+                 chain_log_device = to_device(chain_log_probability);
+    const Tensor lookup_tokens =
+        lookup ? Tensor(chain_device.p, DType::I32, {kSteps, kMaxBatch}) : Tensor{};
+    const Tensor lookup_counts =
+        lookup ? Tensor(chain_count_device.p, DType::I32, {kMaxBatch}) : Tensor{};
+    const Tensor lookup_log =
+        lookup ? Tensor(chain_log_device.p, DType::FP32, {kMaxBatch}) : Tensor{};
+    const auto capacity =
+        ops::candidate_selector_tree_workspace_capacity_bytes(kSteps, kSteps, kMaxBatch, kMaxBatch);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+    ops::candidate_selector_tree(ids, unary, hidden, anchor, predecessor, successor, extent,
+                                 lookup_tokens, lookup_counts, lookup_log, drafts, parents, masks,
+                                 rope_positions, workspace, nullptr);
+    cuda_synchronize();
+    const auto got_drafts  = from_device<int>(draft_device.data(), kMaxBatch * kSteps);
+    const auto got_parents = from_device<int>(parent_device.data(), kMaxBatch * width);
+    const auto got_masks   = from_device<int>(mask_device.data(), kMaxBatch * width);
+    const auto got_rope    = from_device<int>(rope_device.p, kMaxBatch * width);
+
+    if (result != nullptr) *result = {got_drafts, got_parents, got_masks, got_rope};
+    const std::string label =
+        "candidate_selector_tree K=" + std::to_string(kSteps) + " lookup=" + std::to_string(lookup);
+    const auto log_probability = [&](int b, int step, int predecessor_rank, int rank) {
+        const std::size_t base = lattice_offset(b, step, predecessor_rank, 0);
+        double maximum         = -std::numeric_limits<double>::infinity();
+        for (int c = 0; c < kCandidates; ++c)
+            maximum = std::max(maximum, lattice[base + c] / kTreeTemperature);
+        double sum = 0;
+        for (int c = 0; c < kCandidates; ++c)
+            sum += std::exp(lattice[base + c] / kTreeTemperature - maximum);
+        return lattice[base + rank] / kTreeTemperature - maximum - std::log(sum);
+    };
+    int failures = 0;
+    for (int b = 0; b < kMaxBatch; ++b) {
+        const int nodes = extents[b];
+        const auto fail = [&](const std::string& what) {
+            if (failures == 0) std::cerr << label << " row " << b << ": " << what << '\n';
+            ++failures;
+        };
+        std::vector<int> depth(width, 0), rank(width, 0), children(width, 0), size(width, 1);
+        std::vector<double> score(width, 0.0);
+        if (got_parents[b * width] != -1 || got_masks[b * width] != 1) fail("root");
+        for (int c = 1; c <= nodes; ++c) {
+            const int parent = got_parents[b * width + c];
+            if (parent < 0 || parent >= c) {
+                fail("parent order");
+                continue;
+            }
+            depth[c]        = depth[parent] + 1;
+            const int step  = depth[c] - 1;
+            const int token = got_drafts[b * kSteps + c - 1];
+            rank[c]         = -1;
+            for (int r = 0; r < kCandidates; ++r)
+                if (candidate_ids[candidate_offset(b, step, r)] == token) rank[c] = r;
+            const bool chain_token =
+                lookup == 2 && step < chain_counts[b] && token == chain[b * kSteps + step];
+            if ((rank[c] < 0 && !chain_token) || depth[c] > nodes) {
+                fail("node token/depth");
+                continue;
+            }
+            if (rank[c] >= 0 && (parent == 0 || rank[parent] >= 0))
+                score[c] = score[parent] +
+                           log_probability(b, step, parent == 0 ? 0 : rank[parent], rank[c]);
+            if (got_masks[b * width + c] != (got_masks[b * width + parent] | (1 << c)))
+                fail("ancestor mask");
+            if (got_rope[b * width + c] != rope[b * width] + depth[c]) fail("rope position");
+            ++children[parent];
+        }
+        for (int c = nodes; c >= 1; --c) size[got_parents[b * width + c]] += size[c];
+        // DFS pre-order: a node's subtree is the next size[c] columns; its first child is c + 1;
+        // sibling subtrees appear by nondecreasing size.
+        for (int c = 0; c <= nodes; ++c) {
+            int column = c + 1, previous = 0;
+            while (column < c + size[c]) {
+                if (got_parents[b * width + column] != c) fail("pre-order contiguity");
+                if (size[column] < previous) fail("largest subtree last");
+                previous = size[column];
+                column += size[column];
+            }
+        }
+        if (lookup == 2) {
+            // The certain chain is the root path of its first min(n, extent) tokens.
+            int node = 0;
+            for (int step = 0; step < std::min(chain_counts[b], nodes); ++step) {
+                int next = -1;
+                for (int c = node + 1; c <= nodes; ++c)
+                    if (got_parents[b * width + c] == node &&
+                        got_drafts[b * kSteps + c - 1] == chain[b * kSteps + step])
+                        next = c;
+                if (next < 0) {
+                    fail("lookup chain missing at step " + std::to_string(step));
+                    break;
+                }
+                node = next;
+            }
+            for (int c = nodes + 1; c < width; ++c) {
+                if (got_parents[b * width + c] != c - 1 || got_masks[b * width + c] != (1 << c))
+                    fail("inert tail");
+            }
+            continue;
+        }
+        // Best-first optimality.
+        double chosen_minimum = std::numeric_limits<double>::infinity();
+        for (int c = 1; c <= nodes; ++c) chosen_minimum = std::min(chosen_minimum, score[c]);
+        double frontier_maximum = -std::numeric_limits<double>::infinity();
+        for (int c = 0; c <= nodes; ++c) {
+            if (depth[c] + 1 > nodes) continue;
+            const int step = depth[c];
+            for (int r = 0; r < kCandidates; ++r) {
+                bool chosen = false;
+                for (int child = 1; child <= nodes; ++child)
+                    chosen = chosen || (got_parents[b * width + child] == c && rank[child] == r);
+                if (!chosen)
+                    frontier_maximum =
+                        std::max(frontier_maximum,
+                                 score[c] + log_probability(b, step, c == 0 ? 0 : rank[c], r));
+            }
+        }
+        if (nodes > 0 && chosen_minimum < frontier_maximum - 1.0e-4) fail("best-first order");
+        for (int c = nodes + 1; c < width; ++c) {
+            if (got_parents[b * width + c] != c - 1 || got_masks[b * width + c] != (1 << c) ||
+                got_rope[b * width + c] != rope[b * width + c])
+                fail("inert tail");
+        }
+    }
+    failures += draft_device.verify_guards(label + " drafts") +
+                parent_device.verify_guards(label + " parents") +
+                mask_device.verify_guards(label + " masks") + scratch.verify_guards(label);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -626,6 +826,19 @@ int main() {
             failures += run(false, true);
             kSteps = 15;
             failures += run(false, true);
+        }
+        for (int steps : {1, 2, 5, 15}) {
+            kSteps = steps;
+            TreeResult plain, worthless;
+            failures += run_tree(0, &plain);
+            failures += run_tree(1, &worthless);
+            failures += run_tree(2);
+            if (plain.drafts != worthless.drafts || plain.parents != worthless.parents ||
+                plain.masks != worthless.masks || plain.rope != worthless.rope) {
+                std::cerr << "candidate_selector_tree K=" << steps
+                          << ": a worthless lookup chain changed the tree\n";
+                ++failures;
+            }
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " candidate_selector_path\n";
         return failures == 0 ? 0 : 1;

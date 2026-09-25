@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: staged verify-width GDN records, next-state prefetch.
+// Modified by satellitedown for Cinference: staged GDN records, next-state prefetch, verify trees.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -149,6 +149,8 @@ struct RecurrentCoordinates {
     std::uint32_t qk_head;
     std::uint32_t dv_base;
     std::uint32_t dqk_base;
+    // Fold only: the row's committed record columns staged in shared memory (null: the prefix).
+    const std::int32_t* record_path = nullptr;
 };
 
 __device__ __forceinline__ RecurrentCoordinates make_coordinates(std::int32_t batch,
@@ -370,6 +372,8 @@ struct RecordAccess {
     float scale;
     // Optional states laid out like `states` whose tiles are warmed into L2 (never read).
     const float* next_states;
+    // Optional verify-tree parents, I32 [width, batch] in DFS pre-order (see the staged kernel).
+    const std::int32_t* tree_parents;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
@@ -471,6 +475,10 @@ struct FoldAccess {
     std::int32_t record_capacity;
     std::int32_t width;
     GdnReplayFoldKernelRows rows;
+    // Optional I32 [width, record rows]: the record column of each committed token (a verify
+    // tree's accepted path). Null commits the record prefix itself. The kernel stages the row's
+    // columns into coord.record_path.
+    const std::int32_t* record_columns;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         const std::int32_t batch       = static_cast<std::int32_t>(blockIdx.y);
@@ -503,6 +511,11 @@ struct FoldAccess {
         return static_cast<std::int64_t>(coord.layer) * record_capacity + coord.batch;
     }
 
+    __device__ __forceinline__ std::int32_t record_column(const RecurrentCoordinates& coord,
+                                                          std::int32_t token) const {
+        return coord.record_path == nullptr ? token : coord.record_path[token];
+    }
+
     __device__ __forceinline__ const float*
     state_read_base(const RecurrentCoordinates& coord) const {
         const std::int64_t slot_stride =
@@ -523,19 +536,19 @@ struct FoldAccess {
 
     __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates& coord,
                                                             std::int32_t token) const {
-        const std::int64_t column = record_outer(coord) * width + token;
+        const std::int64_t column = record_outer(coord) * width + record_column(coord, token);
         return key_record + (column * Geometry::kQkHeads + coord.qk_head) * kStateDim;
     }
 
     __device__ __forceinline__ const __nv_bfloat16* value_ptr(const RecurrentCoordinates& coord,
                                                               std::int32_t token) const {
-        const std::int64_t column = record_outer(coord) * width + token;
+        const std::int64_t column = record_outer(coord) * width + record_column(coord, token);
         return value_record + (column * Geometry::kValueHeads + coord.value_head) * kStateDim;
     }
 
     __device__ __forceinline__ RawGatePair load_gate(const RecurrentCoordinates& coord,
                                                      std::int32_t token) const {
-        const std::int64_t column = record_outer(coord) * width + token;
+        const std::int64_t column = record_outer(coord) * width + record_column(coord, token);
         return load_record_gate(gate_record, column * Geometry::kValueHeads + coord.value_head);
     }
 
@@ -572,21 +585,25 @@ struct FoldAccess {
         const __nv_bfloat16* record =
             conv_record + record_outer(coord) * width * Geometry::kConvChannels + channel;
 
+        const auto tap = [&](std::int32_t token) {
+            return record[static_cast<std::int64_t>(record_column(coord, token)) *
+                          Geometry::kConvChannels];
+        };
         __nv_bfloat16 h0;
         __nv_bfloat16 h1;
         __nv_bfloat16 h2;
         if (commit == 1) {
             h0 = source_history[Geometry::kConvChannels];
             h1 = source_history[2LL * Geometry::kConvChannels];
-            h2 = record[0];
+            h2 = tap(0);
         } else if (commit == 2) {
             h0 = source_history[2LL * Geometry::kConvChannels];
-            h1 = record[0];
-            h2 = record[Geometry::kConvChannels];
+            h1 = tap(0);
+            h2 = tap(1);
         } else {
-            h0 = record[static_cast<std::int64_t>(commit - 3) * Geometry::kConvChannels];
-            h1 = record[static_cast<std::int64_t>(commit - 2) * Geometry::kConvChannels];
-            h2 = record[static_cast<std::int64_t>(commit - 1) * Geometry::kConvChannels];
+            h0 = tap(commit - 3);
+            h1 = tap(commit - 2);
+            h2 = tap(commit - 1);
         }
         destination_history[0]                             = h0;
         destination_history[Geometry::kConvChannels]       = h1;
@@ -717,7 +734,45 @@ __device__ __forceinline__ float gdn_row_sums(const float (&partial)[kDvPerWarp]
     return sum;
 }
 
-template <bool Masked>
+// A verify tree lists its columns in DFS pre-order, so every parent precedes its children and a
+// node's first child is the next column. The recurrence walks the columns in order and needs a
+// parent's state again only for that parent's later children: such a branch node saves its state
+// after its own transition and the later children restore it. With every node's largest subtree
+// visited last, at most log2(16) branch states are live at once.
+inline constexpr int kTreeStateSlots = 4;
+
+// Plans one valid column's stack actions. Live branch states nest (a branch node's state stays
+// live until its last child starts, and every live branch node is an ancestor of the current
+// column), so they form a stack whose top is always the parent a restoring column needs: a column
+// that is not its parent's first child restores the top (and pops it when it is the parent's last
+// child), and a node with two or more children pushes its state after its own transition.
+// restore: -1 none, 0 restore, 1 restore and pop; push: 1 when the column pushes.
+__device__ __forceinline__ void plan_tree_state_column(const std::int32_t* parents, int valid,
+                                                       int column, std::int8_t& restore,
+                                                       std::int8_t& push) {
+    int children = 0;
+    int last     = -1;
+    int parent   = -1;
+    for (int j = 1; j < valid; ++j) {
+        const int p = parents[j];
+        if (p == column) { ++children; }
+        if (j == column) { parent = p; }
+    }
+    if (column > 0) {
+        for (int j = column; j < valid; ++j) {
+            if (parents[j] == parent) { last = j; }
+        }
+    }
+    push    = static_cast<std::int8_t>(children >= 2 ? 1 : 0);
+    restore = static_cast<std::int8_t>(column == 0 || parent == column - 1 ? -1
+                                       : last == column                    ? 1
+                                                                           : 0);
+}
+
+// Tree: the columns form a DFS pre-order verify tree given by access.tree_parents. Each column's
+// transition starts from its parent's state, so its output equals the chain recurrence along its
+// root path bit for bit; every column's record is still its own raw inputs.
+template <bool Masked, bool Tree>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_record_staged_kernel(RecordAccess<Masked> access) {
     const RecurrentCoordinates coord = access.coordinates();
@@ -733,6 +788,8 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     __shared__ __align__(16) float query_normalized[kStagedRecordMaxWidth][kStateDim];
     __shared__ float decay[kStagedRecordMaxWidth];
     __shared__ __align__(8) uint2 gate_raw[kStagedRecordMaxWidth];
+    __shared__ std::int8_t tree_restore[kStagedRecordMaxWidth];
+    __shared__ std::int8_t tree_save[kStagedRecordMaxWidth];
 
     // The state tile is independent of the staged block, so its DRAM latency overlaps staging.
     __align__(16) float state[kDvPerWarp][kQkPerLane];
@@ -759,6 +816,13 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
         cp_async<4>(&gate_raw[token].y, access.beta + offset);
     }
     cp_commit();
+    if constexpr (Tree) {
+        if (thread < valid) {
+            plan_tree_state_column(access.tree_parents +
+                                       static_cast<std::int64_t>(coord.batch) * access.width,
+                                   valid, thread, tree_restore[thread], tree_save[thread]);
+        }
+    }
     cp_wait<0>();
     __syncthreads();
 
@@ -840,9 +904,32 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 
     const int local_dv  = coord.warp * kDvPerWarp;
     const int owned_row = (coord.lane >> 3) & (kDvPerWarp - 1);
+    float tree_stack[Tree ? kTreeStateSlots : 1][kDvPerWarp][kQkPerLane];
     // Unrolling lets the readout of one column overlap the transition of the next.
 #pragma unroll 4
     for (std::int32_t token = 0; token < valid; ++token) {
+        if constexpr (Tree) {
+            const int restore = tree_restore[token];
+            if (restore >= 0) {
+#pragma unroll
+                for (int r = 0; r < kDvPerWarp; ++r) {
+#pragma unroll
+                    for (int c = 0; c < kQkPerLane; ++c) { state[r][c] = tree_stack[0][r][c]; }
+                }
+                if (restore > 0) {
+#pragma unroll
+                    for (int level = 0; level + 1 < kTreeStateSlots; ++level) {
+#pragma unroll
+                        for (int r = 0; r < kDvPerWarp; ++r) {
+#pragma unroll
+                            for (int c = 0; c < kQkPerLane; ++c) {
+                                tree_stack[level][r][c] = tree_stack[level + 1][r][c];
+                            }
+                        }
+                    }
+                }
+            }
+        }
         const float4 key4           = load_vec<float4>(&key_normalized[token][coord.dqk_base]);
         const float key[kQkPerLane] = {key4.x, key4.y, key4.z, key4.w};
         const float alpha           = decay[token];
@@ -867,6 +954,25 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                 state[r][c] = alpha * state[r][c] + delta * key[c];
             }
         }
+        if constexpr (Tree) {
+            if (tree_save[token] > 0) {
+#pragma unroll
+                for (int level = kTreeStateSlots - 1; level > 0; --level) {
+#pragma unroll
+                    for (int r = 0; r < kDvPerWarp; ++r) {
+#pragma unroll
+                        for (int c = 0; c < kQkPerLane; ++c) {
+                            tree_stack[level][r][c] = tree_stack[level - 1][r][c];
+                        }
+                    }
+                }
+#pragma unroll
+                for (int r = 0; r < kDvPerWarp; ++r) {
+#pragma unroll
+                    for (int c = 0; c < kQkPerLane; ++c) { tree_stack[0][r][c] = state[r][c]; }
+                }
+            }
+        }
 
         const float4 query4           = load_vec<float4>(&query_normalized[token][coord.dqk_base]);
         const float query[kQkPerLane] = {query4.x, query4.y, query4.z, query4.w};
@@ -888,9 +994,19 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 template <class Geometry>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_fold_kernel(const __grid_constant__ FoldAccess<Geometry> access) {
-    const RecurrentCoordinates coord = access.coordinates();
-    const std::int32_t valid         = access.active_columns(coord);
+    RecurrentCoordinates coord = access.coordinates();
+    const std::int32_t valid   = access.active_columns(coord);
     if (valid == 0) { return; }
+    // A committed path's columns are read once here rather than ahead of every record load.
+    __shared__ std::int32_t record_path[kStagedRecordMaxWidth];
+    if (access.record_columns != nullptr) {
+        const int thread = coord.warp * kWarpSize + coord.lane;
+        if (thread < valid) {
+            record_path[thread] = access.record_columns[coord.batch * access.width + thread];
+        }
+        __syncthreads();
+        coord.record_path = record_path;
+    }
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
     run_recurrent_sequence<true, FoldEffects>(state, access, coord, valid);

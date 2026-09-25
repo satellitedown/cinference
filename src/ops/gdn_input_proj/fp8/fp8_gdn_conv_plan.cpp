@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: fuse the width-16 A8 record convolution.
+// Modified by satellitedown for Cinference: fuse the width-16 A8 record convolution; verify trees.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -173,10 +173,13 @@ void launch_snapshot_plan(const Tensor& x, const Weight& weight, const Tensor& c
 
 void launch_record_plan(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                         const Tensor& conv_states, const Tensor& valid_columns,
-                        const Tensor& initial_slot, Tensor& conv_record, Tensor& query, Tensor& key,
-                        Tensor& value, Tensor& z, Fp8GdnConvPlan plan, WorkspaceArena& workspace,
-                        cudaStream_t stream) {
+                        const Tensor& initial_slot, const Tensor& tree_parents, Tensor& conv_record,
+                        Tensor& query, Tensor& key, Tensor& value, Tensor& z, Fp8GdnConvPlan plan,
+                        WorkspaceArena& workspace, cudaStream_t stream) {
     if (plan.schedule == Fp8GdnConvScheduleId::FusedA16) {
+        if (tree_parents.data != nullptr) {
+            throw std::invalid_argument("fp8 GDN record: verify trees need a materialized route");
+        }
         fp8_gdn_record_fused_launch(x, weight, conv_weight, conv_states, valid_columns,
                                     initial_slot, conv_record, query, key, value, z, stream);
         return;
@@ -193,13 +196,13 @@ void launch_record_plan(const Tensor& x, const Weight& weight, const Tensor& con
         width == kFp8GdnRecordConvWidth) {
         const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(workspace, width, weight.k);
         fp8_gdn_record_conv_a8_launch(x_flat, weight, conv_weight, conv_states, valid_columns,
-                                      initial_slot, record_flat, query, key, value, z_flat, scratch,
-                                      stream);
+                                      initial_slot, tree_parents, record_flat, query, key, value,
+                                      z_flat, scratch, stream);
         return;
     }
     launch_projection(x_flat, weight, record_flat, z_flat, plan.schedule, workspace, stream);
     gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states, valid_columns,
-                                     initial_slot, query, key, value, stream);
+                                     initial_slot, tree_parents, query, key, value, stream);
 }
 
 } // namespace
@@ -217,11 +220,12 @@ void fp8_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tens
 
 void fp8_gdn_record_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                              const Tensor& conv_states, const Tensor& valid_columns,
-                             const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
-                             Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
-                             WorkspaceArena& workspace, cudaStream_t stream) {
+                             const Tensor& initial_slot, const Tensor& tree_parents,
+                             Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                             Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+                             cudaStream_t stream) {
     launch_record_plan(x, weight, conv_weight, conv_states, valid_columns, initial_slot,
-                       conv_record, query, key, value, z,
+                       tree_parents, conv_record, query, key, value, z,
                        fp8_gdn_record_resolve_plan(policy, x.ne[1], x.ne[2]), workspace, stream);
 }
 

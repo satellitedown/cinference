@@ -1,3 +1,6 @@
+# Modified by satellitedown for Cinference: register the prompt-lookup test.
+# See NOTICE and upstream-provenance.json for upstream attribution.
+
 ninfer_add_test(ninfer_qwen3_5_loading_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"
   LIBRARIES ninfer_model_loading)
@@ -18,6 +21,10 @@ ninfer_add_test(ninfer_qwen3_5_frontend_test
 ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
   LIBRARIES ninfer_engine ninfer_core)
+
+ninfer_add_test(ninfer_qwen3_5_prompt_lookup_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prompt_lookup.cpp"
+  LIBRARIES ninfer_engine)
 
 ninfer_add_test(ninfer_qwen3_5_state_image_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state_image.cpp"

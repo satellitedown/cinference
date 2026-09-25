@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: size MTP round buffers for up to 10 draft tokens.
+// Modified by satellitedown for Cinference: MTP buffers for 10 drafts; verify-tree/lookup buffers.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -27,6 +27,7 @@ struct RoundStateSpec {
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
     bool causal_scoring          = false;
+    bool verify_tree             = false;
 };
 
 // Stable pinned/device transfer format for ordinary decode. The full fixed-size object is copied
@@ -91,6 +92,11 @@ struct DFlashDecodeIngress {
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    // Verify-tree rounds: each row's prompt-lookup chain ([K,B], K the draft window), its length
+    // and its per-token log-probability.
+    std::array<TokenId, kMaximumConcurrency * kDFlashDecodeMaximumDrafts> lookup_tokens{};
+    std::array<std::int32_t, kMaximumConcurrency> lookup_counts{};
+    std::array<float, kMaximumConcurrency> lookup_log_probability{};
 };
 
 struct DFlashDecodeEgress {
@@ -145,6 +151,11 @@ struct DFlashDecodeStateLayout {
     TensorRegion verify_positions;
     std::optional<TensorRegion> candidate_ids;
     std::optional<TensorRegion> proposal_q;
+    // Verify-tree rounds: DFS pre-order parents and ancestor-or-self masks of the verify columns,
+    // and the accepted path's columns, I32 [K+1,B] each.
+    std::optional<TensorRegion> tree_parents;
+    std::optional<TensorRegion> tree_masks;
+    std::optional<TensorRegion> accepted_columns;
     TensorRegion append_positions;
     TensorRegion append_counts;
     TensorRegion draft_tokens;
@@ -281,6 +292,12 @@ struct DFlashDecodeState {
     Tensor verify_positions;
     Tensor candidate_ids;
     Tensor proposal_q;
+    Tensor tree_parents;
+    Tensor tree_masks;
+    Tensor accepted_columns;
+    Tensor lookup_tokens;
+    Tensor lookup_counts;
+    Tensor lookup_log_probability;
     Tensor append_positions;
     Tensor append_counts;
     Tensor draft_tokens;

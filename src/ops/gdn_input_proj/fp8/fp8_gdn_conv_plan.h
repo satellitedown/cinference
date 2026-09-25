@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: verify-tree record dispatch.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "core/weight.h"
@@ -41,8 +44,9 @@ void fp8_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tens
 
 void fp8_gdn_record_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                              const Tensor& conv_states, const Tensor& valid_columns,
-                             const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
-                             Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
-                             WorkspaceArena& workspace, cudaStream_t stream);
+                             const Tensor& initial_slot, const Tensor& tree_parents,
+                             Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                             Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
+                             cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

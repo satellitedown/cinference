@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: advertise MTP draft windows through K=10.
+// Modified by satellitedown for Cinference: MTP draft windows through K=10; DFlash2 verify trees.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -83,6 +83,8 @@ struct SpeculativeOptions {
     // Startup-fixed K: MTP 1..10; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // DFlash2 only: verify a best-first draft tree of K nodes instead of one draft chain.
+    bool verify_tree = false;
 };
 
 enum class StartupPhase : std::uint8_t {

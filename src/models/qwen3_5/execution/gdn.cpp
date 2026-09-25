@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: verify-tree parents for the record projection.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "models/qwen3_5/execution/gdn.h"
 
 #include "ninfer/ops/gdn_gating_proj.h"
@@ -106,20 +109,24 @@ void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& paramete
 void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters,
                            const GdnConfig& config, const Tensor& conv_states,
                            const Tensor& valid_columns, const Tensor& initial_slots,
-                           Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
-                           Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+                           const Tensor& tree_parents, Tensor& conv_record, Tensor& query,
+                           Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace,
+                           cudaStream_t stream) {
     auto scope = workspace.scope();
     WorkspaceArena scratch(workspace.alloc_bytes(
         gdn_record_workspace_bytes(parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
     if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
+        if (tree_parents.data != nullptr) {
+            throw std::invalid_argument("verify trees require the single-parent GDN projection");
+        }
         ops::gdn_input_proj_conv_record(hidden, pair->first, pair->second, parameters.convolution,
                                         conv_states, valid_columns, initial_slots, conv_record,
                                         query, key, value, z, scratch, stream);
     } else {
         const auto& single = std::get<LinearParameters>(parameters.projection);
         ops::gdn_input_proj_conv_record(hidden, single.weight, parameters.convolution, conv_states,
-                                        valid_columns, initial_slots, conv_record, query, key,
-                                        value, z, single.policy, scratch, stream);
+                                        valid_columns, initial_slots, tree_parents, conv_record,
+                                        query, key, value, z, single.policy, scratch, stream);
     }
 }
 

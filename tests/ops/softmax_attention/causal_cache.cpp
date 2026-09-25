@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: cover wide K8V4 verify blocks.
+// Modified by satellitedown for Cinference: cover wide K8V4 verify blocks and verify trees.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/arena.h"
@@ -7,6 +7,7 @@
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
+#include "ops/verify_tree_test_common.h"
 
 #include <algorithm>
 #include <array>
@@ -909,6 +910,48 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
     return output;
 }
 
+// The same oracle with an explicit visibility predicate (speculative verify trees).
+template <class Visible>
+std::vector<double> ideal_attention_visible(const std::vector<float>& q, const HostCache& cache,
+                                            int tokens, int visible, Visible&& visible_key) {
+    const Geometry& geometry = cache.geometry;
+    std::vector<double> query(q.begin(), q.end()), output(q.size());
+    for (int token = 0; token < tokens; ++token)
+        for (int head = 0; head < geometry.q_heads; ++head) {
+            std::array<double, kHeadDim> row{};
+            for (int d = 0; d < kHeadDim; ++d) row[d] = q[q_index(geometry, head, d, token)];
+            normalized_hadamard_d256(row);
+            for (int d = 0; d < kHeadDim; ++d) query[q_index(geometry, head, d, token)] = row[d];
+        }
+    const auto index = [&](int d, int head, int pos) {
+        return std::size_t(d) + kHeadDim * (std::size_t(pos) + std::size_t(visible) * head);
+    };
+    std::vector<double> keys(std::size_t(visible) * geometry.kv_heads * kHeadDim),
+        values(keys.size());
+    for (int head = 0; head < geometry.kv_heads; ++head)
+        for (int pos = 0; pos < visible; ++pos)
+            for (int d = 0; d < kHeadDim; ++d) {
+                keys[index(d, head, pos)]   = cache_value(cache, true, head, pos, d);
+                values[index(d, head, pos)] = cache_value(cache, false, head, pos, d);
+            }
+    naive_dense_softmax_attention(
+        op_geometry(geometry), tokens, visible, double(kAttentionScale),
+        [&](int d, int head, int token) { return query[q_index(geometry, head, d, token)]; },
+        [&](int d, int head, int pos) { return keys[index(d, head, pos)]; },
+        [&](int d, int head, int pos) { return values[index(d, head, pos)]; }, visible_key,
+        [&](int d, int head, int token, double value) {
+            output[q_index(geometry, head, d, token)] = value;
+        });
+    for (int token = 0; token < tokens; ++token)
+        for (int head = 0; head < geometry.q_heads; ++head) {
+            std::array<double, kHeadDim> row{};
+            for (int d = 0; d < kHeadDim; ++d) row[d] = output[q_index(geometry, head, d, token)];
+            normalized_hadamard_d256(row);
+            for (int d = 0; d < kHeadDim; ++d) output[q_index(geometry, head, d, token)] = row[d];
+        }
+    return output;
+}
+
 template <typename T>
 std::vector<T> copy_from_guarded(const GuardedDeviceBuffer& buffer, std::size_t count) {
     std::vector<T> values(count);
@@ -1780,7 +1823,7 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
 
     launch_attention_case(
         [&](cudaStream_t stream) {
-            ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, ttable_row,
+            ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, Tensor{}, ttable_row,
                                           op_geometry(geometry), kAttentionScale,
                                           cache.batch_view(), envelope, workspace, tout, stream);
         },
@@ -1977,7 +2020,7 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
                         std::any_of(test_case.valid_columns.begin(), test_case.valid_columns.end(),
                                     [&](int count) { return count != width; });
     const auto launch = [&] {
-        ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
+        ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, Tensor{}, tlanes,
                                       op_geometry(geometry), kAttentionScale, cache.view(),
                                       envelope, workspace, tout, device.stream);
     };
@@ -2080,6 +2123,128 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
             ++failures;
         }
     }
+    return failures;
+}
+
+// Speculative verify trees: each row's live columns occupy consecutive cache positions from its
+// context and every column sees the context plus its tree ancestors (and itself) only.
+int run_tree_batch_case(std::vector<std::int32_t> contexts, std::vector<std::int32_t> valid,
+                        std::vector<std::int32_t> lanes, std::uint32_t seed, bool graph_replay) {
+    const Geometry& geometry     = kGeometries[0];
+    const KvCacheStorage storage = KvCacheStorage::Fp8KeyNvfp4Value;
+    constexpr int width          = 16;
+    const int batch              = static_cast<int>(contexts.size());
+    const int pool_rows          = *std::max_element(lanes.begin(), lanes.end()) + 1;
+    int maximum_visible          = 1;
+    for (int b = 0; b < batch; ++b)
+        maximum_visible = std::max(maximum_visible, contexts[b] + width);
+    const ops::CausalAttentionExecutionEnvelope envelope{static_cast<unsigned>(maximum_visible),
+                                                         static_cast<unsigned>(maximum_visible)};
+    const std::size_t q_column_elements  = std::size_t(kHeadDim) * geometry.q_heads,
+                      kv_column_elements = std::size_t(kHeadDim) * geometry.kv_heads;
+    const std::size_t columns            = std::size_t(width) * batch;
+    auto q = make_bf16_values(q_column_elements * columns, seed, -.25f, .25f);
+    auto k = make_bf16_values(kv_column_elements * columns, seed + 1u, -.25f, .25f);
+    auto v = make_bf16_values(kv_column_elements * columns, seed + 2u, -1.f, 1.f);
+    std::vector<HostCache> initial;
+    for (int row = 0; row < pool_rows; ++row)
+        initial.push_back(
+            make_cache(geometry, storage, maximum_visible + 3, seed + 20u + 3u * row));
+    auto expected = initial;
+    BatchDeviceCache cache(initial, MappingPattern::Fragmented);
+    std::vector<std::vector<std::int32_t>> trees(batch);
+    std::vector<std::int32_t> masks(columns), positions(columns);
+    for (int b = 0; b < batch; ++b) {
+        trees[b] = test::random_verify_tree(valid[b], seed + 7u * b, b % 2 == 0 ? 0.3 : 0.7);
+        for (int j = 0; j < width; ++j) {
+            masks[b * width + j] =
+                j < valid[b]
+                    ? static_cast<std::int32_t>(test::verify_tree_ancestor_mask(trees[b], j))
+                    : static_cast<std::int32_t>(1U << j);
+            positions[b * width + j] = contexts[b] + std::min(j, valid[b] - 1);
+        }
+    }
+    GuardedDeviceBuffer dq(q.size() * 2), dk(k.size() * 2), dv(v.size() * 2), dp(columns * 4),
+        dmasks(columns * 4), dvalid(batch * 4), dlanes(batch * 4), dout(q.size() * 2);
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch}),
+        tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, width, batch});
+    Tensor tp(dp.data(), DType::I32, {width, batch}),
+        tmasks(dmasks.data(), DType::I32, {width, batch}),
+        tvalid(dvalid.data(), DType::I32, {batch}), tlanes(dlanes.data(), DType::I32, {batch});
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, width, batch});
+    const auto capacity =
+        ops::causal_softmax_attention_tree_workspace_capacity_bytes(envelope, batch);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
+    WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
+    DeviceContext device;
+    const auto q_bits = to_bf16_bits(q), k_bits = to_bf16_bits(k), v_bits = to_bf16_bits(v);
+    dq.copy_from_host(q_bits.data(), q_bits.size() * 2);
+    dk.copy_from_host(k_bits.data(), k_bits.size() * 2);
+    dv.copy_from_host(v_bits.data(), v_bits.size() * 2);
+    dp.copy_from_host(positions.data(), positions.size() * 4);
+    dmasks.copy_from_host(masks.data(), masks.size() * 4);
+    dvalid.copy_from_host(valid.data(), batch * 4);
+    dlanes.copy_from_host(lanes.data(), batch * 4);
+    dout.fill(0xff);
+    cuda_synchronize();
+    const auto launch = [&] {
+        ops::causal_softmax_attention(tq, tk, tv, tp, tvalid, tmasks, tlanes, op_geometry(geometry),
+                                      kAttentionScale, cache.view(), envelope, workspace, tout,
+                                      device.stream);
+    };
+    if (graph_replay) {
+        DecodeGraphDefinition definition;
+        DecodeGraphExecutable graph;
+        launch();
+        cuda_synchronize(device.stream);
+        definition.capture(device.stream, launch);
+        graph.instantiate(definition);
+        dout.fill(0xff);
+        cuda_synchronize();
+        graph.launch(device.stream);
+    } else {
+        launch();
+    }
+    cuda_synchronize(device.stream);
+
+    std::vector<double> reference(q.size(), 0.0);
+    for (int b = 0; b < batch; ++b) {
+        const std::vector<int> row_positions(positions.begin() + b * width,
+                                             positions.begin() + b * width + valid[b]);
+        auto row_q = extract_request_columns(q, q_column_elements, width, b, valid[b]);
+        auto row_k = extract_request_columns(k, kv_column_elements, width, b, valid[b]);
+        auto row_v = extract_request_columns(v, kv_column_elements, width, b, valid[b]);
+        append_cache(expected[lanes[b]], row_k, row_v, row_positions);
+        const int base = contexts[b];
+        insert_request_columns(
+            ideal_attention_visible(row_q, expected[lanes[b]], valid[b], base + valid[b],
+                                    [&](int token, int pos) {
+                                        return pos < base ||
+                                               ((static_cast<unsigned>(masks[b * width + token]) >>
+                                                 (pos - base)) &
+                                                1U) != 0U;
+                                    }),
+            q_column_elements, width, b, reference);
+    }
+    const std::string label = std::string("causal tree batch ") + geometry.name +
+                              " B=" + std::to_string(batch) + (graph_replay ? " graph" : "");
+    const auto output       = copy_from_guarded<std::uint16_t>(dout, q.size());
+    int failures            = verify_attention(label, bf16_bits_to_double(output), reference,
+                                               attention_criterion(storage));
+    failures += verify_invalid_columns_zero(label, output, geometry, width, valid);
+    failures += cache.verify(label, expected);
+    return failures;
+}
+
+int run_tree_batch_cases() {
+    int failures = 0;
+    failures += run_tree_batch_case({61}, {16}, {0}, 2901u, false);
+    failures += run_tree_batch_case({4077}, {16}, {0}, 2902u, true);
+    failures += run_tree_batch_case({29, 1000, 30001}, {16, 9, 16}, {2, 0, 1}, 2903u, false);
+    failures +=
+        run_tree_batch_case({127, 63, 2048, 5, 511, 64, 9000, 700}, {16, 16, 3, 16, 12, 16, 16, 1},
+                            {7, 0, 4, 2, 6, 1, 5, 3}, 2904u, true);
     return failures;
 }
 
@@ -2469,6 +2634,7 @@ int run_softmax_attention_k8v4_tests() {
     int failures = run_k8v4_cases();
     failures += run_quantized_batch_cases(KvCacheStorage::Fp8KeyNvfp4Value, 815u);
     failures += report_quantization_quality(KvCacheStorage::Fp8KeyNvfp4Value, 819u);
+    failures += run_tree_batch_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention k8v4 independent correctness\n";
     return failures == 0 ? 0 : 1;
@@ -2491,6 +2657,7 @@ int run_softmax_attention_causal_cache_tests() {
     failures += run_fp8_cases();
     failures += run_batch_cases();
     failures += run_dflash2_cases();
+    failures += run_tree_batch_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention public-contract correctness\n";
     return failures == 0 ? 0 : 1;

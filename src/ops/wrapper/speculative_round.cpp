@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: speculative verify-tree acceptance.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "ninfer/ops/speculative_round.h"
 #include "ops/launcher/speculative_round.h"
 
@@ -219,6 +222,92 @@ void speculative_accept_sparse_drafts(
         target_tokens, logits, drafts, candidate_ids, proposal_q, current_extents, round_lengths,
         round_anchors, licensed_tokens, licensed_counts, accepted_drafts, token_domain, configs,
         envelope.all_rows_greedy_without_penalties, scratch, stream);
+}
+
+void speculative_accept_tree_drafts(const Tensor& target_tokens, const Tensor& logits,
+                                    const Tensor& drafts, const Tensor& tree_parents,
+                                    const Tensor& current_extents, Tensor& round_lengths,
+                                    Tensor& round_anchors, Tensor& licensed_tokens,
+                                    Tensor& licensed_counts, Tensor& accepted_drafts,
+                                    Tensor& accepted_columns, std::int32_t token_domain,
+                                    const SamplingConfig* configs,
+                                    SpeculativeAcceptExecutionEnvelope envelope,
+                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    constexpr const char* op = "speculative_accept_tree_drafts";
+    if (token_domain != kSparseTokenDomain) {
+        throw std::invalid_argument("speculative_accept_tree_drafts: token_domain must be 248077");
+    }
+    const std::int32_t k = drafts.ne[0];
+    if (k < 1 || k > kSparseMaxDrafts)
+        throw std::invalid_argument("speculative_accept_tree_drafts: K must be 1..15");
+    const std::int32_t columns = k + 1;
+    const std::int32_t batch   = drafts.ne[1];
+    if (batch < 1 || batch > kSparseMaxBatch) {
+        throw std::invalid_argument("speculative_accept_tree_drafts: B must be 1..8");
+    }
+    require_matrix(target_tokens, DType::I32, columns, batch, op, "target_tokens");
+    require_tensor3(logits, DType::BF16, kSparsePhysicalRows, columns, batch, op, "logits");
+    require_matrix(drafts, DType::I32, k, batch, op, "drafts");
+    require_matrix(tree_parents, DType::I32, columns, batch, op, "tree_parents");
+    require_vector(current_extents, DType::I32, batch, op, "current_extents");
+    require_vector(round_lengths, DType::I32, batch, op, "round_lengths");
+    require_vector(round_anchors, DType::I32, batch, op, "round_anchors");
+    require_matrix(licensed_tokens, DType::I32, columns, batch, op, "licensed_tokens");
+    require_vector(licensed_counts, DType::I32, batch, op, "licensed_counts");
+    require_vector(accepted_drafts, DType::I32, batch, op, "accepted_drafts");
+    require_matrix(accepted_columns, DType::I32, columns, batch, op, "accepted_columns");
+    if (configs == nullptr) {
+        throw std::invalid_argument("speculative_accept_tree_drafts: configs must be non-null");
+    }
+    auto scratch_scope      = workspace.scope();
+    const std::size_t bytes = speculative_accept_sparse_drafts_workspace_capacity_bytes(
+        token_domain, envelope, k, k, batch, batch);
+    const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
+    detail::speculative_accept_tree_drafts_launch(
+        target_tokens, logits, drafts, tree_parents, current_extents, round_lengths, round_anchors,
+        licensed_tokens, licensed_counts, accepted_drafts, accepted_columns, token_domain, configs,
+        envelope.all_rows_greedy_without_penalties, scratch, stream);
+}
+
+void speculative_compact_columns(Tensor& values, const Tensor& rows, const Tensor& accepted_columns,
+                                 const Tensor& accepted, cudaStream_t stream) {
+    constexpr const char* op = "speculative_compact_columns";
+    require_dtype(values, DType::BF16, op, "values");
+    const std::int32_t width = values.ne[1];
+    const std::int32_t batch = accepted.ne[0];
+    if (values.ne[0] <= 0 || width <= 0 || values.ne[3] != 1) {
+        throw std::invalid_argument("speculative_compact_columns: invalid values shape");
+    }
+    require_vector(accepted, DType::I32, batch, op, "accepted");
+    require_matrix(accepted_columns, DType::I32, width, batch, op, "accepted_columns");
+    if (rows.data != nullptr) {
+        require_vector(rows, DType::I32, batch, op, "rows");
+    } else if (values.ne[2] < batch) {
+        throw std::invalid_argument("speculative_compact_columns: values has too few rows");
+    }
+    detail::speculative_compact_columns_launch(values, rows, accepted_columns, accepted, stream);
+}
+
+void speculative_compact_k8v4_kv(std::span<const PagedKVBatchLayerView> layers,
+                                 const Tensor& kv_table_rows, const Tensor& cache_positions,
+                                 const Tensor& accepted_columns, const Tensor& accepted,
+                                 cudaStream_t stream) {
+    constexpr const char* op = "speculative_compact_k8v4_kv";
+    const std::int32_t batch = accepted.ne[0];
+    const std::int32_t width = accepted_columns.ne[0];
+    require_vector(accepted, DType::I32, batch, op, "accepted");
+    require_vector(kv_table_rows, DType::I32, batch, op, "kv_table_rows");
+    require_matrix(accepted_columns, DType::I32, width, batch, op, "accepted_columns");
+    require_matrix(cache_positions, DType::I32, width, batch, op, "cache_positions");
+    for (const PagedKVBatchLayerView& layer : layers) {
+        if (layer.storage != KvCacheStorage::Fp8KeyNvfp4Value || layer.head_dim != 256 ||
+            layer.block_tables.data != layers.front().block_tables.data) {
+            throw std::invalid_argument("speculative_compact_k8v4_kv: invalid K8V4 layer");
+        }
+    }
+    if (layers.empty()) { return; }
+    detail::speculative_compact_k8v4_launch(layers, kv_table_rows, cache_positions,
+                                            accepted_columns, accepted, stream);
 }
 
 void speculative_select_accepted_hidden(const Tensor& hidden, const Tensor& selectors, Tensor& out,

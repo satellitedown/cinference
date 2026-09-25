@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: verify-tree frame tensors.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 #include "models/qwen3_5/program/internal.h"
 
@@ -117,6 +120,10 @@ struct TargetVerifyFrameView {
     Tensor current_extents;
     Tensor candidate_ids;
     Tensor proposal_q;
+    // Verify-tree rounds only (empty for chains): see DFlashDecodeStateLayout.
+    Tensor tree_parents;
+    Tensor tree_masks;
+    Tensor accepted_columns;
     Tensor frontiers;
     Tensor anchors;
     Tensor licensed_tokens;
