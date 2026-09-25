@@ -82,7 +82,9 @@ output distribution and accepts more tokens per round:
 `ninfer-serve`, 16 coding tasks with thinking (effort medium), 1024 output tokens each, before
 prompt lookup existed. On copy-heavy edits (a file in the prompt, the complete updated file as the
 answer), the prompt-lookup chain adds 10–52% more tokens/s on top of trees; on the chat tasks it has
-no measurable effect. Perplexity is unchanged. [Measurements](results/rtx5090-fafstmobel-dflash2-verify-trees.json).
+no measurable effect. On the benchmark corpus (`ninfer_bench`, greedy, 512 tokens) trees with
+prompt lookup reach 144.0 / 894.9 / 851.2 tok/s after 1K / 16K / 64K-token prompts, against 100.8 / 573.1 /
+625.4 for path verification. Perplexity is unchanged. [Measurements](results/rtx5090-fafstmobel-dflash2-verify-trees.json).
 
 ### Historical Huihui measurements
 

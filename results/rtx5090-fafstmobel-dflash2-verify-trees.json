@@ -9,30 +9,158 @@
   "serving_chat": {
     "method": "ninfer-serve, max concurrency 1, no prefix reuse; 16 coding tasks (system prompt plus one user request), OpenAI Chat streaming, thinking with reasoning effort medium, 1024 output tokens per request; server restarted between variants. Sampling rows use the model defaults (temperature 1, top-k 20, top-p 0.95). The tree runs in this table predate prompt lookup.",
     "rows": [
-      {"sampling": "default, seed 1", "path": {"accepted_per_round": 3.264, "decode_tok_s": 265.8}, "tree": {"accepted_per_round": 4.119, "decode_tok_s": 318.2}},
-      {"sampling": "default, seed 2", "path": {"accepted_per_round": 3.479, "decode_tok_s": 271.3}, "tree": {"accepted_per_round": 4.053, "decode_tok_s": 305.5}},
-      {"sampling": "greedy", "path": {"accepted_per_round": 3.711, "decode_tok_s": 307.2}, "tree": {"accepted_per_round": 4.692, "decode_tok_s": 351.5}}
+      {
+        "sampling": "default, seed 1",
+        "path": {
+          "accepted_per_round": 3.264,
+          "decode_tok_s": 265.8
+        },
+        "tree": {
+          "accepted_per_round": 4.119,
+          "decode_tok_s": 318.2
+        }
+      },
+      {
+        "sampling": "default, seed 2",
+        "path": {
+          "accepted_per_round": 3.479,
+          "decode_tok_s": 271.3
+        },
+        "tree": {
+          "accepted_per_round": 4.053,
+          "decode_tok_s": 305.5
+        }
+      },
+      {
+        "sampling": "greedy",
+        "path": {
+          "accepted_per_round": 3.711,
+          "decode_tok_s": 307.2
+        },
+        "tree": {
+          "accepted_per_round": 4.692,
+          "decode_tok_s": 351.5
+        }
+      }
     ],
     "prompt_lookup_on_chat": "Same tasks, seeds 1 and 2, trees without vs with the lookup chain: 4.086 vs 4.008 accepted per round; the per-request paired difference is -0.9% with a standard error of 1.8% (no measurable effect)."
   },
   "agent_edit_tasks": {
     "method": "ninfer CLI, one request each: a source file (1-2K tokens) in the prompt with an instruction to change it and print the complete updated file; reasoning effort low, model default sampling, seed 7, up to 3000 output tokens. Trees without vs with the prompt-lookup chain.",
     "rows": [
-      {"task": "Python script: add two CLI options and a progress print", "tokens_per_round": [5.68, 8.62], "decode_tok_s": [315.8, 480.3]},
-      {"task": "Python script: extract a class and add type hints", "tokens_per_round": [7.33, 8.04], "decode_tok_s": [411.0, 450.3]},
-      {"task": "C++ header: add documentation comments and one helper", "tokens_per_round": [8.08, 9.04], "decode_tok_s": [453.9, 513.7]}
+      {
+        "task": "Python script: add two CLI options and a progress print",
+        "tokens_per_round": [
+          5.68,
+          8.62
+        ],
+        "decode_tok_s": [
+          315.8,
+          480.3
+        ]
+      },
+      {
+        "task": "Python script: extract a class and add type hints",
+        "tokens_per_round": [
+          7.33,
+          8.04
+        ],
+        "decode_tok_s": [
+          411.0,
+          450.3
+        ]
+      },
+      {
+        "task": "C++ header: add documentation comments and one helper",
+        "tokens_per_round": [
+          8.08,
+          9.04
+        ],
+        "decode_tok_s": [
+          453.9,
+          513.7
+        ]
+      }
     ]
   },
   "product_benchmark": {
     "method": "ninfer_bench on the bench corpus, greedy, 512 generated tokens, three alternating runs per variant; trees before prompt lookup.",
     "rows": [
-      {"prompt_tokens": 1024, "path": {"round_ms": 16.144, "decode_tok_s": 101.3}, "tree": {"round_ms": 16.693, "decode_tok_s": 142.0}},
-      {"prompt_tokens": 16384, "path": {"round_ms": 16.805, "decode_tok_s": 564.3}, "tree": {"round_ms": 17.274, "decode_tok_s": 570.6}},
-      {"prompt_tokens": 65536, "path": {"round_ms": 18.097, "decode_tok_s": 602.9}, "tree": {"round_ms": 18.240, "decode_tok_s": 638.0}}
+      {
+        "prompt_tokens": 1024,
+        "path": {
+          "round_ms": 16.144,
+          "decode_tok_s": 101.3
+        },
+        "tree": {
+          "round_ms": 16.693,
+          "decode_tok_s": 142.0
+        }
+      },
+      {
+        "prompt_tokens": 16384,
+        "path": {
+          "round_ms": 16.805,
+          "decode_tok_s": 564.3
+        },
+        "tree": {
+          "round_ms": 17.274,
+          "decode_tok_s": 570.6
+        }
+      },
+      {
+        "prompt_tokens": 65536,
+        "path": {
+          "round_ms": 18.097,
+          "decode_tok_s": 602.9
+        },
+        "tree": {
+          "round_ms": 18.24,
+          "decode_tok_s": 638.0
+        }
+      }
     ]
   },
   "quality": {
     "perplexity": "ninfer-perplexity, 1M corpus quick, K8V4, context 65536, stride 32768: 4.08607 before and after (prefill path).",
     "greedy_rescoring": "8 raw-text prompts x 512 greedy tokens rescored by the causal scorer: mean log-probability of emitted tokens -0.1500 (path) vs -0.1447 (tree); tokens below -1: 132 vs 123."
+  },
+  "product_benchmark_with_lookup": {
+    "method": "ninfer_bench on the bench corpus, greedy, 512 generated tokens, three alternating runs per variant; path verification at de95662 vs verify trees with prompt lookup at a82d183.",
+    "rows": [
+      {
+        "prompt_tokens": 1024,
+        "path": {
+          "round_ms": 16.23,
+          "decode_tok_s": 100.8
+        },
+        "tree_with_lookup": {
+          "round_ms": 16.388,
+          "decode_tok_s": 144.0
+        }
+      },
+      {
+        "prompt_tokens": 16384,
+        "path": {
+          "round_ms": 16.547,
+          "decode_tok_s": 573.1
+        },
+        "tree_with_lookup": {
+          "round_ms": 16.35,
+          "decode_tok_s": 894.9
+        }
+      },
+      {
+        "prompt_tokens": 65536,
+        "path": {
+          "round_ms": 17.424,
+          "decode_tok_s": 625.4
+        },
+        "tree_with_lookup": {
+          "round_ms": 17.691,
+          "decode_tok_s": 851.2
+        }
+      }
+    ]
   }
 }
