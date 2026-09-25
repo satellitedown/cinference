@@ -67,6 +67,23 @@ The fifth pass also pipelines K8V4 prompt attention (`42e4b36`, `2d77e27`), whos
 
 A serving sweep through `ninfer-serve` on a synthetic Python coding prompt (OpenAI Chat, greedy, 512 output tokens, 1K–190K context, one sample per point) measured 19–28% shorter rounds than `b4e8ed4` and 14–21% shorter time to first token from 32K up; for example, the 190K request's first token arrived in 51.3 s instead of 64.8 s. Single-sample tokens/s varies more because greedy trajectories, and therefore acceptance, differ between the builds. [Measurements](results/rtx5090-fafstmobel-dflash2-kernels-5.json); the first kernel pass measured 10–21% shorter rounds ([measurements](results/rtx5090-fafstmobel-dflash2-kernels.json)).
 
+### DFlash2 verify trees
+
+`--verify-tree` (`a82d183`) verifies a best-first tree of fifteen DFlash2 proposals, merged with a
+prompt-lookup continuation of the context, in the same sixteen verify columns. It keeps the target's
+output distribution and accepts more tokens per round:
+
+| Workload | Path verification | Verify tree |
+|---|---:|---:|
+| Coding chat, default sampling (seed 1) | 3.26 accepted/round, 265.8 tok/s | 4.12, **318.2 tok/s** |
+| Coding chat, default sampling (seed 2) | 3.48 accepted/round, 271.3 tok/s | 4.05, **305.5 tok/s** |
+| Coding chat, greedy | 3.71 accepted/round, 307.2 tok/s | 4.69, **351.5 tok/s** |
+
+`ninfer-serve`, 16 coding tasks with thinking (effort medium), 1024 output tokens each, before
+prompt lookup existed. On copy-heavy edits (a file in the prompt, the complete updated file as the
+answer), the prompt-lookup chain adds 10–52% more tokens/s on top of trees; on the chat tasks it has
+no measurable effect. Perplexity is unchanged. [Measurements](results/rtx5090-fafstmobel-dflash2-verify-trees.json).
+
 ### Historical Huihui measurements
 
 The following results used the previous **Huihui Qwen3.8-27B Abliterated NVFP4** model, not fafstmobel:

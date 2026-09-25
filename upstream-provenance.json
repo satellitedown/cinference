@@ -191,6 +191,7 @@
       "results/rtx5090-fafstmobel-dflash2-kernels-4.json",
       "results/rtx5090-fafstmobel-dflash2-kernels-5.json",
       "results/rtx5090-fafstmobel-dflash2-kernels.json",
+      "results/rtx5090-fafstmobel-dflash2-verify-trees.json",
       "src/models/qwen3_5/program/speculative/prompt_lookup.cpp",
       "src/models/qwen3_5/program/speculative/prompt_lookup.h",
       "src/ops/linear/fp8/fp8_a8_quantize.cuh",
