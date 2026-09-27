@@ -83,12 +83,19 @@ __device__ __forceinline__ unsigned long long l2_weight_policy(bool read_once) {
     return policy;
 }
 
-// 16-byte cp.async.cg whose L2 fill carries `policy` (see l2_weight_policy).
+// 16-byte cp.async.cg whose L2 fill carries `policy` (see l2_weight_policy). CUDA 13.1's ptxas
+// leaves the cache-hint operands of some of these fills uninitialized (an illegal instruction at
+// run time), so toolkits before the validated 13.4 issue the fill without the hint.
 __device__ __forceinline__ void cp_async_cg_policy(void* smem_dst, const void* gmem_src,
                                                    unsigned long long policy) {
+#if __CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4)
     asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;\n"
                  :
                  : "r"(smem_addr(smem_dst)), "l"(gmem_src), "l"(policy));
+#else
+    static_cast<void>(policy);
+    cp_async<16, Cache::cg>(smem_dst, gmem_src);
+#endif
 }
 
 // Stores a key whose consumer runs after a larger weight stream: the evict-last fill keeps the
