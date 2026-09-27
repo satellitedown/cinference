@@ -10,19 +10,49 @@
     "q8_drafter_projection_us_per_round": 1447.5,
     "q4_drafter_projection_us_per_round": 1118.2,
     "per_call_us": {
-      "mlp_gate_up_swiglu": [120.4, 70.2],
-      "mlp_down_finish_conv": [60.0, 52.6],
-      "attention_output_finish_conv": [15.0, 12.3],
-      "feature_projection": [88.0, 80.7],
-      "qkv_projection_q8_unchanged": [23.9, 23.9],
-      "proposal_head_q4_unchanged": [237.7, 241.0]
+      "mlp_gate_up_swiglu": [
+        120.4,
+        70.2
+      ],
+      "mlp_down_finish_conv": [
+        60.0,
+        52.6
+      ],
+      "attention_output_finish_conv": [
+        15.0,
+        12.3
+      ],
+      "feature_projection": [
+        88.0,
+        80.7
+      ],
+      "qkv_projection_q8_unchanged": [
+        23.9,
+        23.9
+      ],
+      "proposal_head_q4_unchanged": [
+        237.7,
+        241.0
+      ]
     },
     "note": "Q8 per-call values for MLP down, attention output and feature projection are read from the mixed grid-320 kernel group of the Q8 profile."
   },
   "acceptance": {
     "method": "ninfer-serve with --verify-tree, 32768 context, K8V4, no prefix reuse; 16 coding tasks x seeds 1 and 2, thinking with reasoning effort medium, model default sampling (T=1, top-k 20, top-p 0.95), 1024 output tokens per request (profiles/exp/sample_accept.py)",
-    "q8_drafter": {"produced": 30914, "drafted": 92002, "accepted": 24716, "rounds": 6166, "accepted_per_round": 4.008},
-    "q4_drafter": {"produced": 31281, "drafted": 92806, "accepted": 25019, "rounds": 6230, "accepted_per_round": 4.016}
+    "q8_drafter": {
+      "produced": 30914,
+      "drafted": 92002,
+      "accepted": 24716,
+      "rounds": 6166,
+      "accepted_per_round": 4.008
+    },
+    "q4_drafter": {
+      "produced": 31281,
+      "drafted": 92806,
+      "accepted": 25019,
+      "rounds": 6230,
+      "accepted_per_round": 4.016
+    }
   },
   "capacity": {
     "profile": "installer profile: 262144 context and KV, K8V4, DFlash2 K=15 with optimized head and verify trees, vision, 2 host state slots, 1 GiB host KV; desktop holding 1.48 GiB of VRAM",
@@ -34,5 +64,40 @@
     "Q4 Linear conformance including 5120x25600 across GEMV, K-split capacities, row-split MMA and the prefill route",
     "Q4 LinearSwiGLU conformance with two row tiles per small-T CTA",
     "ninfer_qwen3_5_dflash2_real_test on the Q4-drafter artifact: K=15 chain and tree at B=1 and B=8 graph (B=8 with vision) and B=2 eager"
-  ]
+  ],
+  "context_sweep": {
+    "method": "ninfer_bench, 262144-token corpus, verify trees with prompt lookup, greedy, 256 generated tokens, Q8 and Q4 drafter artifacts alternating for 5 rounds; the Omarchy screensaver held ~23% of SM time throughout, so absolute times are inflated and the round-time ratio is the controlled metric",
+    "median_ms_per_round": {
+      "8192": [
+        22.17,
+        21.688
+      ],
+      "32768": [
+        22.717,
+        22.245
+      ],
+      "131072": [
+        25.768,
+        25.291
+      ]
+    },
+    "round_time_change": {
+      "8192": "-2.2%",
+      "32768": "-2.1%",
+      "131072": "-1.9%"
+    },
+    "note": "Tokens per round of a single 256-token trajectory differ by about one round between drafters (8K 13.47 vs 12.80, 32K 14.22 vs 13.47, 131K 14.22 vs 14.22); see high_acceptance for an aggregate."
+  },
+  "high_acceptance": {
+    "method": "ninfer_bench, 262144-token corpus, verify trees, greedy, 512 generated tokens after 4K, 8K, ..., 32K-token prompts (8 trajectories per drafter)",
+    "q8_drafter": {
+      "rounds": 269,
+      "tokens_per_round": 15.227
+    },
+    "q4_drafter": {
+      "rounds": 269,
+      "tokens_per_round": 15.227
+    }
+  },
+  "greedy_equivalence": "BF16 KV, DFlash2 K=15, 6 prompts x 256 greedy tokens: the Q4 and Q8 drafters emit identical token IDs on all prompts."
 }
