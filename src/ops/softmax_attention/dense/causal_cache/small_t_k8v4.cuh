@@ -1198,8 +1198,10 @@ __launch_bounds__(K8V4WideSchedule<Geometry, TokenTile>::Threads, 1) __global__
     // Adds one tile's PV product over column tiles [First, First + Count) (8 value dimensions each)
     // of a 16-row tile: rescale by the tile's row factors, then multiply the FP16 P fragments by
     // the widened V slot. The operations per element do not depend on which warp owns the column.
+    // The P bound names Schedule::Bc: CUDA 13.1's front end crashes on a template lambda whose
+    // parameter type uses an enclosing dependent local constant.
     const auto accumulate_pv = [&]<int First, int Count>(float (&acc)[Count][4],
-                                                         const unsigned (&pf)[Bc / 16][4],
+                                                         const unsigned (&pf)[Schedule::Bc / 16][4],
                                                          float alpha0, float alpha1, int slot) {
         // Unchanged row maxima give alpha == 1 exactly; skip the no-op rescale.
         if (__any_sync(0xffffffffU, alpha0 != 1.0F || alpha1 != 1.0F)) {
