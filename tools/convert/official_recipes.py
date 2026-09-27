@@ -1,3 +1,5 @@
+# Modified by satellitedown for Cinference: store DFlash2 drafter projections as Q4.
+# See NOTICE and upstream-provenance.json for upstream attribution.
 """Official representation recipes built from the same public conversion functions."""
 
 from __future__ import annotations
@@ -43,7 +45,16 @@ def _optional(model, recipe):
                 )
             ):
                 continue
-            _assign(recipe, name, Q8)
+            # Target verification makes DFlash2 drafter precision an acceptance choice, not an
+            # output-quality one. Q4 halves its weight stream with unchanged acceptance; the fused
+            # QKV input projection (shared by the context key/value projections) keeps Q8, its only
+            # native form.
+            if name.startswith("dflash2/") and not name.endswith(
+                ("/attention/query", "/attention/key", "/attention/value")
+            ):
+                _assign(recipe, name, Q4)
+            else:
+                _assign(recipe, name, Q8)
     for backend in ("dflash", "dflash2"):
         if backend not in model.components:
             continue

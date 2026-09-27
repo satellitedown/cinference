@@ -1,3 +1,6 @@
+# Modified by satellitedown for Cinference: build the DFlash2 feature projection shape.
+# See NOTICE and upstream-provenance.json for upstream attribution.
+
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q4_rowsplit_gemm_mma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q4_rowsplit_gemm_simt.cu"
@@ -6,6 +9,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n1024_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n4096_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k6144.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n5120_k25600.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n6144_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n7168_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n34816_k5120.cu"

@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: cover the DFlash2 feature projection shape.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "ops/linear/linear_test_common.h"
 
 #include <array>
@@ -88,6 +91,16 @@ int q4_a16_conformance() {
     };
     failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
                           {5120, 6144, 149U, Comparison::Sampled, false, kN5120K6144});
+
+    // DFlash2 feature projection: GEMV, every K-split capacity, both row-split MMA schedules and
+    // the wide prefill route.
+    constexpr std::array kN5120K25600{
+        convenience(1), graph(2),  graph(4),  a16(5),    graph(8),  a16(9),    graph(16),
+        a16(17),        graph(24), a16(25),   graph(32), a16(33),   graph(96), a16(97),
+        graph(192),     a16(193),  a16(1024),
+    };
+    failures += run_shape("Q4_A16", ActivationCompute::A16, make_q4_g64_fp16_weight,
+                          {5120, 25600, 151U, Comparison::Sampled, false, kN5120K25600});
 
     // Full-output oracle covers every mechanism this geometry selects and both sides of every
     // switch boundary in the token extent.

@@ -13,6 +13,7 @@ Built from [NInfer](https://github.com/Neroued/ninfer), with source-level change
 - **Expanded CPU/GPU round handling:** enlarged draft and token-position buffers and updated native validation for the longer windows. This carries MTP-10 through the decoding path, not just the command-line options.
 - **Faster DFlash2 verification:** rewrote the verify-width kernels behind fafstmobel's DFlash2-15 rounds: small-token FP8/NVFP4 projection schedules, a double-buffered K-split FP8 LinearAdd, staged GDN replay records with lane-shared reductions, a warp-specialized K8V4 attention kernel that accumulates PV products in FP16 from exactly widened V and balances them across SM sub-partitions, evict-first L2 fills for once-read verify weights, wider bank-conflict-free proposal-head tiles, a GDN record convolution fused into its input projection, a fused RMSNorm-SwiGLU FFN that hands both NVFP4 projections pre-quantized inputs, a fused query/key RMSNorm-RoPE, a K8V4 verify query prepared once per block, mask-free softmax for unmasked key tiles, L2 discards of consumed attention partials, warp-merged proposal top-k groups, GDN norm-gating blocks that share inputs across heads and token tiles, next-layer GDN state warmed in L2 during replay records, RMSNorm fused with the E4M3 quantization of the attention and FP8 FFN inputs, and verify attention blocks whose otherwise idle compute warps take part of the other rows' PV products. Each kernel is qualified against the existing independent oracles; greedy speculative output still matches plain target decoding.
 - **Faster long-prompt prefill:** a pipelined K8V4 prompt attention kernel. Two groups of score warps take turns on the key tiles, running QK and the online softmax, while PV warps multiply the previous tile and widen the next one's V. Its outputs are bit-identical to the kernel it replaces.
+- **Q4 DFlash2 drafter:** the official Qwen3.8 NVFP4 recipe now stores the drafter's projections as Q4 (its fused QKV projection keeps Q8). The drafter only proposes tokens and verification is exact, so this halves its weight stream without changing the output distribution. New Q4 routes serve the drafter's finish convolution and feature projection, and small-T Q4 SwiGLU shares staged activations across row tiles.
 - **Ready-to-run fafstmobel setup:** a Swift-based Qwen3.8-27B derivative with Huihui's abliteration delta and NVFP4/FP8 text weights. One ~23.7 GB NInfer v3 file bundles text, vision, MTP, and the pretrained DFlash2 draft; no local conversion or separate draft download is needed. The recommended installer uses the engine's existing DFlash2 support, not MTP-10.
 
 ## Run
@@ -85,6 +86,12 @@ answer), the prompt-lookup chain adds 10–52% more tokens/s on top of trees; on
 no measurable effect. On the benchmark corpus (`ninfer_bench`, greedy, 512 tokens) trees with
 prompt lookup reach 144.0 / 894.9 / 851.2 tok/s after 1K / 16K / 64K-token prompts, against 100.8 / 573.1 /
 625.4 for path verification. Perplexity is unchanged. [Measurements](results/rtx5090-fafstmobel-dflash2-verify-trees.json).
+
+### Q4 DFlash2 drafter
+
+Reconverting fafstmobel with the current recipe changes only the 16 drafter projection objects; every target, vision, MTP and proposal-head object stays byte-identical. The drafter's projection kernels drop from 1,447.5 to 1,118.2 µs per round (−329 µs, about 2% of an 8K round), and acceptance is unchanged: 4.016 vs 4.008 accepted tokens per round over 32 thinking-mode coding requests with trees and default sampling.
+
+The file shrinks from 23.7 to 22.9 GB and resident weights from 21.7 to 20.9 GiB. On an RTX 5090 whose desktop holds 1.5 GB, the installer's full profile (262,144-token K8V4 context, vision, trees) now starts with 993 MiB free; with the Q8 drafter it fails 275 MB short. The published `satellitedown/fafstmobel` artifact still carries the Q8 drafter until it is reconverted. [Measurements](results/rtx5090-fafstmobel-q4-drafter.json).
 
 ### Historical Huihui measurements
 

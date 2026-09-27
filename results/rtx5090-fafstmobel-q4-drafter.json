@@ -1,0 +1,38 @@
+{
+  "scope": "fafstmobel's DFlash2 drafter projections stored as Q4 instead of Q8 (official qwen3_8_27b_nvfp4 recipe; the fused QKV projection and its shared context key/value projections keep Q8, their only native form). Only drafter proposals change; target verification is exact, so the output distribution is the target's. All target, vision, MTP and proposal-head objects are byte-identical to the published artifact.",
+  "hardware": "NVIDIA GeForce RTX 5090 32 GB; desktop GPU clients active (the Omarchy fullscreen screensaver and compositor held 21-34% of SM time during the serving run), so wall-clock tok/s here is not comparable with earlier records",
+  "model": {
+    "published": "satellitedown/fafstmobel 54202e1, fafstmobel.ninfer, 23,719,715,844 bytes, drafter projections Q8",
+    "q4_drafter": "same sources converted with the updated official recipe; 22,883,654,212 payload bytes; 16 of 1246 objects differ (dflash2 feature projection and each layer's attention output, MLP down and MLP gate/up)"
+  },
+  "drafter_kernels": {
+    "method": "nsys with graph-node tracing, ninfer_bench bench corpus pp8192+tg128, path verification, K=15, optimized proposal head, K8V4; per call-site median durations summed per round (robust to desktop time slicing)",
+    "q8_drafter_projection_us_per_round": 1447.5,
+    "q4_drafter_projection_us_per_round": 1118.2,
+    "per_call_us": {
+      "mlp_gate_up_swiglu": [120.4, 70.2],
+      "mlp_down_finish_conv": [60.0, 52.6],
+      "attention_output_finish_conv": [15.0, 12.3],
+      "feature_projection": [88.0, 80.7],
+      "qkv_projection_q8_unchanged": [23.9, 23.9],
+      "proposal_head_q4_unchanged": [237.7, 241.0]
+    },
+    "note": "Q8 per-call values for MLP down, attention output and feature projection are read from the mixed grid-320 kernel group of the Q8 profile."
+  },
+  "acceptance": {
+    "method": "ninfer-serve with --verify-tree, 32768 context, K8V4, no prefix reuse; 16 coding tasks x seeds 1 and 2, thinking with reasoning effort medium, model default sampling (T=1, top-k 20, top-p 0.95), 1024 output tokens per request (profiles/exp/sample_accept.py)",
+    "q8_drafter": {"produced": 30914, "drafted": 92002, "accepted": 24716, "rounds": 6166, "accepted_per_round": 4.008},
+    "q4_drafter": {"produced": 31281, "drafted": 92806, "accepted": 25019, "rounds": 6230, "accepted_per_round": 4.016}
+  },
+  "capacity": {
+    "profile": "installer profile: 262144 context and KV, K8V4, DFlash2 K=15 with optimized head and verify trees, vision, 2 host state slots, 1 GiB host KV; desktop holding 1.48 GiB of VRAM",
+    "q8_drafter": "fails: runtime reservation needs 8,608,179,713 bytes, 8,333,295,616 available; weights 21.7 GiB",
+    "q4_drafter": "starts: weights 20.9 GiB, 993.2 MiB free after startup"
+  },
+  "qualification": [
+    "linear_dynamic_grouped_conv_add oracle test over Q8 and Q4 projections, C=4096/17408, W=2..16, B=1..8, eager and graph replay",
+    "Q4 Linear conformance including 5120x25600 across GEMV, K-split capacities, row-split MMA and the prefill route",
+    "Q4 LinearSwiGLU conformance with two row tiles per small-T CTA",
+    "ninfer_qwen3_5_dflash2_real_test on the Q4-drafter artifact: K=15 chain and tree at B=1 and B=8 graph (B=8 with vision) and B=2 eager"
+  ]
+}

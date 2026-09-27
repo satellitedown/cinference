@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: select the K-split staging depth.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include <stdexcept>
@@ -6,14 +9,14 @@
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 
 namespace ninfer::ops::detail {
-template <int OutputRows, int InputRows, int Capacity>
+template <int OutputRows, int InputRows, int Capacity, int Stages = 1>
 void launch_q4_ksplit(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using Geometry = Q4LinearGeometry<OutputRows, InputRows>;
     static_assert(OutputRows % Q4KSplitMmaSchedule::kRowsPerCta == 0);
     if (weight.padded_shape[1] != InputRows)
         throw std::invalid_argument("q4 K-split: padded K differs from geometry");
     q4_ksplit_mma_kernel<Geometry, (Capacity + 7) / 8 * 8, Capacity, Q4KSplitStoreEpilogue,
-                         Q4KSplitIdentityRows, true>
+                         Q4KSplitIdentityRows, true, 1, Stages>
         <<<OutputRows / 16, Q4KSplitMmaSchedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),

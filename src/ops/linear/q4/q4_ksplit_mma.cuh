@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: multi-tile staging; rotated codes; magic widening.
+// Modified by satellitedown for Cinference: multi-tile staging; rotated codes; magic widening;
+// optional staging depth.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -74,9 +75,12 @@ __device__ __forceinline__ int q4_ksplit_code_offset(int row, int byte) {
 // slice of each K group feeds every row tile of the CTA, so wide heads amortize the activation
 // traffic over RowTiles weight tiles. Each output keeps the single-tile arithmetic: the same MMA
 // sequence per 64-wide group, the same scale application and the same cross-warp reduction order.
+// Stages > 1 keeps the next K groups' copies in flight while the current group multiplies; the
+// staging depth changes when data arrives, not the arithmetic.
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4KSplitStoreEpilogue,
-          class RowPolicy = Q4KSplitIdentityRows, bool MaskedColumns = false, int RowTiles = 1>
-__launch_bounds__(256, RowTiles == 1 ? 6 : 2) __global__
+          class RowPolicy = Q4KSplitIdentityRows, bool MaskedColumns = false, int RowTiles = 1,
+          int Stages = 1>
+__launch_bounds__(256, RowTiles == 1 ? 6 : (RowTiles == 2 ? 4 : 2)) __global__
     void q4_ksplit_mma_kernel(const __nv_bfloat16* __restrict__ x,
                               const std::uint8_t* __restrict__ codes,
                               const std::uint8_t* __restrict__ scales,
@@ -99,21 +103,19 @@ __launch_bounds__(256, RowTiles == 1 ? 6 : 2) __global__
     static_assert((kHidden % kGroupK) == 0);
     static_assert(RowPolicy::kOutputRowsPerCta <= kTileRows);
     static_assert(RowTiles >= 1);
+    static_assert(Stages >= 1 && Stages <= 3);
 
     union SharedStorage {
         struct {
-            std::uint8_t codes[kRows][kGroupK / 2];
-            __nv_bfloat16 activations[kWarps][kTileCols * kTileK];
-            std::uint16_t scales[kRows][kWarps];
+            std::uint8_t codes[Stages][kRows][kGroupK / 2];
+            __nv_bfloat16 activations[Stages][kWarps][kTileCols * kTileK];
+            std::uint16_t scales[Stages][kRows][kWarps];
         } staging;
 
         float partial[kWarps * RowTiles * kNt * 32 * 4];
     };
 
     __shared__ __align__(16) SharedStorage shared;
-    auto& code_shared  = shared.staging.codes;
-    auto& x_shared     = shared.staging.activations;
-    auto& scale_shared = shared.staging.scales;
 
     const int tid          = static_cast<int>(threadIdx.x);
     const int warp         = tid >> 5;
@@ -127,12 +129,13 @@ __launch_bounds__(256, RowTiles == 1 ? 6 : 2) __global__
         return cta_row0 + tile * RowPolicy::kOutputRowsPerCta;
     };
 
-    const auto stage_x = [&](int group_k0) {
+    const auto stage_x = [&](int stage, int group_k0) {
         constexpr int kItemsPerSplit = ActiveCols * (kTileK / 8);
         for (int item = lane; item < kItemsPerSplit; item += 32) {
             const int col = item / (kTileK / 8);
             const int k8  = item - col * (kTileK / 8);
-            auto* dst     = &x_shared[warp][col * kTileK + q4_ksplit_swizzle_64(col, k8 * 8)];
+            auto* dst     = &shared.staging.activations[stage][warp][col * kTileK +
+                                                                 q4_ksplit_swizzle_64(col, k8 * 8)];
             if constexpr (MaskedColumns) {
                 const int source = col < live_columns ? col : 0;
                 cp_async_zfill<16>(dst,
@@ -146,21 +149,21 @@ __launch_bounds__(256, RowTiles == 1 ? 6 : 2) __global__
         }
     };
 
-    const auto stage_weight = [&](int group_k0) {
+    const auto stage_weight = [&](int stage, int group_k0) {
         for (int task = tid; task < kRows * kCodeChunks; task += kWarps * 32) {
             const int row        = task / kCodeChunks;
             const int chunk      = task - row * kCodeChunks;
             const int tile       = row / kTileRows;
             const int weight_row = row_policy.weight_row(output_row0(tile), row - tile * kTileRows);
             cp_async<16, Schedule::kCodeCache>(
-                &code_shared[row][q4_ksplit_code_offset(row, chunk * 16)],
+                &shared.staging.codes[stage][row][q4_ksplit_code_offset(row, chunk * 16)],
                 codes + static_cast<std::int64_t>(weight_row) * kCodeRowBytes + group_k0 / 2 +
                     chunk * 16);
         }
         for (int row = tid; row < kRows; row += kWarps * 32) {
             const int tile       = row / kTileRows;
             const int weight_row = row_policy.weight_row(output_row0(tile), row - tile * kTileRows);
-            cp_async<16>(&scale_shared[row][0],
+            cp_async<16>(&shared.staging.scales[stage][row][0],
                          scales + (static_cast<std::int64_t>(weight_row) * Geometry::kGroupsPerRow +
                                    group_k0 / 64) *
                                       2);
@@ -172,15 +175,10 @@ __launch_bounds__(256, RowTiles == 1 ? 6 : 2) __global__
     const int warp_koff         = k_split * kTileK;
     float acc[RowTiles][kNt][4] = {};
 
-    stage_weight(0);
-    stage_x(0);
-    cp_commit();
-    cp_wait<0>();
-    __syncthreads();
-
-#pragma unroll
-    for (int group_index = 0; group_index < kGroups; ++group_index) {
-        const int group_k0                = group_index * kGroupK;
+    const auto multiply_group = [&](int stage) {
+        const auto& code_shared  = shared.staging.codes[stage];
+        const auto& x_shared     = shared.staging.activations[stage];
+        const auto& scale_shared = shared.staging.scales[stage];
         float group_acc[RowTiles][kNt][4] = {};
 
 #pragma unroll
@@ -224,15 +222,52 @@ __launch_bounds__(256, RowTiles == 1 ? 6 : 2) __global__
                 acc[tile][nt][3] = fmaf(group_acc[tile][nt][3], bot_scale, acc[tile][nt][3]);
             }
         }
+    };
 
-        if (group_index + 1 < kGroups) {
-            __syncthreads();
-            stage_weight(group_k0 + kGroupK);
-            stage_x(group_k0 + kGroupK);
-            cp_commit();
-            cp_wait<0>();
-            __syncthreads();
+    if constexpr (Stages == 1) {
+        stage_weight(0, 0);
+        stage_x(0, 0);
+        cp_commit();
+        cp_wait<0>();
+        __syncthreads();
+
+#pragma unroll
+        for (int group_index = 0; group_index < kGroups; ++group_index) {
+            multiply_group(0);
+            if (group_index + 1 < kGroups) {
+                __syncthreads();
+                stage_weight(0, (group_index + 1) * kGroupK);
+                stage_x(0, (group_index + 1) * kGroupK);
+                cp_commit();
+                cp_wait<0>();
+                __syncthreads();
+            }
         }
+    } else {
+        // Groups 0..Stages-2 are in flight before the loop. Iteration g waits for group g, then
+        // refills the buffer group g - 1 used (every warp has passed the barrier, so it is no
+        // longer read) with group g + Stages - 1 before multiplying group g.
+#pragma unroll
+        for (int stage = 0; stage + 1 < Stages; ++stage) {
+            if (stage < kGroups) {
+                stage_weight(stage, stage * kGroupK);
+                stage_x(stage, stage * kGroupK);
+            }
+            cp_commit();
+        }
+#pragma unroll
+        for (int group_index = 0; group_index < kGroups; ++group_index) {
+            cp_wait<Stages - 2>();
+            __syncthreads();
+            const int refill = group_index + Stages - 1;
+            if (refill < kGroups) {
+                stage_weight(refill % Stages, refill * kGroupK);
+                stage_x(refill % Stages, refill * kGroupK);
+            }
+            cp_commit();
+            multiply_group(group_index % Stages);
+        }
+        cp_wait<0>();
     }
 
     __syncthreads();

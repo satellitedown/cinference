@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: share small-T activation staging across two row tiles.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 
@@ -69,14 +72,21 @@ struct Q4SwiGluSmallTEpilogue {
 
 using SmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
+// Each CTA shares one staged activation slice across its row tiles. With a single tile every CTA
+// restages the full activation for 8 gate and 8 up rows, which makes the L2 activation traffic four
+// times the 4-bit weight bytes; per-output arithmetic is unchanged by the tile count.
+constexpr int kSmallTRowTiles = 2;
+
 template <int ActiveCols>
 void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     constexpr int TileCols =
         ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
-    constexpr int kBlocks = kIntermediate / Q4SwiGluSmallTRows::kOutputRowsPerCta;
+    constexpr int kBlocks =
+        kIntermediate / (Q4SwiGluSmallTRows::kOutputRowsPerCta * kSmallTRowTiles);
+    static_assert(kIntermediate % (Q4SwiGluSmallTRows::kOutputRowsPerCta * kSmallTRowTiles) == 0);
     const Q4SwiGluSmallTEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), x.ne[1]};
     q4_ksplit_mma_kernel<Q4SwiGluSmallTGeometry, TileCols, ActiveCols, Q4SwiGluSmallTEpilogue,
-                          Q4SwiGluSmallTRows, true>
+                         Q4SwiGluSmallTRows, true, kSmallTRowTiles>
         <<<kBlocks, Q4KSplitMmaSchedule::kThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
             static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),

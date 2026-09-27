@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: register the DFlash2 feature projection shape.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q4/q4_shapes.h"
 #include <array>
@@ -14,6 +17,7 @@ constexpr std::array kShapes{
     ShapeEntry{1024, 5120, select_q4_n1024_k5120},
     ShapeEntry{4096, 5120, select_q4_n4096_k5120},
     ShapeEntry{5120, 6144, select_q4_n5120_k6144},
+    ShapeEntry{5120, 25600, select_q4_n5120_k25600},
     ShapeEntry{6144, 5120, select_q4_n6144_k5120},
     ShapeEntry{7168, 5120, select_q4_n7168_k5120},
     ShapeEntry{34816, 5120, select_q4_n34816_k5120},
