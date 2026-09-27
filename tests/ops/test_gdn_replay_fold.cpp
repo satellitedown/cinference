@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: no next-layer state hint; accepted-path folds.
+// Modified by satellitedown for Cinference: no next-layer state hint; accepted-path folds;
+// graph snapshot ordered before its restore.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -385,9 +386,13 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     if (width == 16 && rows == 8) {
         cuda_synchronize();
         DeviceBuffer original(state_bytes);
-        cuda_check(cudaMemcpy(original.p, state_base, state_bytes, cudaMemcpyDeviceToDevice),
-                   "save graph initial state");
         DeviceContext context;
+        // A device-to-device cudaMemcpy returns before the copy runs, and the context stream is
+        // non-blocking, so take the snapshot on that stream and finish it before any restore.
+        cuda_check(cudaMemcpyAsync(original.p, state_base, state_bytes, cudaMemcpyDeviceToDevice,
+                                   context.stream),
+                   "save graph initial state");
+        context.synchronize();
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;
         definition.capture(context.stream, [&] {
