@@ -99,5 +99,19 @@
       "tokens_per_round": 15.227
     }
   },
-  "greedy_equivalence": "BF16 KV, DFlash2 K=15, 6 prompts x 256 greedy tokens: the Q4 and Q8 drafters emit identical token IDs on all prompts."
+  "greedy_equivalence": "BF16 KV, DFlash2 K=15, 6 prompts x 256 greedy tokens: the Q4 and Q8 drafters emit identical token IDs on all prompts.",
+  "kv_cache_perplexity": {
+    "method": "ninfer-perplexity on the Q4-drafter artifact (text weights identical to the Q8-drafter artifact), ninfer-ppl-1m-v1 quick corpus, context 65536, stride 32768, 261,167 scored tokens, same build and corpus for every KV representation",
+    "overall_ppl": {
+      "bf16": 4.08915,
+      "fp8-e4m3-r256": 4.088427,
+      "k8v4": 4.086067
+    },
+    "overall_mean_nll": {
+      "bf16": 1.408337,
+      "fp8-e4m3-r256": 1.40816,
+      "k8v4": 1.407583
+    },
+    "note": "K8V4, which --verify-tree requires, scores within 0.08% of BF16 KV and no worse than fp8 KV on this corpus."
+  }
 }
