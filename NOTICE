@@ -38,7 +38,10 @@ convolution taps, tree acceptance, and post-accept compaction of the accepted
 path. The official Qwen3.8 NVFP4 recipe stores DFlash2 drafter projections as
 Q4 (the fused QKV projection keeps Q8), served by a Q4 finish-convolution
 projection route, a Q4 feature-projection shape, row-tiled small-T Q4 SwiGLU
-staging and an optional two-stage Q4 K-split pipeline.
+staging and an optional two-stage Q4 K-split pipeline. CUDA 13.1 builds stay
+correct: toolkits before 13.4 issue weight fills without the L2 cache-policy
+hint that CUDA 13.1's ptxas miscompiles, and the wide K8V4 attention kernel
+avoids a CUDA 13.1 front-end crash.
 Publication changes add fork branding, provenance and measurement scope,
 correct stale range text, make local-path instructions portable, and omit
 machine-local agent automation and unrelated sponsorship configuration.
