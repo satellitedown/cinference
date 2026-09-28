@@ -2,7 +2,7 @@
   "scope": "fafstmobel's DFlash2 drafter projections stored as Q4 instead of Q8 (official qwen3_8_27b_nvfp4 recipe; the fused QKV projection and its shared context key/value projections keep Q8, their only native form). Only drafter proposals change; target verification is exact, so the output distribution is the target's. All target, vision, MTP and proposal-head objects are byte-identical to the published artifact.",
   "hardware": "NVIDIA GeForce RTX 5090 32 GB; desktop GPU clients active (the Omarchy fullscreen screensaver and compositor held 21-34% of SM time during the serving run), so wall-clock tok/s here is not comparable with earlier records",
   "model": {
-    "published": "satellitedown/fafstmobel 54202e1, fafstmobel.ninfer, 23,719,715,844 bytes, drafter projections Q8",
+    "published": "satellitedown/fafstmobel 879903480d257762989d05785ee7d8935074703f: this Q4-drafter conversion, fafstmobel.ninfer, 22,884,131,844 bytes. Baseline: revision 54202e174c5f05945fbb873d1c2d8384e2643bd3, 23,719,715,844 bytes, drafter projections Q8",
     "q4_drafter": "same sources converted with the updated official recipe; 22,883,654,212 payload bytes; 16 of 1246 objects differ (dflash2 feature projection and each layer's attention output, MLP down and MLP gate/up)"
   },
   "drafter_kernels": {

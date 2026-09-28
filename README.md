@@ -91,7 +91,7 @@ prompt lookup reach 144.0 / 894.9 / 851.2 tok/s after 1K / 16K / 64K-token promp
 
 Reconverting fafstmobel with the current recipe changes only the 16 drafter projection objects; every target, vision, MTP and proposal-head object stays byte-identical. The drafter's projection kernels drop from 1,447.5 to 1,118.2 µs per round (−329 µs, about 2% of an 8K round), and acceptance is unchanged: 4.016 vs 4.008 accepted tokens per round over 32 thinking-mode coding requests with trees and default sampling.
 
-The file shrinks from 23.7 to 22.9 GB and resident weights from 21.7 to 20.9 GiB. On an RTX 5090 whose desktop holds 1.5 GB, the installer's full profile (262,144-token K8V4 context, vision, trees) now starts with 993 MiB free; with the Q8 drafter it fails 275 MB short. The published `satellitedown/fafstmobel` artifact still carries the Q8 drafter until it is reconverted. [Measurements](results/rtx5090-fafstmobel-q4-drafter.json).
+The file shrinks from 23.7 to 22.9 GB and resident weights from 21.7 to 20.9 GiB. On an RTX 5090 whose desktop holds 1.5 GB, the installer's full profile (262,144-token K8V4 context, vision, trees) now starts with 993 MiB free; with the Q8 drafter it fails 275 MB short. `satellitedown/fafstmobel` publishes this Q4 drafter from revision `879903480d25`; revision `54202e1` keeps the Q8 drafter for older runtimes. [Measurements](results/rtx5090-fafstmobel-q4-drafter.json).
 
 ### Historical Huihui measurements
 

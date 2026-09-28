@@ -24,7 +24,7 @@ The executable `--help` output is the exact source for command-line option spell
 
 | Model | Weights | Download | Versioned model card source |
 |---|---|---|---|
-| **fafstmobel (recommended)** | `nvfp4` / `fp8` | [Hugging Face](https://huggingface.co/satellitedown/fafstmobel) · [installer](https://github.com/satellitedown/fafstmobel-cinference) | [model card](https://huggingface.co/satellitedown/fafstmobel/blob/54202e174c5f05945fbb873d1c2d8384e2643bd3/README.md) |
+| **fafstmobel (recommended)** | `nvfp4` / `fp8` | [Hugging Face](https://huggingface.co/satellitedown/fafstmobel) · [installer](https://github.com/satellitedown/fafstmobel-cinference) | [model card](https://huggingface.co/satellitedown/fafstmobel/blob/879903480d257762989d05785ee7d8935074703f/README.md) |
 | Qwen3.6-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | [model card](../model-cards/Qwen3.6-27B-NInfer/README.md) |
 | Qwen3.6-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) |
 | Qwen3.8-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |
