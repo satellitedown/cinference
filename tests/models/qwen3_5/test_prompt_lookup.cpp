@@ -73,6 +73,30 @@ int main() {
         expect(prior < 0.0F && after_hits > prior, "hits raise the estimate");
         expect(after_miss < after_hits, "misses lower the estimate");
     }
+    {
+        // A suffix that repeats its earlier occurrence far beyond the longest window is trusted
+        // from the first proposal, enough for a lookup round; a window-length match keeps the
+        // prior and is not.
+        std::vector<TokenId> passage;
+        for (TokenId i = 0; i < 100; ++i) passage.push_back(1000 + i);
+        std::vector<TokenId> copied = passage;
+        copied.insert(copied.end(), passage.begin(), passage.end());
+        PromptLookup long_match;
+        expect(propose(long_match, copied, 8) ==
+                   std::vector<TokenId>({1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007}),
+               "copied passage continues with its next repetition");
+        std::vector<TokenId> window{7};
+        for (TokenId i = 0; i < 8; ++i) window.push_back(2000 + i);
+        window.push_back(5);
+        window.push_back(8);
+        for (TokenId i = 0; i < 8; ++i) window.push_back(2000 + i);
+        PromptLookup window_match;
+        expect(propose(window_match, window, 8).size() == 8, "window-length match proposes");
+        expect(long_match.log_probability() > window_match.log_probability(),
+               "a long match raises the estimate");
+        expect(long_match.confident() && !window_match.confident(),
+               "only the long match is confident");
+    }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " prompt_lookup\n";
     return failures == 0 ? 0 : 1;
 }
