@@ -14,6 +14,12 @@ constexpr double kPriorHits   = 1.0;
 constexpr double kPriorMisses = 3.0;
 constexpr double kMinimum     = 0.01;
 constexpr double kMaximum     = 0.97;
+// A proposal whose context suffix matches its earlier occurrence beyond the longest window is
+// likely copied text: each further matched token counts as kMatchWeight prior hits, up to
+// kMatchLimit matched tokens, so a long match is trusted from its first round.
+constexpr std::size_t kMatchFloor = 8;
+constexpr std::size_t kMatchLimit = 128;
+constexpr double kMatchWeight     = 1.0;
 
 std::uint64_t window_hash(const TokenId* tokens, std::uint32_t length) {
     std::uint64_t hash = 0x9e3779b97f4a7c15ULL ^ length;
@@ -104,6 +110,11 @@ std::uint32_t PromptLookup::propose(std::span<const TokenId> context, std::span<
         if (end1 == 0) { continue; }
         const std::size_t end = end1 - 1;
         if (!std::equal(suffix, suffix + size, context.data() + end + 1 - size)) { continue; }
+        std::size_t match = size;
+        while (match < kMatchLimit && match <= end &&
+               context[end - match] == context[length - 1 - match]) {
+            ++match;
+        }
         // The continuation after the occurrence; past the anchor it repeats with the period.
         const std::size_t period = length - 1 - end;
         for (std::size_t j = 0; j < out.size(); ++j) {
@@ -112,6 +123,7 @@ std::uint32_t PromptLookup::propose(std::span<const TokenId> context, std::span<
         }
         proposal_.assign(out.begin(), out.end());
         proposal_window_ = static_cast<int>(window);
+        proposal_match_  = match;
         return static_cast<std::uint32_t>(out.size());
     }
     return 0;
@@ -131,8 +143,12 @@ void PromptLookup::observe(std::span<const TokenId> committed) {
 float PromptLookup::log_probability() const noexcept {
     if (proposal_window_ < 0) { return 0.0F; }
     const Estimate& estimate = estimates_[static_cast<std::size_t>(proposal_window_)];
-    const double probability = (estimate.hits + kPriorHits) /
-                               (estimate.hits + estimate.misses + kPriorHits + kPriorMisses);
+    const double matched =
+        kMatchWeight *
+        static_cast<double>(proposal_match_ > kMatchFloor ? proposal_match_ - kMatchFloor : 0);
+    const double probability =
+        (estimate.hits + kPriorHits + matched) /
+        (estimate.hits + estimate.misses + kPriorHits + kPriorMisses + matched);
     return static_cast<float>(std::log(std::clamp(probability, kMinimum, kMaximum)));
 }
 

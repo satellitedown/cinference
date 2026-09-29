@@ -13,7 +13,8 @@ namespace ninfer::models::qwen3_5 {
 // token is the round's anchor) with the tokens that followed the most recent earlier occurrence of
 // its longest indexed suffix window (8, 4 or 2 tokens). Each window length keeps its own estimate
 // of the probability that a proposed token is committed given that the previous one was, learned
-// from how far earlier proposals matched the committed tokens.
+// from how far earlier proposals matched the committed tokens; a suffix that matches its earlier
+// occurrence well beyond the longest window raises the estimate of that proposal.
 class PromptLookup {
 public:
     static constexpr std::array<std::uint32_t, 3> kWindows{8, 4, 2};
@@ -52,7 +53,8 @@ private:
     std::size_t indexed_  = 0; // window end positions [0, indexed_) are in the tables
     TokenId indexed_last_ = 0;
     std::vector<TokenId> proposal_;
-    int proposal_window_ = -1;
+    int proposal_window_        = -1;
+    std::size_t proposal_match_ = 0; // tokens of the context suffix equal to the occurrence's
 };
 
 } // namespace ninfer::models::qwen3_5
