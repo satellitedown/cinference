@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: side stream for the overlapped replay fold.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
@@ -154,6 +157,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.replay_records) {
         replay_records.emplace(backing, *plan.persistent.replay_records);
         replay_fold.emplace(*replay_records, state_images->linear().all_layers_view());
+        if (is_masked_draft_backend(speculative_backend)) { replay_fold_side.create(); }
     }
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None) ||
         replay_fold.has_value() != replay_records.has_value()) {
@@ -313,6 +317,37 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
 ProgramImpl::~ProgramImpl() noexcept {
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+}
+
+void ReplayFoldSideStream::create() {
+    int least    = 0;
+    int greatest = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+    CUDA_CHECK(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, least));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+}
+
+ReplayFoldSideStream::~ReplayFoldSideStream() noexcept {
+    if (stream != nullptr) {
+        (void)cudaStreamSynchronize(stream);
+        (void)cudaStreamDestroy(stream);
+    }
+    if (ready != nullptr) { (void)cudaEventDestroy(ready); }
+    if (done != nullptr) { (void)cudaEventDestroy(done); }
+}
+
+void ProgramImpl::drain_replay_fold() {
+    if (!replay_fold_pending) { return; }
+    CUDA_CHECK(cudaStreamWaitEvent(device.stream, replay_fold_side.done, 0));
+    replay_fold_pending = false;
+}
+
+// A failed wait leaves the context faulted, and the next checked CUDA call reports it.
+void ProgramImpl::drain_replay_fold_noexcept() noexcept {
+    if (!replay_fold_pending) { return; }
+    (void)cudaStreamWaitEvent(device.stream, replay_fold_side.done, 0);
+    replay_fold_pending = false;
 }
 
 std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,

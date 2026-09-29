@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: fold sync only for staged appends; verify-tree folds.
+// Modified by satellitedown for Cinference: staged-append fold sync; tree folds; fold overlap.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/program/program_impl.h"
@@ -704,6 +704,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
     runtime::ExecutionTiming* failed_timing) {
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Post, failed_timing);
+    drain_replay_fold();
     if (lanes.empty() || lanes.size() > max_concurrency || accepted_tokens.size() != lanes.size() ||
         terminal.size() != lanes.size() || cancelled.size() != lanes.size() ||
         prefix_execution_splits.size() != lanes.size()) {
@@ -808,8 +809,26 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             is_masked_draft_backend(speculative_backend) && io.dflash_decode
                 ? io.dflash_decode->accepted_columns
                 : Tensor{};
+        // Masked-draft rounds fold on the side stream after everything queued so far; the next
+        // round joins the fold before its target verification, and any other submission drains
+        // it first. A row that ends here has no next round, so later work waits on the fold now.
+        const bool side_fold = replay_fold_side.stream != nullptr;
+        if (side_fold) {
+            CUDA_CHECK(cudaEventRecord(replay_fold_side.ready, device.stream));
+            CUDA_CHECK(cudaStreamWaitEvent(replay_fold_side.stream, replay_fold_side.ready, 0));
+        }
         replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
-                             record_columns, device.stream);
+                             record_columns, side_fold ? replay_fold_side.stream : device.stream);
+        if (side_fold) {
+            CUDA_CHECK(cudaEventRecord(replay_fold_side.done, replay_fold_side.stream));
+            replay_fold_pending = true;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                if (cancelled[row] != 0 || terminal[row] != 0) {
+                    drain_replay_fold();
+                    break;
+                }
+            }
+        }
 
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
         if (speculative_backend == SpeculativeBackend::DFlash2) {
@@ -895,6 +914,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         work.reset();
     } catch (...) {
         try {
+            drain_replay_fold();
             device.synchronize();
         } catch (...) {}
         work.reset();

@@ -1,7 +1,9 @@
+// Modified by satellitedown for Cinference: the compute stream takes the greatest priority.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/device.h"
 
 #include <cstdio>
-#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -61,10 +63,19 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
 
     cudaStream_t compute = nullptr;
     cudaStream_t load    = nullptr;
-    err                  = cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking);
+    // Greatest priority: blocks of deferred low-priority side-stream work (a DFlash round's replay
+    // fold) yield SM slots to it.
+    int least_priority    = 0;
+    int greatest_priority = 0;
+    err                   = cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
     if (err != cudaSuccess) {
         throw std::runtime_error(
-            cuda_error_message("cudaStreamCreateWithFlags(stream) failed", err));
+            cuda_error_message("cudaDeviceGetStreamPriorityRange failed", err));
+    }
+    err = cudaStreamCreateWithPriority(&compute, cudaStreamNonBlocking, greatest_priority);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            cuda_error_message("cudaStreamCreateWithPriority(stream) failed", err));
     }
 
     err = cudaStreamCreateWithFlags(&load, cudaStreamNonBlocking);

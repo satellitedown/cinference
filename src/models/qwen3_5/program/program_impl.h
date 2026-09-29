@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: per-sequence prompt-lookup state.
+// Modified by satellitedown for Cinference: per-sequence prompt-lookup state; fold overlap.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -433,6 +433,19 @@ struct RequestControl {
     std::optional<Prefill> prefill;
 };
 
+// Side stream and events of a Program's deferred replay fold (ProgramImpl::replay_fold_side).
+struct ReplayFoldSideStream {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t ready   = nullptr;
+    cudaEvent_t done    = nullptr;
+
+    ReplayFoldSideStream()                                       = default;
+    ReplayFoldSideStream(const ReplayFoldSideStream&)            = delete;
+    ReplayFoldSideStream& operator=(const ReplayFoldSideStream&) = delete;
+    ~ReplayFoldSideStream() noexcept;
+    void create();
+};
+
 class ProgramImpl {
 public:
     struct PressureRecoveryScratch {
@@ -601,6 +614,13 @@ public:
     std::unique_ptr<StateImageStore> state_store;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
+    // DFlash rounds commit their replay fold on a low-priority side stream, so it overlaps the next
+    // round's drafter phase, which reads no GDN state; that round joins replay_fold_side.done
+    // before target verification. Any other device submission first drains a pending fold.
+    ReplayFoldSideStream replay_fold_side;
+    bool replay_fold_pending = false;
+    void drain_replay_fold();
+    void drain_replay_fold_noexcept() noexcept;
     std::optional<DFlashPersistentState> dflash;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;

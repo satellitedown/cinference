@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: verify-tree frame tensors.
+// Modified by satellitedown for Cinference: verify-tree frame tensors; fold overlap.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -86,6 +86,9 @@ struct DFlashBatchContext {
     const qwen3_5::DFlashDecodeIngress& host_ingress;
     qwen3_5::DFlashDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Recorded after the previous round's replay fold on its side stream; the round joins it only
+    // before target verification, the first work that reads GDN state. Null: no deferred fold.
+    cudaEvent_t replay_fold_done = nullptr;
 };
 
 struct DFlashAppendContext {

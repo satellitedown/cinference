@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: DFlash2 verify trees and post-accept compaction.
+// Modified by satellitedown for Cinference: DFlash2 verify trees, compaction, replay-fold join.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/program/graph_execution.h"
@@ -635,6 +635,17 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         propose_batch_impl(state, frame, batch_size, k, envelopes);
         ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
                                                target_positions, state.execution.device.stream);
+        // The previous round's replay fold may still run on its side stream; the drafter above
+        // reads no GDN state, the target verification below does. Inside a capture the wait is
+        // an external event node, which each launch resolves against the latest record.
+        if (state.replay_fold_done != nullptr) {
+            const cudaStream_t stream      = state.execution.device.stream;
+            cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+            CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
+            CUDA_CHECK(cudaStreamWaitEvent(
+                stream, state.replay_fold_done,
+                status == cudaStreamCaptureStatusActive ? cudaEventWaitExternal : 0U));
+        }
 
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,

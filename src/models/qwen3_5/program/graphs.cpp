@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: use capture-derived MTP graph topology classes.
+// Modified by satellitedown for Cinference: capture-derived MTP graph topologies; fold overlap.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/program/program_impl.h"
@@ -394,7 +394,8 @@ void ProgramImpl::prepare_graphs() {
                                                    *io.dflash_decode,
                                                    *dflash_host_ingress,
                                                    *dflash_host_egress,
-                                                   state_images->continuation_hidden_store()};
+                                                   state_images->continuation_hidden_store(),
+                                                   replay_fold_side.done};
         const GraphExecutionProfile code_warm = batch_one_profiles.front();
         const ops::CausalAttentionExecutionEnvelope code_warm_target{
             1, static_cast<std::uint32_t>(std::min<std::uint64_t>(

@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: drain the overlapped replay fold before device work.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/planning/startup.h"
@@ -252,6 +255,7 @@ RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
 }
 
 std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
+    impl_->drain_replay_fold();
     return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
 }
 
@@ -266,6 +270,7 @@ std::optional<AdmissionCandidate> Program::inspect_admission(
 std::optional<ResourcePlan> Program::seal_identity(const AdmissionCandidate& admission,
                                                    const PreparedPrompt& prompt,
                                                    runtime::FinalScheduleIntent intent) {
+    impl_->drain_replay_fold();
     std::optional<AdmissionCandidate> sealed = impl_->seal_materialization(
         admission, PreparedPromptAccess::view(prompt), {}, {}, {}, {}, {}, {});
     if (!sealed) { return std::nullopt; }
@@ -315,6 +320,7 @@ Program::shared_capture_split_prefill_work(const AdmissionCandidate& candidate,
 runtime::ContextTransactionReserveStatus
 Program::start_resource_transaction(ResourcePlan&& plan, PreparedPrompt&& prompt,
                                     runtime::CancellationFlagView cancellation) {
+    impl_->drain_replay_fold();
     if (plan.revision_.value == 0 || plan.revision_ != impl_->resource_revision()) {
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
@@ -336,15 +342,20 @@ Program::prove_persistent_backfill(const RequestBasePlan& blocked_head,
 
 ContextTransactionProgress
 Program::progress_context_transaction(runtime::CancellationFlagView cancellation) {
+    impl_->drain_replay_fold();
     return impl_->progress_context_transaction(cancellation);
 }
 
-void Program::finalize_context_transaction() noexcept { impl_->finalize_context_transaction(); }
+void Program::finalize_context_transaction() noexcept {
+    impl_->drain_replay_fold_noexcept();
+    impl_->finalize_context_transaction();
+}
 
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,
                                          runtime::ExecutionTiming* failed_timing) {
+    impl_->drain_replay_fold();
     return impl_->advance_prefill(sequence, failed_timing);
 }
 
@@ -392,7 +403,10 @@ bool Program::shared_capture_matches(const CaptureOffer& offer,
     return impl_->shared_capture_matches(offer, shared);
 }
 
-void Program::skip_capture(CaptureOffer&& offer) { impl_->skip_capture(std::move(offer)); }
+void Program::skip_capture(CaptureOffer&& offer) {
+    impl_->drain_replay_fold();
+    impl_->skip_capture(std::move(offer));
+}
 
 runtime::ContextTransactionReserveStatus
 Program::reserve_active_capture(CaptureOffer&& offer, const SharedPrefixHandle* exact_shared,
@@ -400,6 +414,7 @@ Program::reserve_active_capture(CaptureOffer&& offer, const SharedPrefixHandle* 
                                 std::optional<runtime::CheckpointRef> private_replacement,
                                 bool permit_shared_publication,
                                 runtime::CancellationFlagView cancellation) {
+    impl_->drain_replay_fold();
     return impl_->reserve_active_capture(std::move(offer), exact_shared, replacement,
                                          private_replacement, permit_shared_publication,
                                          cancellation);
@@ -410,6 +425,7 @@ runtime::ContextTransactionReserveStatus Program::reserve_active_capture_with_pr
     const SharedPrefixHandle* replacement,
     std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
     CapturePressurePlan&& pressure, runtime::CancellationFlagView cancellation) {
+    impl_->drain_replay_fold();
     if (pressure.revision_.value == 0 || pressure.revision_ != impl_->resource_revision()) {
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
@@ -429,6 +445,7 @@ Program::append_forced_tokens(std::span<const SequenceHandle> sequences,
                               std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
                               std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
                               runtime::ExecutionTiming* failed_timing) {
+    impl_->drain_replay_fold();
     return impl_->append_forced_tokens(sequences, row_major_tokens, row_stride,
                                        prefix_execution_splits, failed_timing);
 }
@@ -441,22 +458,34 @@ CommitResult Program::commit(PendingBatch&& pending,
 }
 
 DiscardResult Program::abort_pending(PendingBatch&& pending) noexcept {
+    impl_->drain_replay_fold_noexcept();
     return impl_->abort_pending(std::move(pending));
 }
 
-FinishResult Program::finish(SequenceHandle sequence) noexcept { return impl_->finish(sequence); }
+FinishResult Program::finish(SequenceHandle sequence) noexcept {
+    impl_->drain_replay_fold_noexcept();
+    return impl_->finish(sequence);
+}
 
-AbortResult Program::abort(SequenceHandle sequence) noexcept { return impl_->abort(sequence); }
+AbortResult Program::abort(SequenceHandle sequence) noexcept {
+    impl_->drain_replay_fold_noexcept();
+    return impl_->abort(sequence);
+}
 
 ReleaseResult Program::release_continuation(ContinuationHandle&& continuation) noexcept {
+    impl_->drain_replay_fold_noexcept();
     return impl_->release_continuation(std::move(continuation));
 }
 
 ReleaseResult Program::release_shared_prefix(SharedPrefixHandle&& shared) noexcept {
+    impl_->drain_replay_fold_noexcept();
     return impl_->release_shared_prefix(std::move(shared));
 }
 
-void Program::fail_all_cleanup() noexcept { impl_->fail_all_cleanup(); }
+void Program::fail_all_cleanup() noexcept {
+    impl_->drain_replay_fold_noexcept();
+    impl_->fail_all_cleanup();
+}
 
 bool Program::isolated_request_feasible(const RequestBasePlan& base) const noexcept {
     return impl_->isolated_request_feasible(base);

@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: prompt-lookup chains for DFlash2 verify trees.
+// Modified by satellitedown for Cinference: DFlash2 prompt-lookup verify-tree chains; fold overlap.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/program/program_impl.h"
@@ -706,11 +706,14 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             *io.dflash_decode,
             *dflash_host_ingress,
             *dflash_host_egress,
-            state_images->continuation_hidden_store()};
+            state_images->continuation_hidden_store(),
+            replay_fold_side.done};
 
         mark_workspace_usage(workspace_plan.dflash_round);
         execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                        draft_window, envelopes, target_envelope, executable);
+        // The round joined the pending fold before its verification, so later work is ordered.
+        replay_fold_pending = false;
         submit_range.reset();
         timing.begin_wait();
         {
