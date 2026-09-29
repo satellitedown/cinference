@@ -1,0 +1,47 @@
+{
+  "scope": "fafstmobel DFlash2-15 with verify trees and K8V4 on one RTX 5090: the replay fold overlapped with the next round's drafter (e00a1c1), K-split Q4 drafter finish projections (ed1d11d), prompt-lookup match evidence (1e7d9c4) and lookup rounds (7f9ed3a), against 785473a. All changes keep the target's output distribution: the target's weights and kernels are unchanged, the split K is drafter-only, and trees only change which nodes are verified.",
+  "hardware": "NVIDIA GeForce RTX 5090 32 GB at the 575 W power limit; the desktop (Hyprland and a fullscreen screensaver) shares the GPU and time-slices about 1 ms of every round, so compare within one table",
+  "bench": {
+    "method": "ninfer_bench on the bench corpus (corpus_262144.ids), greedy, 256 generated tokens, --verify-tree, optimized proposal head, K8V4, 1024-token prefill chunks, max context 139264; 4 alternating runs per build (profiles/exp/ab_bins.sh); round = decode time per verification round",
+    "corpus_note": "The corpus repeats a small set of paragraphs, so the greedy continuation copies earlier text and the prompt-lookup chain is right for long stretches. Lookup-round gains on this corpus do not carry over to output that does not copy its context.",
+    "rows": [
+      {"prompt_tokens": 8192, "base": {"round_ms": 16.789, "tokens_per_round": 12.80, "tok_s": 762.4}, "head": {"round_ms": 15.799, "tokens_per_round": 14.22, "tok_s": 900.2, "lookup_rounds": "12 of 18"}, "tok_s_change": 0.181},
+      {"prompt_tokens": 32768, "base": {"round_ms": 17.330, "tokens_per_round": 13.47, "tok_s": 777.5}, "head": {"round_ms": 15.940, "tokens_per_round": 15.06, "tok_s": 944.7, "lookup_rounds": "17 of 17"}, "tok_s_change": 0.215},
+      {"prompt_tokens": 131072, "base": {"round_ms": 19.690, "tokens_per_round": 14.22, "tok_s": 722.3}, "head": {"round_ms": 18.360, "tokens_per_round": 16.00, "tok_s": 871.4, "lookup_rounds": "16 of 16"}, "tok_s_change": 0.206}
+    ],
+    "engine_only": {
+      "note": "e00a1c1 + ed1d11d against 785473a, identical tokens per round; two independent 4-run A/Bs",
+      "round_time_change": {"8192": [-0.011, -0.008], "32768": [-0.007, -0.009], "131072": [-0.008, -0.010]}
+    },
+    "lookup_evidence_only": {
+      "note": "1e7d9c4 without lookup rounds, one run each, tokens per round",
+      "tokens_per_round": {"8192": [12.80, 13.47], "32768": [13.47, 14.22], "131072": [14.22, 15.06]}
+    }
+  },
+  "serving": {
+    "method": "ninfer-serve, max concurrency 1, max context 32768, no prefix reuse, --verify-tree; server restarted per variant, 2 alternations. Chat: 16 coding tasks with thinking (effort medium), 1024 output tokens (profiles/exp/sample_accept.py). Edits: 4 repository files in the prompt, the complete updated file as the answer, effort low, up to 3000 tokens (profiles/exp/edit_accept.py). Sampling rows use the model defaults (T=1, top-k 20, top-p 0.95).",
+    "sampling": {
+      "note": "Sampled trajectories differ between builds, so these are unpaired.",
+      "chat": {"requests": 64, "base": {"tokens_per_round": 5.016, "tok_s": 303.2}, "head": {"tokens_per_round": 5.046, "tok_s": 307.5}},
+      "edits": {"requests": 16, "base": {"tokens_per_round": 9.434, "tok_s": 564.3}, "head": {"tokens_per_round": 9.169, "tok_s": 564.6}}
+    },
+    "greedy_lookup_only": {
+      "note": "ed1d11d against 7f9ed3a-equivalent build, greedy; isolates the two lookup commits. Half of the chat outputs and all edit outputs diverge at near-ties (see losslessness), so only partly paired.",
+      "chat": {"requests": 32, "before": {"tokens_per_round": 5.520, "tok_s": 337.9}, "after": {"tokens_per_round": 5.483, "tok_s": 335.4}},
+      "edits": {"requests": 8, "before": {"tokens_per_round": 9.089, "tok_s": 551.3}, "after": {"tokens_per_round": 9.003, "tok_s": 555.9}}
+    }
+  },
+  "losslessness": {
+    "greedy_bench": "3 x 1024 greedy tokens (8K, 32K, 131K) identical between the pre-lookup build and the lookup-round build",
+    "real_test": "ninfer_qwen3_5_dflash2_real_test (chain/tree, B=1/2/8, graph and eager, vision) passes; its new copied-passage case runs lookup rounds and matches the target's prefill argmax token by token",
+    "selector_test": "candidate_selector_lookup_chain equals the tree candidate_selector_tree builds for a certain chain",
+    "greedy_chat_divergence": "On chat task 0, the fold-overlap build reproduces 785473a for 1024 greedy tokens and the lookup build reproduces ed1d11d; ed1d11d differs from 785473a at token 66. Its drafter-only split K changes the lattice, hence the tree layout and the position of ancestor keys inside tensor-core tiles of the tree attention, which flips a near-tied argmax. This is floating-point accumulation order, as in any batch-dependent inference, not a change to the target model."
+  },
+  "rejected": [
+    "GDN g/beta on a side stream with a separate norm kernel: +0.3% (8K) and +0.5% (32K) round time",
+    "Small-T Q4 SwiGLU variants (4 row tiles; 4 warps, 3 stages): +0.2% and +0.1% round time",
+    "Order-0 FP8 exponent Huffman coding (2.603 bits per exponent, 84-86% of the tensor bytes): decode is issue-bound; best cold GEMV 49.3 vs 52.6 us (-6%), about 2% of a round if every FP8 route were rewritten",
+    "A B=1 CUDA Graph family for lookup rounds: about 0.5 GiB more graph allowance for 0.9% of a lookup round (eager rounds idle 541 vs 396 us per round)",
+    "W=32 verify trees for chat: about 10.7% more tokens per round offline, but attention, GDN records and small kernels add 8-10% round time at 8K"
+  ]
+}

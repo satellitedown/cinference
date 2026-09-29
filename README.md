@@ -93,6 +93,29 @@ Reconverting fafstmobel with the current recipe changes only the 16 drafter proj
 
 The file shrinks from 23.7 to 22.9 GB and resident weights from 21.7 to 20.9 GiB. On an RTX 5090 whose desktop holds 1.5 GB, the installer's full profile (262,144-token K8V4 context, vision, trees) now starts with 993 MiB free; with the Q8 drafter it fails 275 MB short. `satellitedown/fafstmobel` publishes this Q4 drafter from revision `879903480d25`; revision `54202e1` keeps the Q8 drafter for older runtimes. [Measurements](results/rtx5090-fafstmobel-q4-drafter.json).
 
+### Lookup rounds and a shorter round
+
+Four lossless changes on top of `785473a`: the ReplaySSM fold of each round overlaps the next
+round's drafter (`e00a1c1`), verify-width Q4 drafter finish projections split K across CTAs
+(`ed1d11d`), a long verbatim match with an earlier occurrence raises the prompt-lookup chain's
+confidence from its first round (`1e7d9c4`), and a round whose chain is near-certain verifies it
+alone, without drafting (lookup rounds, `7f9ed3a`).
+
+| Prompt tokens | Round time before → after | Tokens/round | Tokens/s before → after |
+|---:|---:|---:|---:|
+| 8,192 | 16.79 → 15.80 ms | 12.80 → 14.22 | 762.4 → **900.2** (+18.1%) |
+| 32,768 | 17.33 → 15.94 ms | 13.47 → 15.06 | 777.5 → **944.7** (+21.5%) |
+| 131,072 | 19.69 → 18.36 ms | 14.22 → 16.00 | 722.3 → **871.4** (+20.6%) |
+
+`ninfer_bench`, greedy, 256 generated tokens, verify trees, K8V4, four alternating runs per build.
+The benchmark corpus repeats a few paragraphs, so its output copies earlier text and lookup
+rounds carry most rounds; that part of the gain applies only to output that copies its context.
+The fold overlap and split K alone shorten rounds by 0.7–1.1% at identical acceptance. Through
+`ninfer-serve` with the model's default sampling, 16 thinking-mode coding chats run 303.2 → 307.5
+tok/s (+1.4%) and copy-heavy file edits 564.3 → 564.6 tok/s; neither accepts measurably more.
+Greedy bench output is identical, and the DFlash2 real test checks a copied passage token by token
+against the target. [Measurements](results/rtx5090-fafstmobel-lookup-rounds.json).
+
 ### Historical Huihui measurements
 
 The following results used the previous **Huihui Qwen3.8-27B Abliterated NVFP4** model, not fafstmobel:
