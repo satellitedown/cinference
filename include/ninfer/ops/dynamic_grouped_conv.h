@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: accept Q4 finish projections.
+// Modified by satellitedown for Cinference: accept Q4 finish projections; per-format capacity.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -71,12 +71,21 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
 
 /**
  * Returns the transient capacity required by linear_dynamic_grouped_conv_add for every width/batch
- * pair in the inclusive intervals. input_rows is 4096 or 17408, widths lie in [2,16], and batch
- * sizes in [1,8]. Capacity follows every shape-selected production route.
+ * pair in the inclusive intervals and either projection format. input_rows is 4096 or 17408,
+ * widths lie in [2,16], and batch sizes in [1,8]. Capacity follows every shape-selected production
+ * route.
  */
 [[nodiscard]] std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
     std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
     std::int32_t min_batch_size, std::int32_t max_batch_size);
+
+/**
+ * The same capacity for one projection format (Q8_G32_FP16 or Q4_G64_FP16). A single exact
+ * width/batch pair gives the peak workspace that format's route uses for that shape.
+ */
+[[nodiscard]] std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+    QType projection_qtype, std::int32_t input_rows, std::int32_t min_width,
+    std::int32_t max_width, std::int32_t min_batch_size, std::int32_t max_batch_size);
 
 /**
  * Op: linear_dynamic_grouped_conv_add

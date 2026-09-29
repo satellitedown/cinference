@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: dispatch Q4 finish projections.
+// Modified by satellitedown for Cinference: dispatch Q4 finish projections; per-format capacity.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -203,11 +203,29 @@ std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(std::int32_
                                                                      std::int32_t max_width,
                                                                      std::int32_t min_batch_size,
                                                                      std::int32_t max_batch_size) {
-    // Both projection formats materialize the same BF16 projection, so capacity is format-free.
-    return std::max(detail::q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                        input_rows, min_width, max_width, min_batch_size, max_batch_size),
-                    detail::q4_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                        input_rows, min_width, max_width, min_batch_size, max_batch_size));
+    // Q8 materializes a BF16 projection; narrow Q4 routes hold FP32 K-split partials instead.
+    return std::max(linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                        QType::Q8_G32_FP16, input_rows, min_width, max_width, min_batch_size,
+                        max_batch_size),
+                    linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                        QType::Q4_G64_FP16, input_rows, min_width, max_width, min_batch_size,
+                        max_batch_size));
+}
+
+std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+    QType projection_qtype, std::int32_t input_rows, std::int32_t min_width,
+    std::int32_t max_width, std::int32_t min_batch_size, std::int32_t max_batch_size) {
+    switch (projection_qtype) {
+    case QType::Q8_G32_FP16:
+        return detail::q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+            input_rows, min_width, max_width, min_batch_size, max_batch_size);
+    case QType::Q4_G64_FP16:
+        return detail::q4_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+            input_rows, min_width, max_width, min_batch_size, max_batch_size);
+    default:
+        throw std::invalid_argument(
+            "linear dynamic grouped conv add workspace: projection must be Q8 or Q4");
+    }
 }
 
 void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_weight,

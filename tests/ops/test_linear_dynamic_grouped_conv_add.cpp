@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: cover Q4 finish projections.
+// Modified by satellitedown for Cinference: cover Q4 finish projections; per-format capacity.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -214,8 +214,10 @@ int run_profile(std::int32_t input_rows, QType qtype) {
             const std::size_t bytes =
                 static_cast<std::size_t>(kHidden) * width * batch_size * sizeof(std::uint16_t);
             const auto exact = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                input_rows, width, width, batch_size, batch_size);
-            if (exact > capacity)
+                qtype, input_rows, width, width, batch_size, batch_size);
+            if (exact > capacity ||
+                ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                    input_rows, width, width, batch_size, batch_size) < exact)
                 throw std::runtime_error("workspace interval does not cover exact shape");
             GuardedDeviceBuffer scratch(exact);
             WorkspaceArena workspace(DeviceSpan{scratch.data(), exact});

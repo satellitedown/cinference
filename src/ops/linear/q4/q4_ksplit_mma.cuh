@@ -1,5 +1,5 @@
 // Modified by satellitedown for Cinference: multi-tile staging; rotated codes; magic widening;
-// optional staging depth.
+// optional staging depth; warp count and cross-CTA K splits with FP32 partial outputs.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -32,8 +32,9 @@ struct Q4LinearGeometry {
     static constexpr int kGroupsPerRow = kInputRows / 64;
 };
 
-struct Q4KSplitMmaSchedule {
-    static constexpr int kKWarps            = 8;
+template <int KWarps>
+struct Q4KSplitMmaScheduleOf {
+    static constexpr int kKWarps            = KWarps;
     static constexpr int kMinBlocksPerSm    = 6;
     static constexpr auto kCodeCache        = Cache::cg;
     static constexpr int kThreads           = kKWarps * 32;
@@ -41,6 +42,29 @@ struct Q4KSplitMmaSchedule {
     static constexpr int kGroupK            = kKWarps * kTileKPerWarp;
     static constexpr int kRowsPerCta        = 16;
     static constexpr int kRowsPerLoaderWarp = kRowsPerCta / kKWarps;
+};
+
+using Q4KSplitMmaSchedule = Q4KSplitMmaScheduleOf<8>;
+
+// K-split partial output: CTA (x, y) owns K slice y and stores its FP32 sums at
+// partials[(y * columns + col) * rows + row] for the live columns.
+struct Q4KSplitPartialEpilogue {
+    float* partials;
+    std::int32_t rows;
+    std::int32_t columns;
+
+    template <int Capacity>
+    __device__ __forceinline__ void store(int row, int col, float4 value) const {
+        float* slice = partials + static_cast<std::int64_t>(blockIdx.y) * columns * rows;
+        if (col < columns) {
+            slice[static_cast<std::int64_t>(col) * rows + row]     = value.x;
+            slice[static_cast<std::int64_t>(col) * rows + row + 8] = value.z;
+        }
+        if (col + 1 < columns) {
+            slice[static_cast<std::int64_t>(col + 1) * rows + row]     = value.y;
+            slice[static_cast<std::int64_t>(col + 1) * rows + row + 8] = value.w;
+        }
+    }
 };
 
 __device__ __forceinline__ int q4_ksplit_swizzle_64(int row, int col) {
@@ -71,39 +95,43 @@ __device__ __forceinline__ int q4_ksplit_code_offset(int row, int byte) {
     return (((byte >> 4) ^ (row & 7)) << 4) | (byte & 15);
 }
 
-// A CTA owns RowTiles 16-row weight tiles and splits K across eight warps. The staged activation
+// A CTA owns RowTiles 16-row weight tiles and splits K across its warps. The staged activation
 // slice of each K group feeds every row tile of the CTA, so wide heads amortize the activation
 // traffic over RowTiles weight tiles. Each output keeps the single-tile arithmetic: the same MMA
 // sequence per 64-wide group, the same scale application and the same cross-warp reduction order.
 // Stages > 1 keeps the next K groups' copies in flight while the current group multiplies; the
-// staging depth changes when data arrives, not the arithmetic.
+// staging depth changes when data arrives, not the arithmetic. KSplit > 1 gives CTA row y the
+// K slice y (a whole number of groups); such launches pair with Q4KSplitPartialEpilogue.
 template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4KSplitStoreEpilogue,
           class RowPolicy = Q4KSplitIdentityRows, bool MaskedColumns = false, int RowTiles = 1,
-          int Stages = 1>
-__launch_bounds__(256, RowTiles == 1 ? 6 : (RowTiles == 2 ? 4 : 2)) __global__
+          int Stages = 1, int Warps = 8, int KSplit = 1,
+          int MinBlocks = (RowTiles == 1 ? 6 : (RowTiles == 2 ? 4 : 2))>
+__launch_bounds__(Warps * 32, MinBlocks) __global__
     void q4_ksplit_mma_kernel(const __nv_bfloat16* __restrict__ x,
                               const std::uint8_t* __restrict__ codes,
                               const std::uint8_t* __restrict__ scales,
                               __nv_bfloat16* __restrict__ out, Epilogue epilogue = {},
                               RowPolicy row_policy = {}, int columns = ActiveCols) {
-    using Schedule              = Q4KSplitMmaSchedule;
+    using Schedule              = Q4KSplitMmaScheduleOf<Warps>;
     constexpr int kHidden       = Geometry::kInputRows;
     constexpr int kTileK        = Schedule::kTileKPerWarp;
     constexpr int kWarps        = Schedule::kKWarps;
     constexpr int kTileRows     = Schedule::kRowsPerCta;
     constexpr int kRows         = kTileRows * RowTiles;
     constexpr int kGroupK       = Schedule::kGroupK;
-    constexpr int kGroups       = kHidden / kGroupK;
+    constexpr int kGroups       = kHidden / kGroupK / KSplit;
     constexpr int kCodeRowBytes = kHidden / 2;
     constexpr int kTileCols     = TileCols;
     constexpr int kNt           = kTileCols / 8;
     constexpr int kCodeChunks   = kGroupK / 32;
     static_assert(kTileCols >= 8 && kTileCols <= 32 && (kTileCols % 8) == 0);
     static_assert(ActiveCols >= 1 && ActiveCols <= kTileCols && ActiveCols > kTileCols - 8);
-    static_assert((kHidden % kGroupK) == 0);
+    static_assert((kHidden % (kGroupK * KSplit)) == 0);
     static_assert(RowPolicy::kOutputRowsPerCta <= kTileRows);
     static_assert(RowTiles >= 1);
     static_assert(Stages >= 1 && Stages <= 3);
+    static_assert(KSplit == 1 || std::is_same_v<Epilogue, Q4KSplitPartialEpilogue>);
+    const int group_base = KSplit > 1 ? static_cast<int>(blockIdx.y) * kGroups * kGroupK : 0;
 
     union SharedStorage {
         struct {
@@ -139,12 +167,12 @@ __launch_bounds__(256, RowTiles == 1 ? 6 : (RowTiles == 2 ? 4 : 2)) __global__
             if constexpr (MaskedColumns) {
                 const int source = col < live_columns ? col : 0;
                 cp_async_zfill<16>(dst,
-                                   &x[static_cast<std::int64_t>(source) * kHidden + group_k0 +
-                                      warp * kTileK + k8 * 8],
+                                   &x[static_cast<std::int64_t>(source) * kHidden + group_base +
+                                      group_k0 + warp * kTileK + k8 * 8],
                                    col < live_columns ? 16 : 0);
             } else {
-                cp_async<16>(dst, &x[static_cast<std::int64_t>(col) * kHidden + group_k0 +
-                                     warp * kTileK + k8 * 8]);
+                cp_async<16>(dst, &x[static_cast<std::int64_t>(col) * kHidden + group_base +
+                                     group_k0 + warp * kTileK + k8 * 8]);
             }
         }
     };
@@ -157,16 +185,17 @@ __launch_bounds__(256, RowTiles == 1 ? 6 : (RowTiles == 2 ? 4 : 2)) __global__
             const int weight_row = row_policy.weight_row(output_row0(tile), row - tile * kTileRows);
             cp_async<16, Schedule::kCodeCache>(
                 &shared.staging.codes[stage][row][q4_ksplit_code_offset(row, chunk * 16)],
-                codes + static_cast<std::int64_t>(weight_row) * kCodeRowBytes + group_k0 / 2 +
-                    chunk * 16);
+                codes + static_cast<std::int64_t>(weight_row) * kCodeRowBytes +
+                    (group_base + group_k0) / 2 + chunk * 16);
         }
         for (int row = tid; row < kRows; row += kWarps * 32) {
             const int tile       = row / kTileRows;
             const int weight_row = row_policy.weight_row(output_row0(tile), row - tile * kTileRows);
-            cp_async<16>(&shared.staging.scales[stage][row][0],
-                         scales + (static_cast<std::int64_t>(weight_row) * Geometry::kGroupsPerRow +
-                                   group_k0 / 64) *
-                                      2);
+            cp_async<kWarps * 2>(&shared.staging.scales[stage][row][0],
+                                 scales + (static_cast<std::int64_t>(weight_row) *
+                                               Geometry::kGroupsPerRow +
+                                           (group_base + group_k0) / 64) *
+                                              2);
         }
     };
 
