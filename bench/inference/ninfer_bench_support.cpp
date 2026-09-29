@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: advertise MTP windows 1..10; parse --verify-tree.
+// Modified by satellitedown for Cinference: advertise MTP windows 1..10; parse --verify-tree;
+// report lookup rounds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "ninfer_bench_support.h"
@@ -177,6 +178,7 @@ SpeculativeStats aggregate_speculative(const TestResult& result) {
         out.drafted_tokens += in.drafted_tokens;
         out.accepted_tokens += in.accepted_tokens;
         out.fallback_steps += in.fallback_steps;
+        out.lookup_rounds += in.lookup_rounds;
         if (out.accepted_per_position.size() < in.accepted_per_position.size()) {
             out.accepted_per_position.resize(in.accepted_per_position.size());
         }
@@ -235,6 +237,7 @@ void append_speculative_json(std::ostringstream& out, const SpeculativeStats& st
         << indent << "  \"drafted_tokens\": " << stats.drafted_tokens << ",\n"
         << indent << "  \"accepted_tokens\": " << stats.accepted_tokens << ",\n"
         << indent << "  \"fallback_steps\": " << stats.fallback_steps << ",\n"
+        << indent << "  \"lookup_rounds\": " << stats.lookup_rounds << ",\n"
         << indent << "  \"acceptance_rate\": ";
     if (stats.drafted_tokens == 0) {
         out << "null";

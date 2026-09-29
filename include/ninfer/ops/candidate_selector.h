@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: lattice verify trees with prompt-lookup chains.
+// Modified by satellitedown for Cinference: lattice verify trees with prompt-lookup chains; lookup
+// rounds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -93,5 +94,20 @@ void candidate_selector_tree(const Tensor& candidate_ids, const Tensor& unary_sc
                              Tensor& drafts, Tensor& tree_parents, Tensor& tree_masks,
                              Tensor& rope_positions, WorkspaceArena& workspace,
                              cudaStream_t stream);
+
+/**
+ * Op: candidate_selector_lookup_chain
+ *
+ * Writes the verify tree of a lookup round, which verifies the prompt-lookup chain alone: with
+ * P=clamp(current_extents[b],0,K), columns 1..P are the chain in order, drafts[c-1,b] =
+ * lookup_tokens[c-1,b], tree_parents[c,b] = c-1, tree_masks[c,b] = (2<<c)-1 and
+ * rope_positions[c,b] = rope_positions[0,b] + c. The root column and the columns beyond P are
+ * written as by candidate_selector_tree. The caller guarantees that each row's chain covers its
+ * extent. current_extents is I32 [B], lookup_tokens and drafts are I32 [K,B], the other outputs
+ * I32 [K+1,B]; rope_positions[0,b] is an input. No workspace.
+ */
+void candidate_selector_lookup_chain(const Tensor& current_extents, const Tensor& lookup_tokens,
+                                     Tensor& drafts, Tensor& tree_parents, Tensor& tree_masks,
+                                     Tensor& rope_positions, cudaStream_t stream);
 
 } // namespace ninfer::ops

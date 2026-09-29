@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: MTP draft windows through K=10; DFlash2 verify trees.
+// Modified by satellitedown for Cinference: MTP draft windows through K=10; DFlash2 verify trees;
+// lookup-round statistics.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -686,6 +687,8 @@ struct SpeculativeStats {
     std::uint64_t accepted_tokens = 0;
     std::uint64_t fallback_steps  = 0;
     std::vector<std::uint64_t> accepted_per_position;
+    // DFlash2 verify-tree rounds that verified the prompt-lookup chain alone, without drafting.
+    std::uint64_t lookup_rounds = 0;
 };
 
 struct ThinkingBudgetStats {

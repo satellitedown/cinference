@@ -29,6 +29,11 @@ public:
     // Log-probability of each token of the last proposal (0 when there is none).
     [[nodiscard]] float log_probability() const noexcept;
 
+    // Whether the last proposal is trusted enough to be verified alone, without drafting: its
+    // per-token estimate is at least kConfident (0.97 is the estimate's ceiling).
+    [[nodiscard]] bool confident() const noexcept;
+    static constexpr float kConfident = 0.96F;
+
 private:
     // Open-addressed map from a window's 64-bit hash to its latest end position.
     struct WindowTable {

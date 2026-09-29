@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: staged lattice walk; verify trees with lookup chains.
+// Modified by satellitedown for Cinference: staged lattice walk; verify trees with lookup chains;
+// chain-only trees for lookup rounds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "ops/candidate_selector/bf16/candidate_selector_path_kernels.h"
@@ -385,6 +386,31 @@ __global__ __launch_bounds__(32) void selector_tree_kernel(
     }
 }
 
+// The chain of a lookup round: columns 1..extent are the lookup tokens in order, each the child of
+// the previous column; the root and the columns past the extent as in selector_tree_kernel.
+__global__ __launch_bounds__(32) void lookup_chain_tree_kernel(
+    int steps, const std::int32_t* extents, const std::int32_t* lookup_tokens, std::int32_t* drafts,
+    std::int32_t* tree_parents, std::int32_t* tree_masks, std::int32_t* rope_positions) {
+    const int lane = threadIdx.x, batch = blockIdx.x, width = steps + 1;
+    int extent             = extents[batch];
+    extent                 = extent < 0 ? 0 : (extent > steps ? steps : extent);
+    const std::int64_t row = static_cast<std::int64_t>(batch) * width;
+    const int root_rope    = rope_positions[row];
+    if (lane >= width) return;
+    if (lane == 0) {
+        tree_parents[row] = -1;
+        tree_masks[row]   = 1;
+    } else if (lane <= extent) {
+        tree_parents[row + lane]         = lane - 1;
+        tree_masks[row + lane]           = (2 << lane) - 1;
+        rope_positions[row + lane]       = root_rope + lane;
+        drafts[batch * steps + lane - 1] = lookup_tokens[batch * steps + lane - 1];
+    } else {
+        tree_parents[row + lane] = lane - 1;
+        tree_masks[row + lane]   = 1 << lane;
+    }
+}
+
 } // namespace
 
 void candidate_selector_tree_launch(
@@ -415,6 +441,19 @@ void candidate_selector_tree_launch(
         static_cast<const std::int32_t*>(lookup_tokens.data),
         static_cast<const std::int32_t*>(lookup_counts.data),
         static_cast<const float*>(lookup_log_probability.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void candidate_selector_lookup_chain_launch(const Tensor& current_extents,
+                                            const Tensor& lookup_tokens, Tensor& drafts,
+                                            Tensor& tree_parents, Tensor& tree_masks,
+                                            Tensor& rope_positions, cudaStream_t stream) {
+    lookup_chain_tree_kernel<<<drafts.ne[1], 32, 0, stream>>>(
+        drafts.ne[0], static_cast<const std::int32_t*>(current_extents.data),
+        static_cast<const std::int32_t*>(lookup_tokens.data),
+        static_cast<std::int32_t*>(drafts.data), static_cast<std::int32_t*>(tree_parents.data),
+        static_cast<std::int32_t*>(tree_masks.data),
+        static_cast<std::int32_t*>(rope_positions.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

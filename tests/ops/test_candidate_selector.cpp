@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: cover lattice verify trees and lookup chains.
+// Modified by satellitedown for Cinference: cover lattice verify trees, lookup chains and lookup
+// rounds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "ninfer/ops/candidate_selector.h"
@@ -618,7 +619,8 @@ struct TreeResult {
 // are the extent best root paths of the FP64 lattice: every chosen node scores at least every
 // unchosen child of the root or of a chosen node within the depth limit.
 // lookup: 0 no chain; 1 a chain worth nothing (the lattice tree itself); 2 a certain chain, which
-// must then be a root path of min(chain, extent) nodes.
+// must then be a root path of min(chain, extent) nodes, and wherever the chain covers the extent,
+// exactly the tree candidate_selector_lookup_chain writes for a lookup round.
 int run_tree(int lookup = 0, TreeResult* result = nullptr) {
     constexpr double kTreeTemperature             = 1.5;
     const std::vector<std::int32_t> candidate_ids = make_candidate_ids();
@@ -696,6 +698,51 @@ int run_tree(int lookup = 0, TreeResult* result = nullptr) {
     const auto got_rope    = from_device<int>(rope_device.p, kMaxBatch * width);
 
     if (result != nullptr) *result = {got_drafts, got_parents, got_masks, got_rope};
+    int chain_failures = 0;
+    if (lookup == 2) {
+        GuardedDeviceBuffer chain_drafts(static_cast<std::size_t>(kMaxBatch) * kSteps * 4);
+        GuardedDeviceBuffer chain_parents(static_cast<std::size_t>(kMaxBatch) * width * 4);
+        GuardedDeviceBuffer chain_masks(static_cast<std::size_t>(kMaxBatch) * width * 4);
+        chain_drafts.fill(0xff);
+        DeviceBuffer chain_rope = to_device(rope);
+        Tensor lookup_drafts(chain_drafts.data(), DType::I32, {kSteps, kMaxBatch});
+        Tensor lookup_parents(chain_parents.data(), DType::I32, {width, kMaxBatch});
+        Tensor lookup_masks(chain_masks.data(), DType::I32, {width, kMaxBatch});
+        Tensor lookup_rope(chain_rope.p, DType::I32, {width, kMaxBatch});
+        ops::candidate_selector_lookup_chain(extent, lookup_tokens, lookup_drafts, lookup_parents,
+                                             lookup_masks, lookup_rope, nullptr);
+        cuda_synchronize();
+        const auto chain_d = from_device<int>(chain_drafts.data(), kMaxBatch * kSteps);
+        const auto chain_p = from_device<int>(chain_parents.data(), kMaxBatch * width);
+        const auto chain_m = from_device<int>(chain_masks.data(), kMaxBatch * width);
+        const auto chain_r = from_device<int>(chain_rope.p, kMaxBatch * width);
+        const std::string chain_label =
+            "candidate_selector_lookup_chain K=" + std::to_string(kSteps);
+        int covered = 0;
+        for (int b = 0; b < kMaxBatch; ++b) {
+            if (chain_counts[b] < extents[b]) continue;
+            ++covered;
+            const auto row = [&](const std::vector<int>& values, int columns) {
+                return std::vector<int>(values.begin() + b * columns,
+                                        values.begin() + (b + 1) * columns);
+            };
+            if (row(chain_d, kSteps) != row(got_drafts, kSteps) ||
+                row(chain_p, width) != row(got_parents, width) ||
+                row(chain_m, width) != row(got_masks, width) ||
+                row(chain_r, width) != row(got_rope, width)) {
+                std::cerr << chain_label << " row " << b
+                          << ": differs from the certain-chain tree\n";
+                ++chain_failures;
+            }
+        }
+        if (covered == 0) {
+            std::cerr << chain_label << ": no row covers its extent\n";
+            ++chain_failures;
+        }
+        chain_failures += chain_drafts.verify_guards(chain_label + " drafts") +
+                          chain_parents.verify_guards(chain_label + " parents") +
+                          chain_masks.verify_guards(chain_label + " masks");
+    }
     const std::string label =
         "candidate_selector_tree K=" + std::to_string(kSteps) + " lookup=" + std::to_string(lookup);
     const auto log_probability = [&](int b, int step, int predecessor_rank, int rank) {
@@ -708,7 +755,7 @@ int run_tree(int lookup = 0, TreeResult* result = nullptr) {
             sum += std::exp(lattice[base + c] / kTreeTemperature - maximum);
         return lattice[base + rank] / kTreeTemperature - maximum - std::log(sum);
     };
-    int failures = 0;
+    int failures = chain_failures;
     for (int b = 0; b < kMaxBatch; ++b) {
         const int nodes = extents[b];
         const auto fail = [&](const std::string& what) {

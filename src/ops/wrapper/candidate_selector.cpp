@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: lattice verify trees with prompt-lookup chains.
+// Modified by satellitedown for Cinference: lattice verify trees with prompt-lookup chains; lookup
+// rounds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "ninfer/ops/candidate_selector.h"
@@ -187,6 +188,31 @@ void candidate_selector_tree(const Tensor& candidate_ids, const Tensor& unary_sc
         candidate_ids, unary_scores, projected_hidden, anchors, predecessor_codebook,
         successor_codebook, current_extents, lookup_tokens, lookup_counts, lookup_log_probability,
         drafts, tree_parents, tree_masks, rope_positions, scratch.edges, stream);
+}
+
+void candidate_selector_lookup_chain(const Tensor& current_extents, const Tensor& lookup_tokens,
+                                     Tensor& drafts, Tensor& tree_parents, Tensor& tree_masks,
+                                     Tensor& rope_positions, cudaStream_t stream) {
+    const std::int32_t kSteps     = drafts.ne[0];
+    const std::int32_t batch_size = drafts.ne[1];
+    if (kSteps < 1 || kSteps > 15)
+        throw std::invalid_argument("candidate_selector_lookup_chain: K must be in [1,15]");
+    if (batch_size < 1 || batch_size > 8) {
+        throw std::invalid_argument("candidate_selector_lookup_chain: B must be in [1,8]");
+    }
+    require_tensor(current_extents, DType::I32, batch_size, 1, 1, 1, "current_extents");
+    require_tensor(lookup_tokens, DType::I32, kSteps, batch_size, 1, 1, "lookup_tokens");
+    require_tensor(drafts, DType::I32, kSteps, batch_size, 1, 1, "drafts");
+    require_tensor(tree_parents, DType::I32, kSteps + 1, batch_size, 1, 1, "tree_parents");
+    require_tensor(tree_masks, DType::I32, kSteps + 1, batch_size, 1, 1, "tree_masks");
+    if (rope_positions.dtype != DType::I32 || rope_positions.ne[0] != kSteps + 1 ||
+        rope_positions.ne[1] != batch_size || rope_positions.ne[2] != 1 ||
+        rope_positions.ne[3] != 1 || !rope_positions.is_contiguous() ||
+        rope_positions.data == nullptr) {
+        throw std::invalid_argument("candidate_selector_lookup_chain: invalid rope_positions");
+    }
+    detail::candidate_selector_lookup_chain_launch(
+        current_extents, lookup_tokens, drafts, tree_parents, tree_masks, rope_positions, stream);
 }
 
 } // namespace ninfer::ops

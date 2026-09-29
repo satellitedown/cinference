@@ -1,6 +1,7 @@
 # DFlash and DFlash2
 
-> Modified by satellitedown for Cinference: DFlash2 verify trees with prompt-lookup chains.
+> Modified by satellitedown for Cinference: DFlash2 verify trees with prompt-lookup chains and lookup
+> rounds.
 
 DFlash backends propose several tokens with one masked-block forward, conditioned on committed
 target hidden features. The target verifies the proposal causally and remains the output authority.
@@ -281,12 +282,15 @@ conditional probability `softmax_c(E_i[parent,c] / 1.5)` and a score summing log
 along its root path. Best-first selection of the P highest-scoring nodes (P = proposal extent)
 yields the union of the P most likely root paths. A prompt-lookup chain joins the same selection:
 the Host proposes the tokens that followed the latest earlier occurrence of the context's 8-, 4- or
-2-token suffix, and each chain node at depth d scores `d * log(pi)`, where pi is that window
-length's decayed rate of proposed tokens later committed. A lattice candidate that equals the
-chain token under a chain parent takes the better score; other chain tokens become chain-only
-nodes. Columns are the DFS pre-order of the tree with every node's children by increasing subtree
-size, so each node's largest subtree comes last. The selector writes each column's token, parent,
-ancestor-or-self column mask and RoPE position (root position plus depth).
+2-token suffix, and each chain node at depth d scores `d * log(pi)`. pi is that window length's
+decayed rate of proposed tokens later committed, with a 1-hit/3-miss prior; when the suffix
+matches its earlier occurrence for L > 8 tokens, the L - 8 further matched tokens (at most 120)
+count as prior hits, so a long copied run is trusted from its first round. pi is clamped to
+[0.01, 0.97]. A lattice candidate that equals the chain token under a chain parent takes the better
+score; other chain tokens become chain-only nodes. Columns are the DFS pre-order of the tree with
+every node's children by increasing subtree size, so each node's largest subtree comes last. The
+selector writes each column's token, parent, ancestor-or-self column mask and RoPE position (root
+position plus depth).
 
 Verification. Every column attends the committed cache plus the columns of its mask. The GDN
 recurrence walks the columns in order; a branch node's state is pushed to a register stack after
@@ -301,6 +305,14 @@ token. The first node without one ends the round with its token as the correctio
 a deterministic tree this is exactly target sampling. The accepted path's K8V4 cache rows, target
 hidden columns and pending draft features are then moved onto chain positions, and the ReplaySSM
 Fold replays the path's record columns, so the commit rules above apply unchanged.
+
+Lookup rounds. When a single request's chain covers the whole round (P tokens) and pi >= 0.96, the
+round verifies the chain alone: the drafter still appends the committed features to its context,
+but its masked block, proposal head and selector are skipped (about 1.5 ms of a 16-17 ms round on
+an RTX 5090), and `candidate_selector_lookup_chain` writes the chain as the tree the selector would
+build for a certain chain. Verification, acceptance and commit are the tree path's. Lookup rounds
+launch eagerly, so they reserve no graph memory, with the envelopes of the round's graph profile,
+so every kernel route matches the drafted rounds. `SpeculativeStats::lookup_rounds` counts them.
 
 ## Backend storage and lifecycle
 

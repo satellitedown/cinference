@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: lattice verify trees with lookup chains.
+// Modified by satellitedown for Cinference: lattice verify trees with lookup chains; lookup rounds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -12,6 +12,10 @@ void candidate_selector_tree_launch(
     const Tensor& current_extents, const Tensor& lookup_tokens, const Tensor& lookup_counts,
     const Tensor& lookup_log_probability, Tensor& drafts, Tensor& tree_parents, Tensor& tree_masks,
     Tensor& rope_positions, const Tensor& edges, cudaStream_t stream);
+void candidate_selector_lookup_chain_launch(const Tensor& current_extents,
+                                            const Tensor& lookup_tokens, Tensor& drafts,
+                                            Tensor& tree_parents, Tensor& tree_masks,
+                                            Tensor& rope_positions, cudaStream_t stream);
 void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate_ids,
                                     const Tensor& unary_scores, const Tensor& projected_hidden,
                                     const Tensor& anchors, const Tensor& predecessor_codebook,

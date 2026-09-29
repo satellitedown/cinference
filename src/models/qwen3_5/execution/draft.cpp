@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: DFlash2 verify trees, compaction, replay-fold join.
+// Modified by satellitedown for Cinference: DFlash2 verify trees, compaction, replay-fold join,
+// lookup rounds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/program/graph_execution.h"
@@ -584,8 +585,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
 
 auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                               DFlashEnvelopes envelopes,
-                              ops::CausalAttentionExecutionEnvelope target_envelope) {
-    return [&state, batch_size, k, envelopes, target_envelope] {
+                              ops::CausalAttentionExecutionEnvelope target_envelope,
+                              bool lookup_round) {
+    return [&state, batch_size, k, envelopes, target_envelope, lookup_round] {
         if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
             k == 0 || k > kDFlashDecodeMaximumDrafts) {
             throw std::logic_error("DFlash decode batch state is incomplete");
@@ -632,7 +634,17 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         append_context_impl(state, compact_features, append_positions, append_counts,
                             state_destinations, dflash_rows, envelopes.append);
 
-        propose_batch_impl(state, frame, batch_size, k, envelopes);
+        if (lookup_round) {
+            // Only the prompt-lookup chain is verified; the drafter's context append above still
+            // runs, so the next drafted round sees every committed token.
+            Tensor parents = frame.tree_parents.slice(1, 0, batch_size);
+            Tensor masks   = frame.tree_masks.slice(1, 0, batch_size);
+            ops::candidate_selector_lookup_chain(
+                extents, frame.lookup_tokens.slice(1, 0, batch_size), drafts, parents, masks,
+                target_rope, state.execution.device.stream);
+        } else {
+            propose_batch_impl(state, frame, batch_size, k, envelopes);
+        }
         ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
                                                target_positions, state.execution.device.stream);
         // The previous round's replay fold may still run on its side stream; the drafter above
@@ -741,15 +753,20 @@ void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_s
                                  std::uint32_t k, DFlashEnvelopes envelopes,
                                  ops::CausalAttentionExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition) {
-    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
+    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope, false);
     capture_graph(state, definition, body);
 }
 
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          DFlashEnvelopes envelopes,
                          ops::CausalAttentionExecutionEnvelope target_envelope,
-                         DecodeGraphExecutable* executable) {
-    auto body = dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope);
+                         DecodeGraphExecutable* executable, bool lookup_round) {
+    if (lookup_round &&
+        (executable != nullptr || state.frame.tree_parents.data == nullptr || batch_size != 1)) {
+        throw std::logic_error("DFlash lookup rounds run eagerly for one verify-tree row");
+    }
+    auto body =
+        dflash_decode_batch_body(state, batch_size, k, envelopes, target_envelope, lookup_round);
     run_prepared(state, executable, body);
 }
 

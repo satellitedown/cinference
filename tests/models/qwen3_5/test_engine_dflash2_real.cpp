@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: accept KV codec and verify-tree arguments.
+// Modified by satellitedown for Cinference: accept KV codec and verify-tree arguments; cover lookup
+// rounds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "ninfer/engine.h"
@@ -223,6 +224,30 @@ int main(int argc, char** argv) {
             require(tail.finish_reason == ninfer::FinishReason::ContextCapacity &&
                         tail.generated_token_ids.size() == 5,
                     "full proposal window escaped the target context capacity tail");
+        }
+        if (k == 15 && options.speculative.verify_tree) {
+            // Output that copies an earlier passage is verified by lookup rounds without drafting.
+            // Each generated token must still be the target's greedy token after its prefix.
+            const auto passage = engine.tokenize_text(
+                "The lighthouse keeper climbed the spiral stairs at dusk, trimmed the wick, "
+                "polished the great lens and wrote the wind and the swell into a leather logbook "
+                "before the first ship rounded the headland.\n");
+            std::vector<ninfer::TokenId> copied;
+            for (int repeat = 0; repeat < 4; ++repeat) {
+                copied.insert(copied.end(), passage.begin(), passage.end());
+            }
+            copied.insert(copied.end(), passage.begin(), passage.begin() + 6);
+            const auto copy = engine.generate(engine.prepare_tokens(copied), request(40));
+            valid(copy, 40);
+            require(copy.speculative.lookup_rounds != 0, "a copied passage ran no lookup round");
+            auto context = copied;
+            for (const ninfer::TokenId token : copy.generated_token_ids) {
+                const auto step = engine.generate(engine.prepare_tokens(context), request(1));
+                require(step.generated_token_ids.size() == 1 &&
+                            step.generated_token_ids.front() == token,
+                        "a lookup round changed the greedy output");
+                context.push_back(token);
+            }
         }
         std::cout << "ok K=" << k << " B=" << batch << " graph=" << graph
                   << " optimized=" << optimized << " tree=" << options.speculative.verify_tree

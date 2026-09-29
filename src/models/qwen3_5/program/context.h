@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: verify-tree frame tensors; fold overlap.
+// Modified by satellitedown for Cinference: verify-tree frame tensors; fold overlap; lookup rounds.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -203,9 +203,11 @@ void capture_dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_s
                                  std::uint32_t k, DFlashEnvelopes envelopes,
                                  ops::CausalAttentionExecutionEnvelope target_envelope,
                                  DecodeGraphDefinition& definition);
+// Executes one exact-B DFlash round. A lookup round (verify trees, B=1, eager) verifies the
+// prompt-lookup chain alone and skips the drafter's block forward.
 void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std::uint32_t k,
                          DFlashEnvelopes envelopes,
                          ops::CausalAttentionExecutionEnvelope target_envelope,
-                         DecodeGraphExecutable* executable);
+                         DecodeGraphExecutable* executable, bool lookup_round = false);
 
 } // namespace ninfer::models::qwen3_5::execution

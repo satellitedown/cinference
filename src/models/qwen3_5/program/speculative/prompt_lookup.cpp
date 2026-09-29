@@ -152,4 +152,8 @@ float PromptLookup::log_probability() const noexcept {
     return static_cast<float>(std::log(std::clamp(probability, kMinimum, kMaximum)));
 }
 
+bool PromptLookup::confident() const noexcept {
+    return proposal_window_ >= 0 && log_probability() >= std::log(kConfident);
+}
+
 } // namespace ninfer::models::qwen3_5

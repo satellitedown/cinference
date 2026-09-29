@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: DFlash2 prompt-lookup verify-tree chains; fold overlap.
+// Modified by satellitedown for Cinference: DFlash2 lookup chains and lookup rounds; fold overlap.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/program/program_impl.h"
@@ -640,18 +640,6 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         DecodeGraphExecutable* executable    = nullptr;
         execution::DFlashEnvelopes envelopes = dflash_envelopes(0, maximum_frontier, draft_window);
         ops::CausalAttentionExecutionEnvelope target_envelope{1, maximum_target_tokens};
-        if (use_cuda_graph) {
-            DecodeGraphProfile& profile =
-                select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
-                                     maximum_frontier, "DFlash batch");
-            executable      = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
-            envelopes       = dflash_envelopes(profile.min_execution_frontier,
-                                               profile.max_execution_frontier, draft_window);
-            target_envelope = {
-                1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                       capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
-                                     draft_window + 1ULL))};
-        }
 
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = active_sequence(lanes[row]);
@@ -697,6 +685,29 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                       backend_kv_cache() ? frontier : 0U);
         }
 
+        // A single verify-tree row whose lookup chain covers the round and is trusted enough is
+        // verified without drafting. Lookup rounds run eagerly, so no graph memory is reserved for
+        // them, but with the envelopes of the round's graph profile, so every kernel route matches.
+        const bool lookup_round =
+            io.dflash_decode->tree_parents.data != nullptr && lanes.size() == 1 &&
+            dflash_host_ingress->proposal_extents[0] > 0 &&
+            dflash_host_ingress->lookup_counts[0] == dflash_host_ingress->proposal_extents[0] &&
+            active_sequence(lanes[0]).prompt_lookup.confident();
+        if (use_cuda_graph) {
+            DecodeGraphProfile& profile =
+                select_graph_profile(dflash_graphs, static_cast<std::uint32_t>(lanes.size()),
+                                     maximum_frontier, "DFlash batch");
+            if (!lookup_round) {
+                executable = &install_graph_profile(dflash_graphs, profile, "DFlash batch");
+            }
+            envelopes       = dflash_envelopes(profile.min_execution_frontier,
+                                               profile.max_execution_frontier, draft_window);
+            target_envelope = {
+                1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                       capacity, static_cast<std::uint64_t>(profile.max_execution_frontier) +
+                                     draft_window + 1ULL))};
+        }
+
         execution::DFlashBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -711,7 +722,8 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
 
         mark_workspace_usage(workspace_plan.dflash_round);
         execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
-                                       draft_window, envelopes, target_envelope, executable);
+                                       draft_window, envelopes, target_envelope, executable,
+                                       lookup_round);
         // The round joined the pending fold before its verification, so later work is ordered.
         replay_fold_pending = false;
         submit_range.reset();
@@ -749,6 +761,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 request.speculative_stats.fallback_steps += 1;
             } else {
                 request.speculative_stats.rounds += 1;
+                request.speculative_stats.lookup_rounds += lookup_round ? 1U : 0U;
                 request.speculative_stats.drafted_tokens += extent;
                 request.speculative_stats.accepted_tokens += static_cast<std::uint32_t>(accepted_i);
                 for (std::int32_t i = 0; i < accepted_i; ++i) {
