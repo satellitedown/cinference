@@ -1,7 +1,7 @@
 # DFlash and DFlash2
 
 > Modified by satellitedown for Cinference: DFlash2 verify trees with prompt-lookup chains and lookup
-> rounds; overlapped GDN verify blocks.
+> rounds; overlapped GDN verify blocks; staged replay fold.
 
 DFlash backends propose several tokens with one masked-block forward, conditioned on committed
 target hidden features. The target verifies the proposal causally and remains the output authority.
@@ -315,14 +315,25 @@ launch eagerly, so they reserve no graph memory, with the envelopes of the round
 so every kernel route matches the drafted rounds. `SpeculativeStats::lookup_rounds` counts them.
 
 Overlapped GDN blocks. A GDN verify block that records for replay with the FP8 input projection's
-single-block A8 route (B=1, W=16) forks two jobs onto `DeviceContext::concurrent`: the
-norm-gating control dots (`gdn_norm_gating_control`) run beside the query/key/value rows of the
-input projection, and its output-gate rows run beside the recurrence. The input RMSNorm writes the
-E4M3 activation both row halves read (`gdn_norm_gating_fp8_hidden`), so the block's critical path
-is norm, query/key/value rows, recurrence instead of norm-gating, activation quantization, all
-16,384 rows, recurrence. The compute stream joins the controls before the recurrence and z
-before the gated RMSNorm; every output is bit-identical to the serial form, which other
-geometries and paths keep.
+single-block A8 route (B=1, W=16) runs its norm-gating control dots (`gdn_norm_gating_control`) and
+then its recurrence on `DeviceContext::concurrent`, while the compute stream runs the
+query/key/value rows of the input projection and then its output-gate rows: the controls run
+beside the query/key/value rows and the recurrence beside the output-gate rows. The input RMSNorm
+writes the E4M3 activation both row halves read (`gdn_norm_gating_fp8_hidden`), so the block's
+critical path is norm, query/key/value rows, output-gate rows instead of norm-gating, activation
+quantization, all 16,384 rows, recurrence. The concurrent stream joins the query/key/value rows
+before the recurrence and the compute stream joins the recurrence before the gated RMSNorm, so z
+follows its query/key/value rows without a cross-stream wait (about 2 µs each in eagerly launched
+lookup rounds). The output-gate rows stream with three weight stages, and the staged record kernel
+keeps each column's raw inputs and normalization scales rather than normalized FP32 columns (9 KB
+of shared memory per block), so its blocks fit beside them. Every output is bit-identical to the
+serial form, which other geometries and paths keep.
+
+Staged fold. For record widths up to 16, `recurrent_fold_staged_kernel` copies a row's committed
+key, value and gate records with independent asynchronous copies and normalizes each key once per
+block, as the staged record kernel does, instead of waiting on one dependent round trip per
+column. Its final states and convolution histories equal the per-column fold's bit for bit; a
+lookup round's verification, which waits for the fold, starts about 100 µs earlier.
 
 ## Backend storage and lifecycle
 

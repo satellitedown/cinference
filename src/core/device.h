@@ -26,7 +26,7 @@ struct DeviceExecutionView {
 // from `stream` and joins back into it through `events` (recorded on one stream, waited on the
 // other). Every fork is joined before the sequence ends, so no work stays pending on it.
 struct ConcurrentStream {
-    static constexpr std::size_t kEvents = 4;
+    static constexpr std::size_t kEvents = 3;
     cudaStream_t stream                  = nullptr;
     std::array<cudaEvent_t, kEvents> events{};
 };

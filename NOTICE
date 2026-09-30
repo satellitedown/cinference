@@ -40,17 +40,18 @@ Q4 (the fused QKV projection keeps Q8), served by a Q4 finish-convolution
 projection route, a Q4 feature-projection shape, row-tiled small-T Q4 SwiGLU
 staging and an optional two-stage Q4 K-split pipeline; verify-width Q4
 finish projections split K across CTAs, whose FP32 partials the finish
-convolution adds in split order. The DFlash2 replay fold runs on a
-low-priority side stream overlapped with the next round's drafter, and each
-GDN verify block runs its control dots and output-gate projection rows on a
-concurrent compute stream beside its query/key/value projection and
-recurrence, fed by an input norm that writes the FP8 activation directly. A
-long verbatim match between the context suffix and its earlier occurrence
-raises the prompt-lookup chain's confidence, and a single request whose chain
-is near-certain verifies it alone, without drafting (lookup rounds). CUDA 13.1
-builds stay correct: toolkits before 13.4 issue weight fills without the L2
-cache-policy hint that CUDA 13.1's ptxas miscompiles, and the wide K8V4
-attention kernel avoids a CUDA 13.1 front-end crash.
+convolution adds in split order. The DFlash2 replay fold stages its committed
+records and runs on a low-priority side stream overlapped with the next
+round's drafter, and each GDN verify block runs its control dots and
+recurrence on a concurrent compute stream beside its query/key/value and
+output-gate projection rows, fed by an input norm that writes the FP8
+activation directly. A long verbatim match between the context suffix and
+its earlier occurrence raises the prompt-lookup chain's confidence, and a
+single request whose chain is near-certain verifies it alone, without
+drafting (lookup rounds). CUDA 13.1 builds stay correct: toolkits before 13.4
+issue weight fills without the L2 cache-policy hint that CUDA 13.1's ptxas
+miscompiles, and the wide K8V4 attention kernel avoids a CUDA 13.1 front-end
+crash.
 Publication changes add fork branding, provenance and measurement scope,
 correct stale range text, make local-path instructions portable, and omit
 machine-local agent automation and unrelated sponsorship configuration.

@@ -1054,14 +1054,19 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             const Tensor next_states = next_layer < state_.layer_count()
                                            ? state_.layer_view(next_layer).recurrent
                                            : Tensor{};
-            if (overlapped) { gdn_join_concurrent(ctx_, kGdnControlReady, s); }
+            // The overlapped route queues the recurrence on the concurrent stream beside z.
+            const cudaStream_t record_stream = overlapped ? ctx_.concurrent.stream : s;
             ops::gated_delta_net_replay_record(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
                 static_cast<float>(
                     1.0 / std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
                 recurrent_states, valid, *active_linear_state_source_slots_, records.key,
                 records.value, records.gate, out_batch, next_states,
-                verify_tree_parents_ != nullptr ? *verify_tree_parents_ : Tensor{}, s);
+                verify_tree_parents_ != nullptr ? *verify_tree_parents_ : Tensor{}, record_stream);
+            if (overlapped) {
+                CUDA_CHECK(
+                    cudaEventRecord(ctx_.concurrent.events[kGdnRecurrenceReady], record_stream));
+            }
         } else {
             ops::gated_delta_net_batch_update(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
@@ -1085,8 +1090,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)
                     .view({dimension(config_.gdn->linear_value_head_dim),
                            dimension(config_.gdn->linear_num_value_heads), T});
-    // The output-gate rows ran beside the recurrence on the overlapped route.
-    if (overlapped) { gdn_join_concurrent(ctx_, kGdnOutputGateReady, s); }
+    // The overlapped route ran the recurrence on the concurrent stream.
+    if (overlapped) { gdn_join_concurrent(ctx_, kGdnRecurrenceReady, s); }
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
 
     ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,

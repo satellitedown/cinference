@@ -1,5 +1,5 @@
 // Modified by satellitedown for Cinference: small-token A8; record convolution with verify trees;
-// record projection halves from a caller-produced activation.
+// record projection halves from a caller-produced activation, the gate half in three stages.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -59,6 +59,14 @@ void run(const Weight& weight, Tensor& qkv, Tensor& z, Fp8A8Workspace workspace,
 using RecordSchedule = Fp8A8SmallTokenSchedule;
 using RecordOutput   = Fp8GdnRecordConvOutput<RecordSchedule::kBlockRows, RecordSchedule::kThreads>;
 static_assert(RecordSchedule::kBlockTokens == RecordOutput::kWidth);
+// The output-gate half streams beside the recurrence, whose blocks leave its own blocks room for a
+// third weight stage. Stages set only the copy depth, so every tile's MMA sequence is unchanged.
+using GateSchedule = Fp8MmaSchedule<RecordSchedule::kBlockTokens, RecordSchedule::kBlockRows,
+                                    RecordSchedule::kBlockK, RecordSchedule::kWarpsTokens,
+                                    RecordSchedule::kWarpsRows, 3, RecordSchedule::kMinBlocksPerSm,
+                                    RecordSchedule::kWeightCache, RecordSchedule::kActivationCache,
+                                    RecordSchedule::kFragmentPipeline, RecordSchedule::kRaster>;
+static_assert(GateSchedule::kThreads == RecordSchedule::kThreads);
 
 RecordOutput record_output(const Tensor& conv_weight, const Tensor& conv_states,
                            const Tensor& valid_columns, const Tensor& initial_slot,
@@ -128,15 +136,23 @@ void fp8_gdn_record_conv_a8_rows_launch(Fp8A8Workspace activation, const Weight&
     constexpr int kZTiles   = Fp8GdnInputOutput::kZRows / RecordSchedule::kBlockRows;
     static_assert(kQkvTiles * RecordSchedule::kBlockRows == Fp8GdnInputOutput::kQkvRows);
     static_assert(kZTiles * RecordSchedule::kBlockRows == Fp8GdnInputOutput::kZRows);
-    const bool gate           = rows == GdnRecordRows::OutputGate;
     const RecordOutput output = record_output(conv_weight, conv_states, valid_columns, initial_slot,
                                               tree_parents, conv_record, query, key, value, z);
-    fp8_mma_kernel<Geometry, RecordSchedule, true, Fp8IdentityEpilogue, RecordOutput,
-                   Fp8MmaRowRange><<<gate ? kZTiles : kQkvTiles, RecordSchedule::kThreads,
-                                     RecordSchedule::kSharedBytes, stream>>>(
-        activation.codes, activation.scales, static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const __nv_bfloat16*>(weight.scales), kFp8GdnRecordConvWidth,
-        Fp8IdentityEpilogue{}, output, Fp8MmaRowRange{gate ? kQkvTiles : 0});
+    if (rows == GdnRecordRows::OutputGate) {
+        fp8_mma_kernel<Geometry, GateSchedule, true, Fp8IdentityEpilogue, RecordOutput,
+                       Fp8MmaRowRange>
+            <<<kZTiles, GateSchedule::kThreads, GateSchedule::kSharedBytes, stream>>>(
+                activation.codes, activation.scales, static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const __nv_bfloat16*>(weight.scales), kFp8GdnRecordConvWidth,
+                Fp8IdentityEpilogue{}, output, Fp8MmaRowRange{kQkvTiles});
+    } else {
+        fp8_mma_kernel<Geometry, RecordSchedule, true, Fp8IdentityEpilogue, RecordOutput,
+                       Fp8MmaRowRange>
+            <<<kQkvTiles, RecordSchedule::kThreads, RecordSchedule::kSharedBytes, stream>>>(
+                activation.codes, activation.scales, static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const __nv_bfloat16*>(weight.scales), kFp8GdnRecordConvWidth,
+                Fp8IdentityEpilogue{}, output, Fp8MmaRowRange{0});
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

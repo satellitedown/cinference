@@ -552,6 +552,12 @@ struct FoldAccess {
         return load_record_gate(gate_record, column * Geometry::kValueHeads + coord.value_head);
     }
 
+    __device__ __forceinline__ const uint2* gate_ptr(const RecurrentCoordinates& coord,
+                                                     std::int32_t token) const {
+        const std::int64_t column = record_outer(coord) * width + record_column(coord, token);
+        return gate_record + column * Geometry::kValueHeads + coord.value_head;
+    }
+
     __device__ __forceinline__ void
     store_final_state(const RecurrentCoordinates& coord,
                       const float (&state)[kDvPerWarp][kQkPerLane]) const {
@@ -707,10 +713,10 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
 
 // Speculative verify widths are short, so the per-token loop above is dominated by dependent global
 // loads, redundant Q/K normalizations and warp reductions. This form copies the complete raw block
-// once, normalizes each Q/K column once per CTA with the same lane partition and reduction as
-// normalize_qk_lane, writes the records in parallel, and then runs the per-token transition from
-// shared memory. Outputs, records and every arithmetic step are identical to
-// recurrent_record_kernel.
+// once, forms each Q/K column's normalization scale once per CTA with the same lane partition and
+// reduction as normalize_qk_lane, writes the records in parallel, and then runs the per-token
+// transition from shared memory, rebuilding each normalized lane value as raw value times scale.
+// Outputs, records and every arithmetic step are identical to recurrent_record_kernel.
 inline constexpr int kStagedRecordMaxWidth = 16;
 
 // Sums the lane partials of a warp's four state rows with the pairwise tree of four warp_sum
@@ -784,8 +790,10 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     __shared__ __align__(16) __nv_bfloat16 key_raw[kStagedRecordMaxWidth][kStateDim];
     __shared__ __align__(16) __nv_bfloat16 query_raw[kStagedRecordMaxWidth][kStateDim];
     __shared__ __align__(16) __nv_bfloat16 value_raw[kStagedRecordMaxWidth][kBlockDv];
-    __shared__ __align__(16) float key_normalized[kStagedRecordMaxWidth][kStateDim];
-    __shared__ __align__(16) float query_normalized[kStagedRecordMaxWidth][kStateDim];
+    // Each column's normalization scales. A lane's normalized value is its raw value times the
+    // scale, the product normalize_qk_lane forms, so the loop rebuilds it instead of staging FP32.
+    __shared__ float key_scale[kStagedRecordMaxWidth];
+    __shared__ float query_scale[kStagedRecordMaxWidth];
     __shared__ float decay[kStagedRecordMaxWidth];
     __shared__ __align__(8) uint2 gate_raw[kStagedRecordMaxWidth];
     __shared__ std::int8_t tree_restore[kStagedRecordMaxWidth];
@@ -826,37 +834,24 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     cp_wait<0>();
     __syncthreads();
 
-    // Each warp normalizes whole columns: the scale is formed on lane 0 exactly as
-    // normalize_qk_lane forms it, then every lane stores its exact FP32 products for the loop.
+    // Each warp forms whole columns' scales exactly as normalize_qk_lane forms them on lane 0.
     for (int token = coord.warp; token < valid; token += kNumWarps) {
-        float key[kQkPerLane];
-        float query[kQkPerLane];
+        const RawQkLane key   = load_raw_qk_lane(key_raw[token], coord.dqk_base);
+        const RawQkLane query = load_raw_qk_lane(query_raw[token], coord.dqk_base);
+        float key_sum         = 0.0f;
+        float query_sum       = 0.0f;
 #pragma unroll
         for (int c = 0; c < kQkPerLane; ++c) {
-            key[c]   = __bfloat162float(key_raw[token][coord.dqk_base + c]);
-            query[c] = __bfloat162float(query_raw[token][coord.dqk_base + c]);
+            key_sum += key.value[c] * key.value[c];
+            query_sum += query.value[c] * query.value[c];
         }
-        float key_sum   = 0.0f;
-        float query_sum = 0.0f;
-#pragma unroll
-        for (int c = 0; c < kQkPerLane; ++c) {
-            key_sum += key[c] * key[c];
-            query_sum += query[c] * query[c];
+        key_sum   = warp_reduce_sum(key_sum);
+        query_sum = warp_reduce_sum(query_sum);
+        if (coord.lane == 0) {
+            key_scale[token]   = rsqrtf(key_sum + kQkL2NormEps);
+            query_scale[token] = rsqrtf(query_sum + kQkL2NormEps);
+            decay[token]       = expf(__uint_as_float(gate_raw[token].x));
         }
-        key_sum           = warp_reduce_sum(key_sum);
-        query_sum         = warp_reduce_sum(query_sum);
-        float key_scale   = coord.lane == 0 ? rsqrtf(key_sum + kQkL2NormEps) : 0.0f;
-        float query_scale = coord.lane == 0 ? rsqrtf(query_sum + kQkL2NormEps) : 0.0f;
-        key_scale         = __shfl_sync(kFullWarpMask, key_scale, 0);
-        query_scale       = __shfl_sync(kFullWarpMask, query_scale, 0);
-#pragma unroll
-        for (int c = 0; c < kQkPerLane; ++c) {
-            key[c] *= key_scale;
-            query[c] *= query_scale;
-        }
-        store_vec(&key_normalized[token][coord.dqk_base], load_vec<float4>(key));
-        store_vec(&query_normalized[token][coord.dqk_base], load_vec<float4>(query));
-        if (coord.lane == 0) { decay[token] = expf(__uint_as_float(gate_raw[token].x)); }
     }
 
     if (coord.state_tile == 0 &&
@@ -930,10 +925,13 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                 }
             }
         }
-        const float4 key4           = load_vec<float4>(&key_normalized[token][coord.dqk_base]);
-        const float key[kQkPerLane] = {key4.x, key4.y, key4.z, key4.w};
-        const float alpha           = decay[token];
-        const float beta            = __uint_as_float(gate_raw[token].y);
+        const RawQkLane key_lane = load_raw_qk_lane(key_raw[token], coord.dqk_base);
+        const float key_factor   = key_scale[token];
+        float key[kQkPerLane];
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { key[c] = key_lane.value[c] * key_factor; }
+        const float alpha = decay[token];
+        const float beta  = __uint_as_float(gate_raw[token].y);
 
         // Transition: the same per-row projection, delta and update as apply_gdn_transition.
         float partial[kDvPerWarp];
@@ -974,8 +972,11 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
             }
         }
 
-        const float4 query4           = load_vec<float4>(&query_normalized[token][coord.dqk_base]);
-        const float query[kQkPerLane] = {query4.x, query4.y, query4.z, query4.w};
+        const RawQkLane query_lane = load_raw_qk_lane(query_raw[token], coord.dqk_base);
+        const float query_factor   = query_scale[token];
+        float query[kQkPerLane];
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { query[c] = query_lane.value[c] * query_factor; }
 #pragma unroll
         for (int r = 0; r < kDvPerWarp; ++r) {
             partial[r] = 0.0f;
@@ -1010,6 +1011,108 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     __align__(16) float state[kDvPerWarp][kQkPerLane];
     load_state_tile(state, access.state_read_base(coord), coord);
     run_recurrent_sequence<true, FoldEffects>(state, access, coord, valid);
+    access.store_final_state(coord, state);
+    access.publish_final_conv_history(coord, valid);
+}
+
+// The fold's per-token loop waits on one dependent round trip for each committed column's records
+// (written a round earlier, so no longer in L2). This form copies all committed key, value and
+// gate records with independent asynchronous copies, forms each key's normalization scale once
+// per CTA with the partition and reduction of normalize_qk_lane, and runs the transitions from
+// shared memory in the staged record kernel's form. Final states and convolution histories are
+// bit-identical to recurrent_fold_kernel's.
+template <class Geometry>
+__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
+    recurrent_fold_staged_kernel(const __grid_constant__ FoldAccess<Geometry> access) {
+    RecurrentCoordinates coord = access.coordinates();
+    const std::int32_t valid   = access.active_columns(coord);
+    if (valid == 0) { return; }
+    const int thread              = coord.warp * kWarpSize + coord.lane;
+    constexpr int kThreads        = kWarpSize * kNumWarps;
+    constexpr int kPacksPerColumn = kStateDim / 8;
+
+    __shared__ std::int32_t record_path[kStagedRecordMaxWidth];
+    __shared__ __align__(16) __nv_bfloat16 key_raw[kStagedRecordMaxWidth][kStateDim];
+    __shared__ __align__(16) __nv_bfloat16 value_raw[kStagedRecordMaxWidth][kBlockDv];
+    __shared__ float key_scale[kStagedRecordMaxWidth];
+    __shared__ float decay[kStagedRecordMaxWidth];
+    __shared__ __align__(8) uint2 gate_raw[kStagedRecordMaxWidth];
+
+    // The state tile is independent of the records, so its DRAM latency overlaps their staging.
+    __align__(16) float state[kDvPerWarp][kQkPerLane];
+    load_state_tile(state, access.state_read_base(coord), coord);
+
+    if (access.record_columns != nullptr) {
+        if (thread < valid) {
+            record_path[thread] = access.record_columns[coord.batch * access.width + thread];
+        }
+        __syncthreads();
+        coord.record_path = record_path;
+    }
+    const std::uint32_t tile_dv = static_cast<std::uint32_t>(coord.state_tile * kBlockDv);
+    for (int task = thread; task < valid * kPacksPerColumn; task += kThreads) {
+        const int token = task / kPacksPerColumn;
+        const int pack  = task - token * kPacksPerColumn;
+        cp_async<16>(&key_raw[token][pack * 8], access.key_ptr(coord, token) + pack * 8);
+    }
+    for (int task = thread; task < valid * (kBlockDv / 8); task += kThreads) {
+        const int token = task / (kBlockDv / 8);
+        const int pack  = task - token * (kBlockDv / 8);
+        cp_async<16>(&value_raw[token][pack * 8],
+                     access.value_ptr(coord, token) + tile_dv + pack * 8);
+    }
+    for (int token = thread; token < valid; token += kThreads) {
+        cp_async<8>(&gate_raw[token], access.gate_ptr(coord, token));
+    }
+    cp_commit();
+    cp_wait<0>();
+    __syncthreads();
+
+    // Each warp forms whole columns' scales exactly as normalize_qk_lane forms them on lane 0.
+    for (int token = coord.warp; token < valid; token += kNumWarps) {
+        const RawQkLane key = load_raw_qk_lane(key_raw[token], coord.dqk_base);
+        float key_sum       = 0.0f;
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { key_sum += key.value[c] * key.value[c]; }
+        key_sum = warp_reduce_sum(key_sum);
+        if (coord.lane == 0) {
+            key_scale[token] = rsqrtf(key_sum + kQkL2NormEps);
+            decay[token]     = expf(__uint_as_float(gate_raw[token].x));
+        }
+    }
+    __syncthreads();
+
+    const int local_dv  = coord.warp * kDvPerWarp;
+    const int owned_row = (coord.lane >> 3) & (kDvPerWarp - 1);
+#pragma unroll 4
+    for (std::int32_t token = 0; token < valid; ++token) {
+        const RawQkLane key_lane = load_raw_qk_lane(key_raw[token], coord.dqk_base);
+        const float key_factor   = key_scale[token];
+        float key[kQkPerLane];
+#pragma unroll
+        for (int c = 0; c < kQkPerLane; ++c) { key[c] = key_lane.value[c] * key_factor; }
+        const float alpha = decay[token];
+        const float beta  = __uint_as_float(gate_raw[token].y);
+        // Transition: the same per-row projection, delta and update as apply_gdn_transition.
+        float partial[kDvPerWarp];
+#pragma unroll
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            partial[r] = 0.0f;
+#pragma unroll
+            for (int c = 0; c < kQkPerLane; ++c) { partial[r] += state[r][c] * key[c]; }
+        }
+        const float projection  = gdn_row_sums(partial, coord.lane);
+        const float v_r         = __bfloat162float(value_raw[token][local_dv + owned_row]);
+        const float owned_delta = beta * (v_r - alpha * projection);
+#pragma unroll
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            const float delta = __shfl_sync(kFullWarpMask, owned_delta, r * 8);
+#pragma unroll
+            for (int c = 0; c < kQkPerLane; ++c) {
+                state[r][c] = alpha * state[r][c] + delta * key[c];
+            }
+        }
+    }
     access.store_final_state(coord, state);
     access.publish_final_conv_history(coord, valid);
 }

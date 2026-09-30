@@ -133,17 +133,13 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
 
 namespace {
 // Forks of gdn_projection_record_overlapped: the concurrent stream starts the controls after the
-// activation and the output-gate half after the query/key/value half.
+// activation and the caller's recurrence after the query/key/value half.
 constexpr std::size_t kGdnActivationReady = 0;
-constexpr std::size_t kGdnQkvLaunched     = 1;
+constexpr std::size_t kGdnQkvReady        = 1;
 
 void fork_concurrent(const DeviceContext& device, std::size_t event, cudaStream_t stream) {
     CUDA_CHECK(cudaEventRecord(device.concurrent.events[event], stream));
     CUDA_CHECK(cudaStreamWaitEvent(device.concurrent.stream, device.concurrent.events[event], 0));
-}
-
-void mark_concurrent(const DeviceContext& device, std::size_t event) {
-    CUDA_CHECK(cudaEventRecord(device.concurrent.events[event], device.concurrent.stream));
 }
 } // namespace
 
@@ -182,13 +178,13 @@ void gdn_projection_record_overlapped(const Tensor& residual, const Tensor& norm
                                      std::get<LinearParameters>(parameters.control).weight,
                                      parameters.a_log, parameters.dt_bias, g, beta, side);
     }
-    mark_concurrent(device, kGdnControlReady);
-    fork_concurrent(device, kGdnQkvLaunched, main);
+    // z follows the query/key/value half on `stream` without a cross-stream wait, and the caller's
+    // recurrence joins that half on the concurrent stream, whose controls it also reads.
+    fork_concurrent(device, kGdnQkvReady, main);
     ops::gdn_input_proj_conv_record(codes, scales, projection.weight, parameters.convolution,
                                     conv_states, valid_columns, initial_slots, tree_parents,
                                     conv_record, query, key, value, z,
-                                    ops::GdnRecordRows::OutputGate, side);
-    mark_concurrent(device, kGdnOutputGateReady);
+                                    ops::GdnRecordRows::OutputGate, main);
 }
 
 void gdn_join_concurrent(const DeviceContext& device, std::size_t event, cudaStream_t stream) {

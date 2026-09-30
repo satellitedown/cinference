@@ -139,7 +139,11 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
                     static_cast<unsigned>(active_rows),
                     static_cast<unsigned>(Geometry::kLayers * (kStateDim / kBlockDv)));
     const dim3 block(kWarpSize, kNumWarps, 1);
-    recurrent_fold_kernel<Geometry><<<grid, block, 0, stream>>>(access);
+    if (records.spec.width <= kStagedRecordMaxWidth) {
+        recurrent_fold_staged_kernel<Geometry><<<grid, block, 0, stream>>>(access);
+    } else {
+        recurrent_fold_kernel<Geometry><<<grid, block, 0, stream>>>(access);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
