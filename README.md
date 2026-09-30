@@ -11,7 +11,7 @@ Built from [NInfer](https://github.com/Neroued/ninfer), with source-level change
 - **MTP-10 decoding:** raised the draft window from 5 to 10 tokens. Longer proposals let the engine emit more tokens per verification round when the drafts are accepted.
 - **Capture-based CUDA Graph reuse:** reworked MTP graph matching to use the captured node types and kernel functions. Profiles with matching signatures and batch sizes share an executable, rather than relying only on planned context ranges.
 - **Expanded CPU/GPU round handling:** enlarged draft and token-position buffers and updated native validation for the longer windows. This carries MTP-10 through the decoding path, not just the command-line options.
-- **Faster DFlash2 verification:** rewrote the verify-width kernels behind fafstmobel's DFlash2-15 rounds: small-token FP8/NVFP4 projection schedules, a double-buffered K-split FP8 LinearAdd, staged GDN replay records with lane-shared reductions, a warp-specialized K8V4 attention kernel that accumulates PV products in FP16 from exactly widened V and balances them across SM sub-partitions, evict-first L2 fills for once-read verify weights, wider bank-conflict-free proposal-head tiles, a GDN record convolution fused into its input projection, a fused RMSNorm-SwiGLU FFN that hands both NVFP4 projections pre-quantized inputs, a fused query/key RMSNorm-RoPE, a K8V4 verify query prepared once per block, mask-free softmax for unmasked key tiles, L2 discards of consumed attention partials, warp-merged proposal top-k groups, GDN norm-gating blocks that share inputs across heads and token tiles, next-layer GDN state warmed in L2 during replay records, RMSNorm fused with the E4M3 quantization of the attention and FP8 FFN inputs, and verify attention blocks whose otherwise idle compute warps take part of the other rows' PV products. Each kernel is qualified against the existing independent oracles. Verification computes the target's logits at verify width, so, as with any batched verifier, a near-tied greedy argmax can resolve differently than in single-token decoding and the continuation then diverges; both follow the target model's logits.
+- **Faster DFlash2 verification:** rewrote the verify-width kernels behind fafstmobel's DFlash2-15 rounds: small-token FP8/NVFP4 projection schedules, a double-buffered K-split FP8 LinearAdd, staged GDN replay records with lane-shared reductions, a warp-specialized K8V4 attention kernel that accumulates PV products in FP16 from exactly widened V and balances them across SM sub-partitions, evict-first L2 fills for once-read verify weights, wider bank-conflict-free proposal-head tiles, a GDN record convolution fused into its input projection, a fused RMSNorm-SwiGLU FFN that hands both NVFP4 projections pre-quantized inputs, a fused query/key RMSNorm-RoPE, a K8V4 verify query prepared once per block, mask-free softmax for unmasked key tiles, L2 discards of consumed attention partials, warp-merged proposal top-k groups, GDN norm-gating blocks that share inputs across heads and token tiles, next-layer GDN state warmed in L2 during replay records, RMSNorm fused with the E4M3 quantization of the attention and FP8 FFN inputs, verify attention blocks whose otherwise idle compute warps take part of the other rows' PV products, GDN verify blocks that run their control dots and recurrence on a second compute stream beside their projection rows, and a replay fold that stages its committed records. Each kernel is qualified against the existing independent oracles. Verification computes the target's logits at verify width, so, as with any batched verifier, a near-tied greedy argmax can resolve differently than in single-token decoding and the continuation then diverges; both follow the target model's logits.
 - **Faster long-prompt prefill:** a pipelined K8V4 prompt attention kernel. Two groups of score warps take turns on the key tiles, running QK and the online softmax, while PV warps multiply the previous tile and widen the next one's V. Its outputs are bit-identical to the kernel it replaces.
 - **Q4 DFlash2 drafter:** the official Qwen3.8 NVFP4 recipe now stores the drafter's projections as Q4 (its fused QKV projection keeps Q8). The drafter only proposes tokens and verification is exact, so this halves its weight stream without changing the output distribution. New Q4 routes serve the drafter's finish convolution and feature projection, and small-T Q4 SwiGLU shares staged activations across row tiles.
 - **Ready-to-run fafstmobel setup:** a Swift-based Qwen3.8-27B derivative with Huihui's abliteration delta and NVFP4/FP8 text weights. One ~23.7 GB NInfer v3 file bundles text, vision, MTP, and the pretrained DFlash2 draft; no local conversion or separate draft download is needed. The recommended installer uses the engine's existing DFlash2 support, not MTP-10.
@@ -115,6 +115,30 @@ The fold overlap and split K alone shorten rounds by 0.7–1.1% at identical acc
 tok/s (+1.4%) and copy-heavy file edits 564.3 → 564.6 tok/s; neither accepts measurably more.
 Greedy bench output is identical, and the DFlash2 real test checks a copied passage token by token
 against the target. [Measurements](results/rtx5090-fafstmobel-lookup-rounds.json).
+
+### Overlapped GDN blocks and a staged fold
+
+Two bit-exact passes on top of `bf3bd22` shorten the 48 GDN verify blocks and the ReplaySSM fold. The
+first (`c6ab440`) runs each block's control dots beside its query/key/value projection on a second
+compute stream, fed by an input norm that writes the FP8 activation directly. The second (`e5ed41c`)
+moves the recurrence to that stream beside the output-gate projection, which now follows the
+query/key/value rows without a cross-stream wait and streams with three weight stages, shrinks the
+record kernel's shared memory so both fit on the SMs together, and stages the fold's committed
+records instead of waiting on one dependent load per column.
+
+| Prompt tokens | Round time before → after | Tokens/s before → after |
+|---:|---:|---:|
+| 8,192 | 15.83 → 15.43 ms | 898.4 → **922.0** (+2.4%) |
+| 32,768 | 15.89 → 15.51 ms | 947.9 → **970.7** (+2.4%) |
+| 131,072 | 18.29 → 17.96 ms | 874.7 → **890.8** (+1.9%) |
+
+`ninfer_bench`, greedy, 256 generated tokens, verify trees, K8V4, four alternating runs per build,
+paired medians; tokens per round are identical (14.22 / 15.06 / 16.00). The first pass alone gives
++1.3 / +0.6 / +0.6%. The benchmark corpus makes most of these rounds lookup rounds; the serving
+chats below exercise drafted rounds. Through `ninfer-serve` with the model's seeded default sampling,
+the 64 chat and 16 edit requests produce byte-identical outputs on both builds and run
+307.2 → 313.6 tok/s (+2.1%) and 563.9 → 575.8 tok/s (+2.1%).
+[Measurements](results/rtx5090-fafstmobel-gdn-overlap.json).
 
 ### Historical Huihui measurements
 

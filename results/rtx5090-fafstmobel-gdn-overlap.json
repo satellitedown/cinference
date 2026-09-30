@@ -1,0 +1,70 @@
+{
+  "scope": "fafstmobel DFlash2-15 with verify trees and K8V4 on one RTX 5090: GDN verify blocks overlapped on a concurrent compute stream (c6ab440), then the recurrence beside the output-gate projection, a three-stage output-gate stream, a smaller record-kernel footprint and a staged replay fold (e5ed41c). Every state, record and output is bit-identical to bf3bd22.",
+  "hardware": "NVIDIA GeForce RTX 5090 32 GB at the 575 W power limit; the desktop (Hyprland) shares the GPU, so builds alternate within every round and ratios are paired per round.",
+  "bench": {
+    "method": "ninfer_bench on the bench corpus (corpus_262144.ids), greedy, 256 generated tokens, --verify-tree, optimized proposal head, K8V4, max context 139264, four rounds alternating bf3bd22, c6ab440 and e5ed41c; paired median of per-round ratios.",
+    "corpus_note": "The corpus repeats a small set of paragraphs: 24 of 36 rounds at 8K and every round at 32K and 131K are lookup rounds.",
+    "rows": [
+      {
+        "prompt_tokens": 8192,
+        "base": {"commit": "bf3bd22", "round_ms": 15.830, "tokens_per_round": 14.22, "tok_s": 898.4},
+        "first_pass": {"commit": "c6ab440", "round_ms": 15.595, "tokens_per_round": 14.22, "tok_s": 912.0, "paired_change": 0.013},
+        "head": {"commit": "e5ed41c", "round_ms": 15.426, "tokens_per_round": 14.22, "tok_s": 922.0, "paired_change": 0.024}
+      },
+      {
+        "prompt_tokens": 32768,
+        "base": {"commit": "bf3bd22", "round_ms": 15.886, "tokens_per_round": 15.06, "tok_s": 947.9},
+        "first_pass": {"commit": "c6ab440", "round_ms": 15.790, "tokens_per_round": 15.06, "tok_s": 953.7, "paired_change": 0.006},
+        "head": {"commit": "e5ed41c", "round_ms": 15.513, "tokens_per_round": 15.06, "tok_s": 970.7, "paired_change": 0.024}
+      },
+      {
+        "prompt_tokens": 131072,
+        "base": {"commit": "bf3bd22", "round_ms": 18.292, "tokens_per_round": 16.0, "tok_s": 874.7},
+        "first_pass": {"commit": "c6ab440", "round_ms": 18.197, "tokens_per_round": 16.0, "tok_s": 879.3, "paired_change": 0.006},
+        "head": {"commit": "e5ed41c", "round_ms": 17.961, "tokens_per_round": 16.0, "tok_s": 890.8, "paired_change": 0.019}
+      }
+    ],
+    "second_pass_only": {
+      "note": "e5ed41c against c6ab440 in the same runs",
+      "paired_change": {"8192": 0.010, "32768": 0.017, "131072": 0.013}
+    }
+  },
+  "serving": {
+    "method": "ninfer-serve, max concurrency 1, max context 32768, no prefix reuse, --verify-tree; server restarted per variant; 16 thinking-mode coding chats (seeds 1 and 2) and copy-heavy file edits (seeds 7 and 8), two rounds alternating bf3bd22 and e5ed41c.",
+    "sampling": {
+      "note": "Seeded default sampling. Outputs are byte-identical between the builds, so both served the same tokens in the same rounds.",
+      "chat": {
+        "requests": 64,
+        "identical_outputs": 64,
+        "tokens_per_round": 5.046,
+        "base": {"tok_s": 307.2},
+        "head": {"tok_s": 313.6}
+      },
+      "edits": {
+        "requests": 16,
+        "identical_outputs": 16,
+        "tokens_per_round": 9.169,
+        "base": {"tok_s": 563.9},
+        "head": {"tok_s": 575.8}
+      }
+    }
+  },
+  "profile": {
+    "gdn_block_8k_us": "nsys, one lookup round: output projection starts 1.4-1.7 us earlier per GDN block once z follows its query/key/value rows on the compute stream (eager launches paid about 2 us per cross-stream wait); graph-launched drafter rounds gain about 0.4 us per block from the three-stage output-gate stream.",
+    "fold_us": "Lookup rounds at 131K: verification started about 290 us after the round began instead of 395 us once the fold was staged; drafter-round folds at 8K took 184-501 us before and 217-292 us after.",
+    "record_kernel": "142 registers and 9056 bytes of shared memory per block, down from 145 and 25312."
+  },
+  "losslessness": {
+    "op_tests": "ninfer_gated_delta_net_replay_record_test (fails when the rebuilt query scale is perturbed by one ulp), ninfer_gdn_replay_fold_test, ninfer_gdn_record_overlap_test and ninfer_gdn_input_proj_conv_record_test pass bit for bit.",
+    "real_test": "ninfer_qwen3_5_dflash2_real_test passes chain and tree at B=1 graph, B=8 graph and B=2 eager with unchanged acceptance (20/24, 21/23, 20/24, 20/24).",
+    "greedy_serving": "32 greedy chats and 8 greedy edits are byte-identical to bf3bd22.",
+    "ctest": "Passes except ninfer_chat_templates_test, which needs jinja2."
+  },
+  "rejected": [
+    "Output-gate projection with 16-row tiles (384 blocks): +1.2 us per GDN block",
+    "Output-gate projection with 64-row tiles and four stages: +0.3 us per GDN block",
+    "Output-gate projection with four stages or 512-byte K tiles: its blocks crowd out the recurrence (+2 us in a microbenchmark)",
+    "Query/key/value projection with three stages: no gain beside the control dots",
+    "Stream priorities or launch order between the output-gate projection and the recurrence: no change"
+  ]
+}
