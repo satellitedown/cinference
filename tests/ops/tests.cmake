@@ -1,4 +1,5 @@
-# Modified by satellitedown for Cinference: register the fused FFN, attention input and q/k tests.
+# Modified by satellitedown for Cinference: register the fused FFN, attention input and q/k tests;
+# the overlapped GDN record route test.
 # See NOTICE and upstream-provenance.json for upstream attribution.
 
 set(ninfer_op_tests
@@ -141,6 +142,10 @@ ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
 
 ninfer_add_op_test(ninfer_gdn_input_proj_conv_record_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_proj_conv_record.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_gdn_record_overlap_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_record_overlap.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_gated_delta_net_replay_record_test

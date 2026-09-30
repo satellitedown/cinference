@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: evict-first weight fills; tile-finishing outputs.
+// Modified by satellitedown for Cinference: evict-first weight fills; tile-finishing outputs;
+// row-range launches.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -17,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -32,6 +34,17 @@ enum class Fp8MmaRaster : std::uint8_t {
 };
 
 struct Fp8MmaIdentityRows {
+    __device__ __forceinline__ int weight_row(int row_begin, int local_row) const {
+        return row_begin + local_row;
+    }
+};
+
+// A launch over the row tiles [tile_offset, tile_offset + launched tiles) of a geometry, so one
+// GEMM can be issued as consecutive row-range launches; every tile computes exactly what the
+// full launch computes for it.
+struct Fp8MmaRowRange {
+    std::int32_t tile_offset;
+
     __device__ __forceinline__ int weight_row(int row_begin, int local_row) const {
         return row_begin + local_row;
     }
@@ -148,6 +161,7 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     int token_tile          = 0;
     fp8_mma_tile_coordinates<Schedule>(static_cast<int>(blockIdx.x), row_tiles, token_tiles,
                                        row_tile, token_tile);
+    if constexpr (std::is_same_v<RowPolicy, Fp8MmaRowRange>) { row_tile += row_policy.tile_offset; }
     constexpr int rows_per_block = PairRows ? BN / 2 : BN;
     const int row_begin          = row_tile * rows_per_block;
     const int token_begin        = token_tile * BM;

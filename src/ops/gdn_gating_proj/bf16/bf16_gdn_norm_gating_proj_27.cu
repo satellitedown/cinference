@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: group verify-width gating heads and tiles per CTA.
+// Modified by satellitedown for Cinference: group verify-width gating heads and tiles per CTA;
+// control-only launches; the E4M3 A8 activation of the hidden output.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -7,16 +8,24 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/linear/fp8/fp8_a8_quantize.cuh"
 
 #include <cuda_bf16.h>
 
 namespace ninfer::ops::detail {
 namespace {
+constexpr int kGdn27Hidden = 5120;
+
+// Width of the per-token norm partition (thread t sums the squares of the 8-element chunks
+// t, t + Threads, ... in order); both kernels below derive it from T the same way.
+constexpr int gdn_norm_27_threads(int tokens) { return tokens <= 14 ? 512 : 256; }
+
 // Each head computes both control dots and the complete norm. RMS scaling can be
 // applied after the dots; h is independently rounded from the full normalized input.
 // A CTA runs HeadGroups x TileGroups independent Threads-wide groups, each owning one head and Tile
 // tokens with the same partition as a one-group CTA. Grouping changes only which loads a CTA
 // shares through L1 (x rows across heads, weight rows across tiles), never the arithmetic.
+// A null h skips the hidden output.
 template <int Tile, int Threads, int HeadGroups = 1, int TileGroups = 1>
 __global__ __launch_bounds__(Threads * HeadGroups * TileGroups) void gdn_norm_gating_27_simt(
     const __nv_bfloat16* x, const __nv_bfloat16* nw, const __nv_bfloat16* aw,
@@ -88,6 +97,7 @@ __global__ __launch_bounds__(Threads * HeadGroups * TileGroups) void gdn_norm_ga
         }
     }
     __syncthreads();
+    if (h == nullptr) { return; }
     // Disjoint, pair-aligned h slices across the 48 heads avoid a separate norm kernel.
     constexpr int PairsPerHead = (D / 2 + H - 1) / H;
     const int pair             = head * PairsPerHead + tid;
@@ -102,6 +112,97 @@ __global__ __launch_bounds__(Threads * HeadGroups * TileGroups) void gdn_norm_ga
                     v.x * inverse[group][t] * (1 + n.x), v.y * inverse[group][t] * (1 + n.y));
             }
     }
+}
+
+// The hidden output of gdn_norm_gating_27_simt<*, Threads> for one token per CTA, quantized as
+// fp8_a8_quantize_kernel quantizes it: the same chunk partition, FMA order, warp reductions and
+// in-order warp sum form the norm, each value is rounded to BF16 as h stores it, and the token
+// scale, reciprocal and E4M3 pair conversion are the shared A8 helpers. The maximum is
+// order-independent, so its reduction tree is free.
+template <int Threads>
+__global__ __launch_bounds__(Threads) void gdn_norm_27_fp8_hidden_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ nw,
+    std::uint8_t* __restrict__ codes, float* __restrict__ scales, float eps) {
+    constexpr int D = kGdn27Hidden, Warps = Threads / 32, Chunks = (D / 8 + Threads - 1) / Threads;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const std::int64_t row = std::int64_t(blockIdx.x) * D;
+    // Every load is issued before the reduction, so the x and weight trips overlap.
+    int4 xv[Chunks]{}, nv[Chunks]{};
+#pragma unroll
+    for (int c = 0; c < Chunks; ++c) {
+        const int base = (tid + c * Threads) * 8;
+        if (base < D) {
+            xv[c] = load_vec<int4>(x + row + base);
+            nv[c] = load_vec<int4>(nw + base);
+        }
+    }
+    float ss = 0.0f;
+#pragma unroll
+    for (int c = 0; c < Chunks; ++c) {
+        if ((tid + c * Threads) * 8 < D) {
+            const auto* xp = reinterpret_cast<const unsigned*>(&xv[c]);
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const float2 v = bf16x2_bits_to_float2(xp[p]);
+                ss             = fmaf(v.x, v.x, ss);
+                ss             = fmaf(v.y, v.y, ss);
+            }
+        }
+    }
+    __shared__ float partial[Warps], maxima[Warps], inverse_shared, scale_shared;
+    ss = warp_reduce_sum(ss);
+    if (lane == 0) { partial[warp] = ss; }
+    __syncthreads();
+    if (tid == 0) {
+        float s = 0;
+#pragma unroll
+        for (int w = 0; w < Warps; ++w) { s += partial[w]; }
+        inverse_shared = rsqrtf(s / D + eps);
+    }
+    __syncthreads();
+    const float inv = inverse_shared;
+    float2 hidden[Chunks][4];
+    float maximum = 0.0f;
+#pragma unroll
+    for (int c = 0; c < Chunks; ++c) {
+        if ((tid + c * Threads) * 8 < D) {
+            const auto* xp = reinterpret_cast<const unsigned*>(&xv[c]);
+            const auto* np = reinterpret_cast<const unsigned*>(&nv[c]);
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                const float2 v = bf16x2_bits_to_float2(xp[p]);
+                const float2 n = bf16x2_bits_to_float2(np[p]);
+                hidden[c][p]   = __bfloat1622float2(
+                    __floats2bfloat162_rn(v.x * inv * (1 + n.x), v.y * inv * (1 + n.y)));
+                maximum = fmaxf(maximum, fabsf(hidden[c][p].x));
+                maximum = fmaxf(maximum, fabsf(hidden[c][p].y));
+            }
+        }
+    }
+    maximum = warp_max(maximum);
+    if (lane == 0) { maxima[warp] = maximum; }
+    __syncthreads();
+    if (warp == 0) {
+        maximum = lane < Warps ? maxima[lane] : 0.0f;
+        maximum = warp_max(maximum);
+        if (lane == 0) { scale_shared = fp8_a8_token_scale(maximum); }
+    }
+    __syncthreads();
+    const float scale   = scale_shared;
+    const float inverse = fp8_a8_inverse_scale(scale);
+#pragma unroll
+    for (int c = 0; c < Chunks; ++c) {
+        const int base = (tid + c * Threads) * 8;
+        if (base < D) {
+            const uint2 packed{
+                fp8_a8_encode_pair(hidden[c][0], inverse) |
+                    (static_cast<unsigned>(fp8_a8_encode_pair(hidden[c][1], inverse)) << 16),
+                fp8_a8_encode_pair(hidden[c][2], inverse) |
+                    (static_cast<unsigned>(fp8_a8_encode_pair(hidden[c][3], inverse)) << 16)};
+            store_vec(codes + row + base, packed);
+        }
+    }
+    if (tid == 0) { scales[blockIdx.x] = scale; }
 }
 } // namespace
 
@@ -123,16 +224,39 @@ void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_wei
                 static_cast<float*>(beta.data), x.ne[1], eps);
     };
     const int tokens = x.ne[1];
-    if (tokens <= 2)
-        launch.template operator()<1, 512>();
-    else if (tokens <= 14)
-        launch.template operator()<2, 512>();
-    else if (tokens <= 28)
+    if (gdn_norm_27_threads(tokens) == 512) {
+        if (tokens <= 2) {
+            launch.template operator()<1, 512>();
+        } else {
+            launch.template operator()<2, 512>();
+        }
+    } else if (tokens <= 28 && h.data != nullptr) {
         // Verify widths: 2 heads x 2 token tiles per CTA share x and weight rows through L1,
         // 4.90 -> 3.74 us at T=16 (with the constants requested first) in a cold-weight microbench.
         launch.template operator()<2, 256, 2, 2>();
-    else
+    } else if (tokens <= 28) {
+        // A control-only launch runs beside the input projection: one 256-thread group per CTA
+        // leaves room for the projection's CTAs on every SM.
+        launch.template operator()<2, 256>();
+    } else {
         launch.template operator()<4, 256>();
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void bf16_gdn_norm_27_fp8_hidden_launch(const Tensor& x, const Tensor& norm_weight, float eps,
+                                        Tensor& codes, Tensor& scales, cudaStream_t stream) {
+    const auto launch = [&]<int Threads>() {
+        gdn_norm_27_fp8_hidden_kernel<Threads><<<x.ne[1], Threads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const __nv_bfloat16*>(norm_weight.data),
+            static_cast<std::uint8_t*>(codes.data), static_cast<float*>(scales.data), eps);
+    };
+    if (gdn_norm_27_threads(x.ne[1]) == 512) {
+        launch.template operator()<512>();
+    } else {
+        launch.template operator()<256>();
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 } // namespace ninfer::ops::detail

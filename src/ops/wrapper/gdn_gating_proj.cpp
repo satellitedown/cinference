@@ -1,6 +1,11 @@
+// Modified by satellitedown for Cinference: control-only and E4M3-hidden forms of the fused
+// norm-gating route.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #include "core/weight.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 
+#include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 #include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_plan.h"
 
 #include <cmath>
@@ -182,6 +187,69 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
     const Weight b_weight = bf16_row_view(ab_weight, geometry.heads, geometry.heads);
     detail::bf16_gdn_norm_gating_dispatch(x, norm_weight, eps, h, a_weight, b_weight, A_log,
                                           dt_bias, ws, g, beta, execution);
+}
+
+bool gdn_norm_gating_split_admits(std::int32_t heads, std::int32_t input_rows,
+                                  std::int32_t tokens) noexcept {
+    if (heads <= 0 || input_rows <= 0 || tokens <= 0) { return false; }
+    try {
+        return detail::bf16_gdn_norm_gating_resolve_plan({heads, input_rows, tokens}).schedule ==
+               detail::Bf16GdnNormGatingScheduleId::FusedSimt27;
+    } catch (const std::exception&) { return false; }
+}
+
+void gdn_norm_gating_control(const Tensor& x, const Tensor& norm_weight, float eps,
+                             const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                             const Tensor& dt_bias, Tensor& g, Tensor& beta, cudaStream_t stream) {
+    constexpr const char* op  = "gdn_norm_gating_control";
+    const std::int32_t tokens = x.ne[1];
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument("gdn_norm_gating_control: eps must be positive and finite");
+    }
+    if (!gdn_norm_gating_split_admits(48, 5120, tokens)) {
+        throw std::invalid_argument("gdn_norm_gating_control: outside the fused route");
+    }
+    require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
+    require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");
+    require_vector_tensor(A_log, DType::FP32, 48, op, "A_log");
+    require_vector_tensor(dt_bias, DType::FP32, 48, op, "dt_bias");
+    require_sequence_tensor(g, DType::FP32, 48, tokens, op, "g");
+    require_sequence_tensor(beta, DType::FP32, 48, tokens, op, "beta");
+    require_bf16_weight(a_weight, 48, 5120, "a_weight");
+    require_bf16_weight(b_weight, 48, 5120, "b_weight");
+
+    Tensor no_hidden;
+    detail::bf16_gdn_norm_gating_proj_27_launch(x, norm_weight, eps, no_hidden, a_weight, b_weight,
+                                                A_log, dt_bias, g, beta, stream);
+}
+
+void gdn_norm_gating_control(const Tensor& x, const Tensor& norm_weight, float eps,
+                             const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
+                             Tensor& g, Tensor& beta, cudaStream_t stream) {
+    const GdnControlParentGeometry geometry = require_bf16_parent(ab_weight);
+    if (geometry.heads != 48) {
+        throw std::invalid_argument("gdn_norm_gating_control: outside the fused route");
+    }
+    gdn_norm_gating_control(x, norm_weight, eps, bf16_row_view(ab_weight, 0, geometry.heads),
+                            bf16_row_view(ab_weight, geometry.heads, geometry.heads), A_log,
+                            dt_bias, g, beta, stream);
+}
+
+void gdn_norm_gating_fp8_hidden(const Tensor& x, const Tensor& norm_weight, float eps,
+                                Tensor& codes, Tensor& scales, cudaStream_t stream) {
+    constexpr const char* op  = "gdn_norm_gating_fp8_hidden";
+    const std::int32_t tokens = x.ne[1];
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument("gdn_norm_gating_fp8_hidden: eps must be positive and finite");
+    }
+    if (!gdn_norm_gating_split_admits(48, 5120, tokens)) {
+        throw std::invalid_argument("gdn_norm_gating_fp8_hidden: outside the fused route");
+    }
+    require_sequence_tensor(x, DType::BF16, 5120, tokens, op, "x");
+    require_vector_tensor(norm_weight, DType::BF16, 5120, op, "norm_weight");
+    require_sequence_tensor(codes, DType::U8, 5120, tokens, op, "codes");
+    require_vector_tensor(scales, DType::FP32, tokens, op, "scales");
+    detail::bf16_gdn_norm_27_fp8_hidden_launch(x, norm_weight, eps, codes, scales, stream);
 }
 
 } // namespace ninfer::ops

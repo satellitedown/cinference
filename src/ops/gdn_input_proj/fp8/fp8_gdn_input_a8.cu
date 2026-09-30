@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: small-token A8; record convolution with verify trees.
+// Modified by satellitedown for Cinference: small-token A8; record convolution with verify trees;
+// record projection halves from a caller-produced activation.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -55,6 +56,38 @@ void run(const Weight& weight, Tensor& qkv, Tensor& z, Fp8A8Workspace workspace,
     }
 }
 
+using RecordSchedule = Fp8A8SmallTokenSchedule;
+using RecordOutput   = Fp8GdnRecordConvOutput<RecordSchedule::kBlockRows, RecordSchedule::kThreads>;
+static_assert(RecordSchedule::kBlockTokens == RecordOutput::kWidth);
+
+RecordOutput record_output(const Tensor& conv_weight, const Tensor& conv_states,
+                           const Tensor& valid_columns, const Tensor& initial_slot,
+                           const Tensor& tree_parents, Tensor& conv_record, Tensor& query,
+                           Tensor& key, Tensor& value, Tensor& z) {
+    return {
+        {static_cast<__nv_bfloat16*>(conv_record.data), static_cast<__nv_bfloat16*>(z.data)},
+        {
+            static_cast<const __nv_bfloat16*>(conv_weight.data),
+            static_cast<const __nv_bfloat16*>(conv_states.data),
+            static_cast<const std::int32_t*>(initial_slot.data),
+            valid_columns.data == nullptr ? nullptr
+                                          : static_cast<const std::int32_t*>(valid_columns.data),
+            static_cast<__nv_bfloat16*>(query.data),
+            static_cast<__nv_bfloat16*>(key.data),
+            static_cast<__nv_bfloat16*>(value.data),
+            Fp8GdnInputOutput::kQkvRows,
+            Fp8GdnInputOutput::kQueryRows,
+            Fp8GdnInputOutput::kKeyRows,
+            Fp8GdnInputOutput::kValueRows,
+            0,
+            RecordOutput::kWidth,
+            0,
+            NoHistoryPublish{},
+        },
+        static_cast<const std::int32_t*>(tree_parents.data),
+    };
+}
+
 } // namespace
 
 void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -72,36 +105,39 @@ void fp8_gdn_record_conv_a8_launch(const Tensor& x, const Weight& weight, const 
                                    const Tensor& initial_slot, const Tensor& tree_parents,
                                    Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                    Tensor& z, Fp8A8Workspace workspace, cudaStream_t stream) {
-    using Schedule = Fp8A8SmallTokenSchedule;
-    using Output   = Fp8GdnRecordConvOutput<Schedule::kBlockRows, Schedule::kThreads>;
-    static_assert(Schedule::kBlockTokens == Output::kWidth);
     if (x.ne[1] != kFp8GdnRecordConvWidth) {
         throw std::invalid_argument("fp8 GDN record convolution: unsupported block width");
     }
     launch_fp8_a8_quantize(x, weight, workspace, stream);
-    const Output output{
-        {static_cast<__nv_bfloat16*>(conv_record.data), static_cast<__nv_bfloat16*>(z.data)},
-        {
-            static_cast<const __nv_bfloat16*>(conv_weight.data),
-            static_cast<const __nv_bfloat16*>(conv_states.data),
-            static_cast<const std::int32_t*>(initial_slot.data),
-            valid_columns.data == nullptr ? nullptr
-                                          : static_cast<const std::int32_t*>(valid_columns.data),
-            static_cast<__nv_bfloat16*>(query.data),
-            static_cast<__nv_bfloat16*>(key.data),
-            static_cast<__nv_bfloat16*>(value.data),
-            Fp8GdnInputOutput::kQkvRows,
-            Fp8GdnInputOutput::kQueryRows,
-            Fp8GdnInputOutput::kKeyRows,
-            Fp8GdnInputOutput::kValueRows,
-            0,
-            Output::kWidth,
-            0,
-            NoHistoryPublish{},
-        },
-        static_cast<const std::int32_t*>(tree_parents.data),
-    };
-    launch_mma<Schedule, true>(weight, output, workspace, x.ne[1], stream);
+    launch_mma<RecordSchedule, true>(weight,
+                                     record_output(conv_weight, conv_states, valid_columns,
+                                                   initial_slot, tree_parents, conv_record, query,
+                                                   key, value, z),
+                                     workspace, x.ne[1], stream);
+}
+
+void fp8_gdn_record_conv_a8_rows_launch(Fp8A8Workspace activation, const Weight& weight,
+                                        const Tensor& conv_weight, const Tensor& conv_states,
+                                        const Tensor& valid_columns, const Tensor& initial_slot,
+                                        const Tensor& tree_parents, Tensor& conv_record,
+                                        Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                        GdnRecordRows rows, cudaStream_t stream) {
+    // Each row tile is exactly the tile of the complete launch (RecordSchedule's TokenFast raster
+    // gives one row tile per block at W=16), so the halves together equal it bit for bit.
+    constexpr int kQkvTiles = Fp8GdnInputOutput::kQkvRows / RecordSchedule::kBlockRows;
+    constexpr int kZTiles   = Fp8GdnInputOutput::kZRows / RecordSchedule::kBlockRows;
+    static_assert(kQkvTiles * RecordSchedule::kBlockRows == Fp8GdnInputOutput::kQkvRows);
+    static_assert(kZTiles * RecordSchedule::kBlockRows == Fp8GdnInputOutput::kZRows);
+    const bool gate           = rows == GdnRecordRows::OutputGate;
+    const RecordOutput output = record_output(conv_weight, conv_states, valid_columns, initial_slot,
+                                              tree_parents, conv_record, query, key, value, z);
+    fp8_mma_kernel<Geometry, RecordSchedule, true, Fp8IdentityEpilogue, RecordOutput,
+                   Fp8MmaRowRange><<<gate ? kZTiles : kQkvTiles, RecordSchedule::kThreads,
+                                     RecordSchedule::kSharedBytes, stream>>>(
+        activation.codes, activation.scales, static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const __nv_bfloat16*>(weight.scales), kFp8GdnRecordConvWidth,
+        Fp8IdentityEpilogue{}, output, Fp8MmaRowRange{gate ? kQkvTiles : 0});
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops::detail

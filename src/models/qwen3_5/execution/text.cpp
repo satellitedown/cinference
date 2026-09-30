@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: fused FFN/input-norm/norm-RoPE; GDN prefetch; trees.
+// Modified by satellitedown for Cinference: fused FFN/input-norm/norm-RoPE; GDN prefetch; trees;
+// overlapped GDN record projection.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/program/internal.h"
@@ -937,8 +938,15 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
-    gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
-                     ctx_.execution_view());
+    // A record block on the overlapped route leaves the norm and controls to its projection.
+    const bool overlapped =
+        ph == Phase::Verify && gdn_state_action_ == GdnStateAction::RecordForReplay &&
+        active_sequence_batch_ > 0 &&
+        gdn_record_overlap_admits(p, active_sequence_batch_, active_sequence_width_);
+    if (!overlapped) {
+        gdn_norm_control(x, w.input_norm, config_.rms_norm_eps, p, h, g, beta, work_,
+                         ctx_.execution_view());
+    }
 
     const auto projection = workspace::gdn_projection(work_, config_, T);
     Tensor z  = projection.output_gate.view({dimension(config_.gdn->linear_value_head_dim),
@@ -975,11 +983,22 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 throw std::logic_error("Replay-record GDN has no record storage");
             }
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
-            gdn_projection_record(
-                projection_input, p, *config_.gdn, conv_states, valid,
-                *active_linear_state_source_slots_,
-                verify_tree_parents_ != nullptr ? *verify_tree_parents_ : Tensor{}, records.conv,
-                query_output, key_output, value_output, gate_output, work_, s);
+            const Tensor tree_parents =
+                verify_tree_parents_ != nullptr ? *verify_tree_parents_ : Tensor{};
+            if (overlapped) {
+                const auto activation = workspace::gdn_record_activation(work_, config_, T);
+                Tensor codes          = activation.codes;
+                Tensor scales         = activation.scales;
+                gdn_projection_record_overlapped(
+                    x, w.input_norm, config_.rms_norm_eps, p, conv_states, valid,
+                    *active_linear_state_source_slots_, tree_parents, records.conv, query_output,
+                    key_output, value_output, gate_output, g, beta, codes, scales, ctx_);
+            } else {
+                gdn_projection_record(projection_input, p, *config_.gdn, conv_states, valid,
+                                      *active_linear_state_source_slots_, tree_parents,
+                                      records.conv, query_output, key_output, value_output,
+                                      gate_output, work_, s);
+            }
         } else {
             gdn_projection_snapshot(projection_input, p, *config_.gdn, conv_states, valid,
                                     *active_linear_state_source_slots_,
@@ -1035,6 +1054,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             const Tensor next_states = next_layer < state_.layer_count()
                                            ? state_.layer_view(next_layer).recurrent
                                            : Tensor{};
+            if (overlapped) { gdn_join_concurrent(ctx_, kGdnControlReady, s); }
             ops::gated_delta_net_replay_record(
                 q_batch, k_batch, v_batch, g_batch, beta_batch,
                 static_cast<float>(
@@ -1065,6 +1085,8 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)
                     .view({dimension(config_.gdn->linear_value_head_dim),
                            dimension(config_.gdn->linear_num_value_heads), T});
+    // The output-gate rows ran beside the recurrence on the overlapped route.
+    if (overlapped) { gdn_join_concurrent(ctx_, kGdnOutputGateReady, s); }
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
 
     ops::linear_add(on.view({dimension(config_.gdn->value_width()), T}), p.output.weight, x,

@@ -1,7 +1,11 @@
+// Modified by satellitedown for Cinference: a concurrent compute stream with fork/join events.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -18,10 +22,20 @@ struct DeviceExecutionView {
     std::int32_t multiprocessor_count = 0;
 };
 
+// A second compute stream, at the compute stream's priority, for work that a sequence of Ops forks
+// from `stream` and joins back into it through `events` (recorded on one stream, waited on the
+// other). Every fork is joined before the sequence ends, so no work stays pending on it.
+struct ConcurrentStream {
+    static constexpr std::size_t kEvents = 4;
+    cudaStream_t stream                  = nullptr;
+    std::array<cudaEvent_t, kEvents> events{};
+};
+
 struct DeviceContext {
     int device                   = 0;
     cudaStream_t stream          = nullptr;
     cudaStream_t transfer_stream = nullptr;
+    ConcurrentStream concurrent;
     cudaDeviceProp props{};
 
     explicit DeviceContext(int device_id = 0);

@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: control-only fused launches; the E4M3 hidden output.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "core/weight.h"
@@ -10,10 +13,16 @@
 
 namespace ninfer::ops::detail {
 
+// A null h.data launches the control-only form (g and beta).
 void bf16_gdn_norm_gating_proj_27_launch(const Tensor& x, const Tensor& norm_weight, float eps,
                                          Tensor& h, const Weight& a_weight, const Weight& b_weight,
                                          const Tensor& alog, const Tensor& bias, Tensor& g,
                                          Tensor& beta, cudaStream_t stream);
+
+// The fused route's h, quantized per column to row-scaled E4M3 exactly as the FP8 A8 activation
+// pass would quantize it: codes U8 [5120,T], scales FP32 [T].
+void bf16_gdn_norm_27_fp8_hidden_launch(const Tensor& x, const Tensor& norm_weight, float eps,
+                                        Tensor& codes, Tensor& scales, cudaStream_t stream);
 
 enum class Bf16GdnGatingTokenVariant {
     None,

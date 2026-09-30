@@ -1,7 +1,7 @@
 # DFlash and DFlash2
 
 > Modified by satellitedown for Cinference: DFlash2 verify trees with prompt-lookup chains and lookup
-> rounds.
+> rounds; overlapped GDN verify blocks.
 
 DFlash backends propose several tokens with one masked-block forward, conditioned on committed
 target hidden features. The target verifies the proposal causally and remains the output authority.
@@ -313,6 +313,16 @@ an RTX 5090), and `candidate_selector_lookup_chain` writes the chain as the tree
 build for a certain chain. Verification, acceptance and commit are the tree path's. Lookup rounds
 launch eagerly, so they reserve no graph memory, with the envelopes of the round's graph profile,
 so every kernel route matches the drafted rounds. `SpeculativeStats::lookup_rounds` counts them.
+
+Overlapped GDN blocks. A GDN verify block that records for replay with the FP8 input projection's
+single-block A8 route (B=1, W=16) forks two jobs onto `DeviceContext::concurrent`: the
+norm-gating control dots (`gdn_norm_gating_control`) run beside the query/key/value rows of the
+input projection, and its output-gate rows run beside the recurrence. The input RMSNorm writes the
+E4M3 activation both row halves read (`gdn_norm_gating_fp8_hidden`), so the block's critical path
+is norm, query/key/value rows, recurrence instead of norm-gating, activation quantization, all
+16,384 rows, recurrence. The compute stream joins the controls before the recurrence and z
+before the gated RMSNorm; every output is bit-identical to the serial form, which other
+geometries and paths keep.
 
 ## Backend storage and lifecycle
 

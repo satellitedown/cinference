@@ -1,4 +1,4 @@
-// Modified by satellitedown for Cinference: declare the record-route convolution launcher.
+// Modified by satellitedown for Cinference: declare the record-route convolution launchers.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -6,6 +6,7 @@
 #include "core/weight.h"
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
@@ -39,6 +40,15 @@ void fp8_gdn_record_conv_a8_launch(const Tensor& x, const Weight& weight, const 
                                    const Tensor& initial_slot, const Tensor& tree_parents,
                                    Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                    Tensor& z, Fp8A8Workspace workspace, cudaStream_t stream);
+
+// One half of that route's projection from a caller-produced activation (codes U8 [5120,16],
+// scales FP32 [16]): QueryKeyValue runs the convolved tiles, OutputGate the z tiles.
+void fp8_gdn_record_conv_a8_rows_launch(Fp8A8Workspace activation, const Weight& weight,
+                                        const Tensor& conv_weight, const Tensor& conv_states,
+                                        const Tensor& valid_columns, const Tensor& initial_slot,
+                                        const Tensor& tree_parents, Tensor& conv_record,
+                                        Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                        GdnRecordRows rows, cudaStream_t stream);
 
 // Exact contraction mechanisms shared by G1/G2/G3. Semantic Ops own their route frontier and
 // call one of these launchers after resolving their complete-form plan.

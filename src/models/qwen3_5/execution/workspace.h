@@ -1,3 +1,6 @@
+// Modified by satellitedown for Cinference: the overlapped GDN record route's A8 activation.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 // Phase allocations shared by actual execution and startup sizing.
@@ -114,6 +117,22 @@ GdnProjectionRoots gdn_projection(Allocator& allocator, const TextConfig& config
         matrix(allocator, DType::BF16, dimension(config.gdn->key_width()), tokens),
         matrix(allocator, DType::BF16, dimension(config.gdn->key_width()), tokens),
         matrix(allocator, DType::BF16, dimension(config.gdn->value_width()), tokens),
+    };
+}
+
+// Row-scaled E4M3 activation (codes [hidden,T], scales [T]) that both halves of an overlapped GDN
+// record projection read.
+struct GdnRecordActivationRoots {
+    Tensor codes;
+    Tensor scales;
+};
+
+template <class Allocator>
+GdnRecordActivationRoots gdn_record_activation(Allocator& allocator, const TextConfig& config,
+                                               std::int32_t tokens) {
+    return {
+        matrix(allocator, DType::U8, dimension(config.hidden_size), tokens),
+        vector(allocator, DType::FP32, tokens),
     };
 }
 

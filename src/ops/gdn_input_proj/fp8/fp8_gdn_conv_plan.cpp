@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: fuse the width-16 A8 record convolution; verify trees.
+// Modified by satellitedown for Cinference: fuse the width-16 A8 record convolution; verify trees;
+// the activation form's route query.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -130,6 +131,13 @@ std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy, std::
     }
     return snapshot_capacity(maximum, batch_size * largest_materialized_width,
                              batch_size * max_width);
+}
+
+bool fp8_gdn_record_takes_activation(LinearPolicy policy, std::int32_t batch_size,
+                                     std::int32_t width) {
+    return batch_size == 1 && width == kFp8GdnRecordConvWidth &&
+           fp8_gdn_record_resolve_plan(policy, width, batch_size).schedule ==
+               Fp8GdnConvScheduleId::MaterializedA8;
 }
 
 std::size_t fp8_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::int32_t batch_size,

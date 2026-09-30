@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: MTP-10, diagnostics, fused FFN/input norm, trees.
+// Modified by satellitedown for Cinference: MTP-10, diagnostics, fused FFN/input norm, trees;
+// the overlapped GDN record activation.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/execution/attention.h"
@@ -347,6 +348,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         scratch(layout, execution::gdn_snapshot_workspace_bytes(
                                             gdn, *config.gdn, batch_size, min_width, max_width));
                     } else if (path == GdnWorkspacePath::ReplayRecord) {
+                        // Overlapped record blocks keep their activation for the whole layer.
+                        (void)workspace::gdn_record_activation(layout, config, last);
                         scratch(layout, execution::gdn_record_workspace_bytes(
                                             gdn, *config.gdn, batch_size, min_width, max_width));
                     } else {

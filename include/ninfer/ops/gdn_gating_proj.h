@@ -1,3 +1,7 @@
+// Modified by satellitedown for Cinference: control-only and E4M3-hidden forms of the fused
+// norm-gating route, for a projection that overlaps the control dots.
+// See NOTICE and upstream-provenance.json for upstream attribution.
+
 #pragma once
 
 #include "core/weight.h"
@@ -93,5 +97,37 @@ void gdn_norm_gating_proj(const Tensor& x, const Tensor& norm_weight, float eps,
                           const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
                           WorkspaceArena& ws, Tensor& h, Tensor& g, Tensor& beta,
                           DeviceExecutionView execution);
+
+/**
+ * Whether the two split forms below serve a gdn_norm_gating_proj problem: the Qwen3.8-27B
+ * geometry (48 heads, 5120 input rows) at T <= 42, where the complete Op evaluates its norm and
+ * controls in one fused pass. Outside it the split forms throw.
+ */
+[[nodiscard]] bool gdn_norm_gating_split_admits(std::int32_t heads, std::int32_t input_rows,
+                                                std::int32_t tokens) noexcept;
+
+/**
+ * Control-only form of gdn_norm_gating_proj: writes g and beta bit for bit as the complete Op does
+ * for the same x, weights and T, without the hidden output and without workspace. Its launch
+ * keeps every SM open to a concurrent projection, so it can run beside the input projection that
+ * consumes gdn_norm_gating_fp8_hidden. The two-weight and contiguous-parent forms match the
+ * complete Op's; only the admitted geometry is accepted.
+ */
+void gdn_norm_gating_control(const Tensor& x, const Tensor& norm_weight, float eps,
+                             const Weight& a_weight, const Weight& b_weight, const Tensor& A_log,
+                             const Tensor& dt_bias, Tensor& g, Tensor& beta, cudaStream_t stream);
+
+void gdn_norm_gating_control(const Tensor& x, const Tensor& norm_weight, float eps,
+                             const Weight& ab_weight, const Tensor& A_log, const Tensor& dt_bias,
+                             Tensor& g, Tensor& beta, cudaStream_t stream);
+
+/**
+ * The hidden output h of gdn_norm_gating_proj, delivered as its row-scaled E4M3 activation: codes
+ * (U8 [5120,T]) and scales (FP32 [T]) equal, bit for bit, the per-column A8 quantization that the
+ * FP8 input projection applies to the complete Op's h for the same x, norm_weight, eps and T. The
+ * BF16 h itself is not written. codes and scales must not overlap x or each other.
+ */
+void gdn_norm_gating_fp8_hidden(const Tensor& x, const Tensor& norm_weight, float eps,
+                                Tensor& codes, Tensor& scales, cudaStream_t stream);
 
 } // namespace ninfer::ops

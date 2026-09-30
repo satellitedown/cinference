@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: route verify-tree parents to the FP8 record.
+// Modified by satellitedown for Cinference: route verify-tree parents to the FP8 record; the
+// record's A8 halves from a caller-produced activation.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/weight.h"
@@ -1035,6 +1036,91 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
     dispatch_single_parent_record(x, query_key_value_z_weight, conv_weight, conv_states,
                                   valid_columns, initial_state_slots, Tensor{}, conv_record, query,
                                   key, value, z, LinearPolicy::A16Only, workspace, stream);
+}
+
+bool gdn_input_proj_conv_record_takes_activation(const Weight& weight, LinearPolicy policy,
+                                                 std::int32_t batch_size, std::int32_t width) {
+    validate_policy(policy);
+    return weight.qtype == QType::FP8_E4M3FN_ROW_BF16 && weight.n == 16384 && weight.k == 5120 &&
+           detail::fp8_gdn_record_takes_activation(policy, batch_size, width);
+}
+
+void gdn_input_proj_conv_record(const Tensor& codes, const Tensor& scales,
+                                const Weight& query_key_value_z_weight, const Tensor& conv_weight,
+                                const Tensor& conv_states, const Tensor& valid_columns,
+                                const Tensor& initial_state_slots, const Tensor& tree_parents,
+                                Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                Tensor& z, GdnRecordRows rows, cudaStream_t stream) {
+    constexpr const char* op           = "gdn_input_proj_conv_record";
+    constexpr std::int32_t kHidden     = 5120;
+    constexpr std::int32_t kQueryRows  = 2048;
+    constexpr std::int32_t kKeyRows    = 2048;
+    constexpr std::int32_t kValueRows  = 6144;
+    constexpr std::int32_t kZRows      = 6144;
+    constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
+    constexpr std::int32_t kParentRows = kChannels + kZRows;
+    constexpr ConvGeometry geometry{detail::kFp8GdnRecordConvWidth, 1,
+                                    detail::kFp8GdnRecordConvWidth};
+    const Weight& weight = query_key_value_z_weight;
+    detail::validate_fp8_weight(weight, "fp8 gdn_input_proj_conv_record");
+    if (weight.n != kParentRows || weight.k != kHidden) {
+        throw std::invalid_argument("fp8 gdn_input_proj_conv_record: unsupported weight shape");
+    }
+    if (rows != GdnRecordRows::QueryKeyValue && rows != GdnRecordRows::OutputGate) {
+        throw std::invalid_argument("gdn_input_proj_conv_record: invalid row half");
+    }
+    if (codes.dtype != DType::U8 || codes.ne[0] != kHidden || codes.ne[1] != geometry.width ||
+        codes.ne[2] != 1 || codes.ne[3] != 1 || !codes.is_contiguous() ||
+        !aligned_to(codes.data, 16)) {
+        throw std::invalid_argument("gdn_input_proj_conv_record: invalid activation codes");
+    }
+    if (scales.dtype != DType::FP32 || scales.ne[0] != geometry.width || scales.ne[1] != 1 ||
+        scales.ne[2] != 1 || scales.ne[3] != 1 || !scales.is_contiguous() ||
+        !aligned_to(scales.data, 4)) {
+        throw std::invalid_argument("gdn_input_proj_conv_record: invalid activation scales");
+    }
+    require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots, kChannels,
+                            geometry);
+    require_conv_tensor(conv_record, kChannels, geometry.width, geometry.batch, op, "conv record");
+    require_conv_tensor(query, kQueryRows, geometry.width, geometry.batch, op, "query");
+    require_conv_tensor(key, kKeyRows, geometry.width, geometry.batch, op, "key");
+    require_conv_tensor(value, kValueRows, geometry.width, geometry.batch, op, "value");
+    require_conv_tensor(z, kZRows, geometry.width, geometry.batch, op, "z");
+    if (tree_parents.data != nullptr &&
+        (tree_parents.dtype != DType::I32 || !tree_parents.is_contiguous() ||
+         tree_parents.ne[0] != geometry.width || tree_parents.ne[1] != geometry.batch ||
+         tree_parents.ne[2] != 1 || tree_parents.ne[3] != 1)) {
+        throw std::invalid_argument("gdn_input_proj_conv_record: invalid tree parents");
+    }
+    const std::array<const Tensor*, 11> tensors{&codes,
+                                                &scales,
+                                                &conv_weight,
+                                                &conv_states,
+                                                &valid_columns,
+                                                &initial_state_slots,
+                                                &conv_record,
+                                                &query,
+                                                &key,
+                                                &value,
+                                                &z};
+    for (std::size_t lhs = 0; lhs < tensors.size(); ++lhs) {
+        if (tensors[lhs]->data == nullptr) { continue; }
+        for (std::size_t rhs = lhs + 1; rhs < tensors.size(); ++rhs) {
+            if (tensors[rhs]->data != nullptr && overlaps(*tensors[lhs], *tensors[rhs])) {
+                throw std::invalid_argument(
+                    "gdn_input_proj_conv_record: tensor operands must not overlap");
+            }
+        }
+        if (overlaps_range(*tensors[lhs], weight.payload,
+                           static_cast<std::size_t>(weight.payload_bytes))) {
+            throw std::invalid_argument(
+                "fp8 gdn_input_proj_conv_record: tensor operand overlaps parent weight");
+        }
+    }
+    detail::fp8_gdn_record_conv_a8_rows_launch(
+        {static_cast<std::uint8_t*>(codes.data), static_cast<float*>(scales.data)}, weight,
+        conv_weight, conv_states, valid_columns, initial_state_slots, tree_parents, conv_record,
+        query, key, value, z, rows, stream);
 }
 
 } // namespace ninfer::ops

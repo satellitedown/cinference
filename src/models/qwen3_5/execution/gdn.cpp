@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: verify-tree parents for the record projection.
+// Modified by satellitedown for Cinference: verify-tree parents for the record projection;
+// record projection overlapped with the control dots and the recurrence.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "models/qwen3_5/execution/gdn.h"
@@ -128,6 +129,70 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
                                         valid_columns, initial_slots, tree_parents, conv_record,
                                         query, key, value, z, single.policy, scratch, stream);
     }
+}
+
+namespace {
+// Forks of gdn_projection_record_overlapped: the concurrent stream starts the controls after the
+// activation and the output-gate half after the query/key/value half.
+constexpr std::size_t kGdnActivationReady = 0;
+constexpr std::size_t kGdnQkvLaunched     = 1;
+
+void fork_concurrent(const DeviceContext& device, std::size_t event, cudaStream_t stream) {
+    CUDA_CHECK(cudaEventRecord(device.concurrent.events[event], stream));
+    CUDA_CHECK(cudaStreamWaitEvent(device.concurrent.stream, device.concurrent.events[event], 0));
+}
+
+void mark_concurrent(const DeviceContext& device, std::size_t event) {
+    CUDA_CHECK(cudaEventRecord(device.concurrent.events[event], device.concurrent.stream));
+}
+} // namespace
+
+bool gdn_record_overlap_admits(const GdnParameters& parameters, std::int32_t batch,
+                               std::int32_t width) {
+    const auto* single = std::get_if<LinearParameters>(&parameters.projection);
+    return single != nullptr &&
+           ops::gdn_input_proj_conv_record_takes_activation(single->weight, single->policy, batch,
+                                                            width) &&
+           ops::gdn_norm_gating_split_admits(48, 5120, batch * width);
+}
+
+void gdn_projection_record_overlapped(const Tensor& residual, const Tensor& norm, float epsilon,
+                                      const GdnParameters& parameters, const Tensor& conv_states,
+                                      const Tensor& valid_columns, const Tensor& initial_slots,
+                                      const Tensor& tree_parents, Tensor& conv_record,
+                                      Tensor& query, Tensor& key, Tensor& value, Tensor& z,
+                                      Tensor& g, Tensor& beta, Tensor& codes, Tensor& scales,
+                                      const DeviceContext& device) {
+    const auto& projection  = std::get<LinearParameters>(parameters.projection);
+    const cudaStream_t main = device.stream;
+    const cudaStream_t side = device.concurrent.stream;
+    ops::gdn_norm_gating_fp8_hidden(residual, norm, epsilon, codes, scales, main);
+    CUDA_CHECK(cudaEventRecord(device.concurrent.events[kGdnActivationReady], main));
+    // The query/key/value half is queued first so its blocks reach the SMs before the controls'.
+    ops::gdn_input_proj_conv_record(codes, scales, projection.weight, parameters.convolution,
+                                    conv_states, valid_columns, initial_slots, tree_parents,
+                                    conv_record, query, key, value, z,
+                                    ops::GdnRecordRows::QueryKeyValue, main);
+    CUDA_CHECK(cudaStreamWaitEvent(side, device.concurrent.events[kGdnActivationReady], 0));
+    if (const auto* pair = std::get_if<ops::PairedProjectionWeights>(&parameters.control)) {
+        ops::gdn_norm_gating_control(residual, norm, epsilon, pair->first, pair->second,
+                                     parameters.a_log, parameters.dt_bias, g, beta, side);
+    } else {
+        ops::gdn_norm_gating_control(residual, norm, epsilon,
+                                     std::get<LinearParameters>(parameters.control).weight,
+                                     parameters.a_log, parameters.dt_bias, g, beta, side);
+    }
+    mark_concurrent(device, kGdnControlReady);
+    fork_concurrent(device, kGdnQkvLaunched, main);
+    ops::gdn_input_proj_conv_record(codes, scales, projection.weight, parameters.convolution,
+                                    conv_states, valid_columns, initial_slots, tree_parents,
+                                    conv_record, query, key, value, z,
+                                    ops::GdnRecordRows::OutputGate, side);
+    mark_concurrent(device, kGdnOutputGateReady);
+}
+
+void gdn_join_concurrent(const DeviceContext& device, std::size_t event, cudaStream_t stream) {
+    CUDA_CHECK(cudaStreamWaitEvent(stream, device.concurrent.events[event], 0));
 }
 
 } // namespace ninfer::models::qwen3_5::execution

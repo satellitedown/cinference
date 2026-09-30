@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: verify-tree taps in the FP8 record-producing form.
+// Modified by satellitedown for Cinference: verify-tree taps in the FP8 record-producing form;
+// its A8 halves from a caller-produced activation.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -247,5 +248,39 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 const Tensor& valid_columns, const Tensor& initial_state_slots,
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
+
+/** The two row halves of the FP8 parent's record projection. */
+enum class GdnRecordRows : std::uint8_t {
+    QueryKeyValue, ///< the convolved query/key/value channels: conv_record, query, key, value
+    OutputGate,    ///< the output-gate rows: z
+};
+
+/**
+ * Whether the policy-bearing single-parent record Op evaluates this problem with its single-block
+ * A8 route: the FP8 [16384,5120] parent, a policy that admits A8, B=1 and W=16. Only such a
+ * problem has the activation form below.
+ */
+[[nodiscard]] bool gdn_input_proj_conv_record_takes_activation(const Weight& weight,
+                                                               LinearPolicy policy,
+                                                               std::int32_t batch_size,
+                                                               std::int32_t width);
+
+/**
+ * Activation form of the single-parent record Op, one row half per call. `codes` (U8 [5120,16])
+ * and `scales` (FP32 [16]) are the row-scaled E4M3 activation of the block x, as the A8 route
+ * quantizes it (gdn_norm_gating_fp8_hidden produces it for a normalized residual). QueryKeyValue
+ * writes conv_record, query, key and value and OutputGate writes z, each bit for bit as the
+ * policy-bearing Op on x, for problems that gdn_input_proj_conv_record_takes_activation admits.
+ * A half reads only the activation, the parent and its own operands, so the halves may run
+ * concurrently on different streams; codes and scales must stay unmodified until both finish.
+ * Tensor operands follow the policy-bearing Op, with x replaced by codes and scales; there is no
+ * workspace.
+ */
+void gdn_input_proj_conv_record(const Tensor& codes, const Tensor& scales,
+                                const Weight& query_key_value_z_weight, const Tensor& conv_weight,
+                                const Tensor& conv_states, const Tensor& valid_columns,
+                                const Tensor& initial_state_slots, const Tensor& tree_parents,
+                                Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                Tensor& z, GdnRecordRows rows, cudaStream_t stream);
 
 } // namespace ninfer::ops

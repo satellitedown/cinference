@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: verify-tree record dispatch.
+// Modified by satellitedown for Cinference: verify-tree record dispatch; the activation form's
+// route query.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #pragma once
@@ -24,6 +25,11 @@ namespace ninfer::ops::detail {
                                                                   std::int32_t batch_size,
                                                                   std::int32_t min_width,
                                                                   std::int32_t max_width);
+
+// Whether a record problem takes the single-block A8 route (B=1, W=16), whose projection may start
+// from a caller-produced activation (fp8_gdn_record_conv_a8_rows_launch).
+[[nodiscard]] bool fp8_gdn_record_takes_activation(LinearPolicy policy, std::int32_t batch_size,
+                                                   std::int32_t width);
 
 void fp8_gdn_snapshot_fused_launch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                                    Tensor& conv_states, const Tensor& valid_columns,

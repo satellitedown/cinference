@@ -1,4 +1,5 @@
-// Modified by satellitedown for Cinference: the compute stream takes the greatest priority.
+// Modified by satellitedown for Cinference: the compute stream takes the greatest priority; a
+// concurrent compute stream with fork/join events.
 // See NOTICE and upstream-provenance.json for upstream attribution.
 
 #include "core/device.h"
@@ -34,6 +35,11 @@ void destroy_event(cudaEvent_t& event) noexcept {
         log_cuda_error("cudaEventDestroy", cudaEventDestroy(event));
         event = nullptr;
     }
+}
+
+void destroy_concurrent(ConcurrentStream& concurrent) noexcept {
+    for (cudaEvent_t& event : concurrent.events) { destroy_event(event); }
+    destroy_stream(concurrent.stream);
 }
 
 } // namespace
@@ -85,27 +91,47 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
             cuda_error_message("cudaStreamCreateWithFlags(transfer_stream) failed", err));
     }
 
+    ConcurrentStream side;
+    err = cudaStreamCreateWithPriority(&side.stream, cudaStreamNonBlocking, greatest_priority);
+    for (cudaEvent_t& event : side.events) {
+        if (err == cudaSuccess) { err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming); }
+    }
+    if (err != cudaSuccess) {
+        destroy_concurrent(side);
+        destroy_stream(load);
+        destroy_stream(compute);
+        throw std::runtime_error(cuda_error_message("concurrent stream creation failed", err));
+    }
+
     stream          = compute;
     transfer_stream = load;
+    concurrent      = side;
 }
 
 DeviceContext::~DeviceContext() {
-    if (stream != nullptr || transfer_stream != nullptr) { bind_to_current_thread_noexcept(); }
+    if (stream != nullptr || transfer_stream != nullptr || concurrent.stream != nullptr) {
+        bind_to_current_thread_noexcept();
+    }
+    destroy_concurrent(concurrent);
     destroy_stream(transfer_stream);
     destroy_stream(stream);
 }
 
 DeviceContext::DeviceContext(DeviceContext&& other) noexcept
     : device(other.device), stream(other.stream), transfer_stream(other.transfer_stream),
-      props(other.props) {
+      concurrent(other.concurrent), props(other.props) {
     other.stream          = nullptr;
     other.transfer_stream = nullptr;
+    other.concurrent      = {};
 }
 
 DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (stream != nullptr || transfer_stream != nullptr) { bind_to_current_thread_noexcept(); }
+    if (stream != nullptr || transfer_stream != nullptr || concurrent.stream != nullptr) {
+        bind_to_current_thread_noexcept();
+    }
+    destroy_concurrent(concurrent);
     destroy_stream(transfer_stream);
     destroy_stream(stream);
 
@@ -113,9 +139,11 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     props           = other.props;
     stream          = other.stream;
     transfer_stream = other.transfer_stream;
+    concurrent      = other.concurrent;
 
     other.stream          = nullptr;
     other.transfer_stream = nullptr;
+    other.concurrent      = {};
     return *this;
 }
 
