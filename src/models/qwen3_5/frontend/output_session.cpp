@@ -468,9 +468,15 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
             feed_semantic_thinking(impl_->preview_semantic, decoded.bytes);
         }
 
+        // Model-default stop tokens (EOS) are content-channel markers: the thinking phase
+        // closes only via the thinking-close tag, so a stop token the model writes inside its
+        // own reasoning trace (free text quoting a control token) must not end the turn.
+        // Without this guard such a trace produces a reasoning-only finish (stop reason,
+        // empty content, zero tool calls) and silently drops the pending work.
         const bool stop_token =
+            !impl_->preview_state.in_reasoning &&
             std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
-            impl_->policy.token_ids.end();
+                impl_->policy.token_ids.end();
         DecoderState before_state;
         PublishedOutput before_output;
         if (stop_token && !impl_->policy.publish_stop_token) {

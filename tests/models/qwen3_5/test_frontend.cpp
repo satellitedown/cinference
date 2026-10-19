@@ -1688,6 +1688,45 @@ ninfer::models::qwen3_5::PreparedPrompt thinking_prompt(const Frontend& frontend
     return frontend.prepare(std::move(input));
 }
 
+int test_eos_inside_reasoning_does_not_end_turn(const Frontend& frontend) {
+    auto prompt  = thinking_prompt(frontend);
+    auto session = frontend.make_output_session(prompt, {});
+
+    // The model quotes its own EOS token (6, from generation_config.json) inside the thinking
+    // trace. The thinking phase closes only via the thinking-close tag, so the turn continues.
+    const auto first =
+        session.preview_model(std::array<ninfer::TokenId, 2>{0, 6}, 20,
+                              ninfer::FinishReason::OutputLimit);
+    int failures = check(first.accepted_tokens == 2 && !first.finished() &&
+                             first.finish_reason == ninfer::FinishReason::None,
+                         "model-default stop token inside reasoning ended the turn early");
+    const auto first_output = session.commit_preview();
+    failures += check(channel_text(first_output, ninfer::OutputChannel::Reasoning) == "x" &&
+                          channel_text(first_output, ninfer::OutputChannel::Content).empty(),
+                      "EOS inside reasoning was published or misrouted");
+
+    // The thinking phase still closes into the answer channel after the stray EOS.
+    const auto second = session.preview_model(std::array<ninfer::TokenId, 2>{3, 4}, 18,
+                                              ninfer::FinishReason::OutputLimit);
+    failures += check(second.accepted_tokens == 2 && !second.finished(),
+                      "turn did not continue after a reasoning EOS");
+    const auto second_output = session.commit_preview();
+    failures += check(channel_text(second_output, ninfer::OutputChannel::Reasoning) == "thought" &&
+                          channel_text(second_output, ninfer::OutputChannel::Content) == "answer",
+                      "channels were misrouted after a reasoning EOS");
+
+    // The EOS token still ends the turn in the content channel.
+    const auto third =
+        session.preview_model(std::array<ninfer::TokenId, 1>{6}, 16,
+                              ninfer::FinishReason::OutputLimit);
+    failures += check(third.accepted_tokens == 1 &&
+                          third.finish_reason == ninfer::FinishReason::StopToken,
+                      "content-channel EOS did not end generation");
+    const auto third_output = session.commit_preview();
+    failures += check(third_output.empty(), "content-channel EOS leaked into output");
+    return failures;
+}
+
 int test_thinking_budget_control(const Frontend& frontend) {
     auto prompt = thinking_prompt(frontend);
     ninfer::StopPolicy stop;
@@ -1761,14 +1800,17 @@ int test_thinking_budget_control(const Frontend& frontend) {
     auto terminal_prompt  = thinking_prompt(frontend);
     auto terminal_session = frontend.make_output_session(
         terminal_prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 1});
+    // A stop token inside the thinking phase is not terminal: at the budget boundary the
+    // canonical thinking control takes over and the turn continues.
     const auto terminal = terminal_session.preview_model(std::array<ninfer::TokenId, 1>{6}, 10,
                                                          ninfer::FinishReason::OutputLimit);
-    failures += check(terminal.finish_reason == ninfer::FinishReason::StopToken &&
-                          terminal.continuation == ninfer::runtime::ContinuationAction::Decode,
-                      "terminal token at the thinking boundary did not take priority");
+    failures += check(terminal.finish_reason == ninfer::FinishReason::None &&
+                          terminal.continuation ==
+                              ninfer::runtime::ContinuationAction::ApplyTargetControl,
+                      "terminal token at the thinking boundary did not yield to thinking control");
     (void)terminal_session.commit_preview();
-    failures += check(terminal_session.pending_control_tokens().empty(),
-                      "terminal thinking boundary left control pending");
+    failures += check(!terminal_session.pending_control_tokens().empty(),
+                      "terminal thinking boundary did not arm the canonical thinking control");
 
     auto limit_prompt  = thinking_prompt(frontend);
     auto limit_session = frontend.make_output_session(limit_prompt, {}, {},
@@ -2192,6 +2234,7 @@ int main() {
     failures += test_terminal_flush(frontend);
     failures += test_structured_tool_output();
     failures += test_reasoning_split(frontend);
+    failures += test_eos_inside_reasoning_does_not_end_turn(frontend);
     failures += test_thinking_budget_control(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
